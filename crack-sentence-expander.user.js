@@ -1,0 +1,508 @@
+// ==UserScript==
+// @name         크랙 문장 부풀리기 (Gemini)
+// @namespace    https://crack.wrtn.ai
+// @version      6.1.0
+// @author       me
+// @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음).
+// @match        https://crack.wrtn.ai/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
+// @connect      generativelanguage.googleapis.com
+// @homepageURL  https://github.com/YOUR_ID/crack-sentence-expander
+// @supportURL   https://github.com/YOUR_ID/crack-sentence-expander/issues
+// @updateURL    https://raw.githubusercontent.com/YOUR_ID/crack-sentence-expander/main/crack-sentence-expander.user.js
+// @downloadURL  https://raw.githubusercontent.com/YOUR_ID/crack-sentence-expander/main/crack-sentence-expander.user.js
+// @license      MIT
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const K_APIKEY    = 'se_gemini_key';
+    const K_MODEL     = 'se_gemini_model';
+    const K_MODELLIST = 'se_model_list';
+    const K_PERSONA   = 'se_persona';
+    const K_NAME      = 'se_name';
+    const K_POV       = 'se_pov';
+    const K_LENGTH    = 'se_length';
+    const K_POS       = 'se_panel_pos';
+    const K_OPEN      = 'se_panel_open';
+
+    const DEFAULT_MODELS = [
+        { id: 'gemini-3.5-flash',       label: 'Gemini 3.5 Flash' },
+        { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro (프리뷰)' },
+    ];
+
+    const LENGTHS = {
+        short:  { label: '짧게', guide: '간결하게, 핵심만 살짝 살을 붙여서.' },
+        medium: { label: '보통', guide: '감각 묘사와 감정을 적당히 풀어서 자연스러운 분량으로.' },
+        long:   { label: '길게', guide: '풍부한 문학적 묘사와 내면 묘사를 충분히 펼쳐서 길게.' },
+    };
+
+    // ───────────────────────── 프롬프트 ─────────────────────────
+    function buildPrompt(dialogue, action, lengthKey, persona, pov, name) {
+        const lenGuide = (LENGTHS[lengthKey] || LENGTHS.medium).guide;
+        const isThird = (pov === 'third');
+        const lines = [
+            '너는 롤플레이(캐릭터 채팅)에서 "유저 캐릭터"의 대사와 행동을 문학적으로 늘려 쓰는 글쓰기 보조다.',
+            '입력은 두 칸으로 들어온다: [대사] 칸과 [행동] 칸. 둘 중 하나가 비어 있을 수 있다.',
+            '아래 규칙을 반드시 지켜라.',
+        ];
+
+        if (persona && persona.trim()) {
+            lines.push('');
+            lines.push('[유저 캐릭터의 페르소나]');
+            lines.push(persona.trim());
+            lines.push('- 위 페르소나의 성격·말투·가치관·배경에 어울리게 써라. 설정을 본문에 그대로 나열·설명하지 말고 자연스럽게 녹여라.');
+        }
+
+        lines.push('');
+        lines.push('[시점]');
+        if (isThird) {
+            lines.push('- 3인칭 시점으로 쓴다. 유저 캐릭터를 ' + (name && name.trim()
+                ? '"' + name.trim() + '"라는 이름(또는 그/그녀)으로'
+                : '"그/그녀" 같은 3인칭 대명사로') + ' 지칭한다. "나/내가"로 쓰지 마라.');
+            lines.push('- 장면을 풍부하게 하기 위해 "새로운 단역·배경 NPC"(지나가는 행인, 점원, 군중, 조연 등)를 등장시키고 그들의 대사·행동·묘사를 써도 된다.');
+            lines.push('- 단, "주요 캐릭터"(유저의 상대역·메인 등장인물)의 대사·행동·감정·생각·반응은 절대 쓰지 마라. 그건 상대의 차례다.');
+            lines.push('- 어떤 인물이 주요 캐릭터인지 애매하면, 주요 캐릭터로 간주하고 건드리지 마라. 새 단역은 이름 있는 기존 주연과 겹치지 않게 만들어라.');
+        } else {
+            lines.push('- 1인칭 시점으로 쓴다. "나/내가"로 서술한다.');
+            lines.push('- 상대 캐릭터(모든 NPC 포함)의 대사·행동·감정·반응·생각은 절대 대신 쓰지 마라. 오직 "내가" 한 것만 쓴다.');
+        }
+
+        lines.push('');
+        lines.push('[대사 칸 처리]');
+        lines.push('- [대사] 칸은 유저 캐릭터가 실제로 입으로 "말하는" 내용이다.');
+        lines.push('- 의미는 유지하되 말투를 자연스럽고 생생하게 다듬어, 큰따옴표 "..." 로 감싸 출력한다.');
+        lines.push('- 없는 정보를 새로 지어내지 마라.');
+        lines.push('');
+        lines.push('[행동 칸 처리 — 가장 중요]');
+        lines.push('- [행동] 칸은 유저 캐릭터가 "무엇을 하는지"에 대한 지시/의도다. 그 행동을 실제로 "수행하는 장면"으로 *이탤릭* 지문으로 묘사하라.');
+        lines.push('- 절대로 그 지시문을 명령형 대사로 바꾸지 마라. 누군가가 그것을 소리내어 말하게 하지도 마라.');
+        lines.push('- 행동 내용이 추상적이면, 그 행동의 구체적인 내용을 창의적으로 채워서 "실제로 그것을 해내는 모습"으로 보여줘라.');
+        lines.push('- 예시: 행동 칸에 "독창적인 아이디어를 낸다" 라고 적혀 있으면');
+        if (isThird) {
+            lines.push('    (O) *' + (name && name.trim() ? name.trim() : '그') + '는 잠시 골똘히 생각하다 눈을 반짝였다…* "있잖아, 이렇게 해보면 어떨까?" (구체적 아이디어를 직접 떠올리고 제안하는 장면)');
+        } else {
+            lines.push('    (O) *나는 잠시 골똘히 생각하다 눈을 반짝였다…* "있잖아, 이렇게 해보면 어떨까?" (구체적 아이디어를 직접 떠올리고 제안하는 장면)');
+        }
+        lines.push('    (X) "독창적인 아이디어 내봐!"  ← 지시문을 명령 대사로 출력하는 것은 금지');
+        lines.push('');
+        lines.push('[공통 규칙]');
+        lines.push('- 새로운 사건·설정을 멋대로 키우지 말고, 입력이 담은 행동·의도의 범위 안에서만 살을 붙인다.');
+        lines.push('- 대사는 큰따옴표 "...", 지문·행동·감정·감각 묘사는 *별표*로 감싼 이탤릭으로 쓴다.');
+        lines.push('- 대사와 행동이 둘 다 있으면 자연스럽게 한 흐름으로 엮되, 따옴표와 별표 형식은 지킨다.');
+        lines.push('- 길이: ' + lenGuide);
+        lines.push('');
+        lines.push('[출력 규칙]');
+        lines.push('- 설명·머리말·해설 없이, 완성된 본문 텍스트만 출력한다.');
+        lines.push('- 전체를 따옴표나 코드블록(```)으로 감싸지 마라.');
+
+        const system = lines.join('\n');
+        const user = [
+            '[대사]', (dialogue.trim() || '(없음)'),
+            '', '[행동]', (action.trim() || '(없음)'),
+            '', '위 규칙대로 늘려서 본문만 출력해줘.'
+        ].join('\n');
+        return { system, user };
+    }
+
+    // ───────────────────────── 모델 목록 불러오기 ─────────────────────────
+    function fetchModels(onDone, onErr) {
+        const apiKey = GM_getValue(K_APIKEY, '');
+        if (!apiKey) { onErr('API 키를 먼저 넣고 저장해 주세요.'); return; }
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: 'https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=' + encodeURIComponent(apiKey),
+            onload: function (res) {
+                if (res.status < 200 || res.status >= 300) { onErr('목록 조회 실패 (' + res.status + ')'); return; }
+                try {
+                    const data = JSON.parse(res.responseText);
+                    const models = (data.models || [])
+                        .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+                        .filter(m => /gemini/i.test(m.name || ''))
+                        .map(m => ({ id: (m.name || '').replace(/^models\//, ''), label: m.displayName || (m.name || '').replace(/^models\//, '') }));
+                    if (!models.length) { onErr('쓸 수 있는 모델이 없어요.'); return; }
+                    onDone(models);
+                } catch (e) { onErr('목록을 읽지 못했어요.'); }
+            },
+            onerror: function () { onErr('네트워크 오류예요.'); },
+            timeout: 30000,
+            ontimeout: function () { onErr('시간 초과예요.'); },
+        });
+    }
+
+    // ───────────────────────── 본문 생성 호출 ─────────────────────────
+    function callGemini(dialogue, action, onDone, onErr) {
+        const apiKey = GM_getValue(K_APIKEY, '');
+        const model = GM_getValue(K_MODEL, DEFAULT_MODELS[0].id);
+        const lengthKey = GM_getValue(K_LENGTH, 'medium');
+        const persona = GM_getValue(K_PERSONA, '');
+        const pov = GM_getValue(K_POV, 'first');
+        const name = GM_getValue(K_NAME, '');
+
+        if (!apiKey) { onErr('API 키가 없어요. ⚙️ 설정에서 먼저 넣어주세요.'); return; }
+        if (!dialogue.trim() && !action.trim()) { onErr('대사나 행동 중 하나는 입력해 주세요.'); return; }
+
+        const { system, user } = buildPrompt(dialogue, action, lengthKey, persona, pov, name);
+        const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/'
+            + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(apiKey);
+
+        const body = {
+            system_instruction: { parts: [{ text: system }] },
+            contents: [{ role: 'user', parts: [{ text: user }] }],
+            generationConfig: { maxOutputTokens: 2048 },
+        };
+
+        GM_xmlhttpRequest({
+            method: 'POST', url: endpoint,
+            headers: { 'Content-Type': 'application/json' },
+            data: JSON.stringify(body),
+            onload: function (res) {
+                if (res.status < 200 || res.status >= 300) {
+                    let msg = 'API 에러 (' + res.status + ')';
+                    try { const e = JSON.parse(res.responseText); if (e.error && e.error.message) msg += ': ' + e.error.message; } catch (_) {}
+                    console.error('[문장 부풀리기] API 에러 전체 응답:', res.responseText);
+                    onErr(msg); return;
+                }
+                try {
+                    const data = JSON.parse(res.responseText);
+                    const cand = data.candidates && data.candidates[0];
+                    if (!cand || !cand.content) {
+                        const reason = (cand && cand.finishReason) || (data.promptFeedback && data.promptFeedback.blockReason) || '알 수 없음';
+                        onErr('응답이 비어 있어요 (사유: ' + reason + '). 입력을 바꾸거나 다시 시도해 보세요.'); return;
+                    }
+                    const out = (cand.content.parts || []).map(p => p.text || '').join('').trim();
+                    if (!out) { onErr('빈 응답이 왔어요. 다시 시도해 주세요.'); return; }
+                    onDone(out);
+                } catch (err) {
+                    console.error('[문장 부풀리기] 파싱 실패:', err, res.responseText);
+                    onErr('응답을 읽지 못했어요. 콘솔을 확인해 주세요.');
+                }
+            },
+            onerror: function () { onErr('네트워크 오류예요. 연결을 확인해 주세요.'); },
+            ontimeout: function () { onErr('시간 초과예요. 다시 시도해 주세요.'); },
+            timeout: 60000,
+        });
+    }
+
+    // ───────────────────── 크랙 채팅창 찾기 & 입력 ─────────────────────
+    function isVisible(el) {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width < 30 || r.height < 12) return false;
+        const st = getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+        return true;
+    }
+    function findChatInput() {
+        const inPanel = el => el.closest && el.closest('#se-panel');
+        let cands = Array.from(document.querySelectorAll('textarea')).filter(el => !inPanel(el) && isVisible(el));
+        if (cands.length) { cands.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top); return cands[0]; }
+        cands = Array.from(document.querySelectorAll('[contenteditable="true"],[contenteditable=""]')).filter(el => !inPanel(el) && isVisible(el));
+        if (cands.length) { cands.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top); return cands[0]; }
+        return null;
+    }
+    function setNativeValue(el, value) {
+        const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    function insertIntoChat(text) {
+        const el = findChatInput();
+        if (!el) return false;
+        el.focus();
+        const tag = el.tagName;
+        if (tag === 'TEXTAREA' || tag === 'INPUT') {
+            const cur = el.value || '';
+            const next = cur.trim() ? (cur.replace(/\s+$/, '') + '\n' + text) : text;
+            setNativeValue(el, next);
+            try { el.selectionStart = el.selectionEnd = el.value.length; } catch (_) {}
+        } else {
+            el.focus();
+            let ok = false;
+            try { ok = document.execCommand('insertText', false, text); } catch (_) { ok = false; }
+            if (!ok) {
+                el.textContent = (el.textContent ? el.textContent + '\n' : '') + text;
+                el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+            }
+        }
+        return true;
+    }
+
+    // ───────────────────────── 스타일 ─────────────────────────
+    const CSS = `
+    #se-panel, #se-fab { position: fixed; z-index: 2147483600; font-family: 'Pretendard','Noto Sans KR',system-ui,sans-serif; box-sizing: border-box; }
+    #se-panel *, #se-fab * { box-sizing: border-box; }
+    #se-panel { width: 350px; max-width: calc(100vw - 24px); background: #1d1f27; color: #e9eaf0; border: 1px solid #33384a; border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.45); display: flex; flex-direction: column; overflow: hidden; font-size: 13px; max-height: calc(100vh - 40px); }
+    #se-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; cursor: grab; user-select: none; background: linear-gradient(135deg,#2a2d3a,#23262f); border-bottom: 1px solid #33384a; }
+    #se-head.dragging { cursor: grabbing; }
+    #se-title { font-weight: 700; font-size: 13px; flex: 1; letter-spacing: -.2px; }
+    #se-head button { background: transparent; border: none; color: #b9bcca; cursor: pointer; font-size: 15px; padding: 2px 5px; border-radius: 6px; line-height: 1; }
+    #se-head button:hover { background: #3a3f52; color: #fff; }
+    #se-body { padding: 12px; display: flex; flex-direction: column; gap: 9px; overflow-y: auto; }
+    .se-field-label { font-size: 11px; font-weight: 700; color: #9aa0b4; margin: 0 0 -4px 2px; letter-spacing: -.2px; }
+    .se-ta { width: 100%; min-height: 48px; max-height: 160px; resize: vertical; background: #14161c; color: #e9eaf0; border: 1px solid #33384a; border-radius: 10px; padding: 9px; font-size: 13px; line-height: 1.5; font-family: inherit; }
+    .se-ta:focus { outline: none; border-color: #6c7bff; }
+    #se-dialogue { border-left: 3px solid #5fd0c3; }
+    #se-action   { border-left: 3px solid #c8a6ff; }
+    .se-segwrap { display: flex; gap: 6px; }
+    .se-seg { display: flex; gap: 4px; background: #14161c; padding: 3px; border-radius: 10px; flex: 1; }
+    .se-seg button { flex: 1; background: transparent; border: none; color: #9aa0b4; padding: 6px 0; border-radius: 7px; cursor: pointer; font-size: 12px; font-weight: 600; }
+    .se-seg button.active { background: #3a3f52; color: #fff; }
+    #se-pov button.active { background: #4a3f6b; color: #e7defb; }
+    #se-go { width: 100%; padding: 11px; border: none; border-radius: 10px; cursor: pointer; background: linear-gradient(135deg,#6c7bff,#8a5cff); color: #fff; font-size: 13px; font-weight: 700; letter-spacing: -.2px; }
+    #se-go:hover { filter: brightness(1.08); }
+    #se-go:disabled { opacity: .6; cursor: default; }
+    #se-out { white-space: pre-wrap; word-break: break-word; line-height: 1.65; background: #14161c; border: 1px solid #33384a; border-radius: 10px; padding: 11px; min-height: 40px; font-size: 13px; display: none; }
+    #se-out.show { display: block; }
+    #se-out em { color: #c8bdff; font-style: italic; }
+    #se-insert { width: 100%; padding: 10px; border: none; border-radius: 10px; cursor: pointer; background: linear-gradient(135deg,#3ecf8e,#2fb3c0); color: #07241c; font-size: 13px; font-weight: 800; display: none; }
+    #se-insert.show { display: block; }
+    #se-insert:hover { filter: brightness(1.06); }
+    #se-outbtns { display: none; gap: 6px; }
+    #se-outbtns.show { display: flex; }
+    #se-outbtns button { flex: 1; padding: 8px; border: 1px solid #33384a; border-radius: 9px; background: #23262f; color: #e9eaf0; cursor: pointer; font-size: 12px; font-weight: 600; }
+    #se-outbtns button:hover { background: #2d3140; }
+    #se-status { font-size: 12px; color: #9aa0b4; min-height: 16px; }
+    #se-status.err { color: #ff8a8a; }
+    #se-settings { display: none; flex-direction: column; gap: 9px; padding: 12px; border-top: 1px solid #33384a; background: #191b22; overflow-y: auto; }
+    #se-settings.show { display: flex; }
+    #se-settings label { font-size: 12px; color: #b9bcca; font-weight: 600; }
+    #se-settings input, #se-settings select, #se-settings textarea { width: 100%; background: #14161c; color: #e9eaf0; border: 1px solid #33384a; border-radius: 9px; padding: 9px; font-size: 13px; font-family: inherit; }
+    #se-persona { min-height: 64px; max-height: 160px; resize: vertical; line-height: 1.5; }
+    #se-settings input:focus, #se-settings select:focus, #se-settings textarea:focus { outline: none; border-color: #6c7bff; }
+    #se-fetch { padding: 8px; border: 1px solid #4a4f63; border-radius: 9px; cursor: pointer; background: #23262f; color: #cdd1e0; font-size: 12px; font-weight: 600; }
+    #se-fetch:hover { background: #2d3140; }
+    #se-fetch:disabled { opacity: .6; cursor: default; }
+    #se-fetch-status { font-size: 11px; color: #9aa0b4; min-height: 14px; }
+    #se-fetch-status.err { color: #ff8a8a; }
+    #se-save { padding: 9px; border: none; border-radius: 9px; cursor: pointer; background: #6c7bff; color: #fff; font-weight: 700; font-size: 13px; }
+    #se-hint { font-size: 11px; color: #777c8e; line-height: 1.5; }
+    #se-fab { right: 18px; bottom: 18px; width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg,#6c7bff,#8a5cff); color: #fff; border: none; cursor: pointer; font-size: 22px; display: none; align-items: center; justify-content: center; box-shadow: 0 8px 24px rgba(108,123,255,.5); }
+    #se-fab.show { display: flex; }
+    `;
+
+    function injectStyle() { const s = document.createElement('style'); s.textContent = CSS; document.head.appendChild(s); }
+
+    function buildUI() {
+        const panel = document.createElement('div');
+        panel.id = 'se-panel';
+        panel.innerHTML = `
+            <div id="se-head">
+                <span id="se-title">✨ 문장 부풀리기</span>
+                <button id="se-gear" title="설정">⚙️</button>
+                <button id="se-min" title="닫기">✕</button>
+            </div>
+            <div id="se-body">
+                <div class="se-field-label">💬 대사 (말하는 내용)</div>
+                <textarea id="se-dialogue" class="se-ta" placeholder='예: 괜찮아, 내가 도와줄게'></textarea>
+                <div class="se-field-label">🎬 행동 (하는 행동·의도)</div>
+                <textarea id="se-action" class="se-ta" placeholder='예: 독창적인 아이디어를 낸다'></textarea>
+                <div class="se-segwrap">
+                    <div class="se-seg" id="se-pov">
+                        <button data-pov="first">1인칭</button>
+                        <button data-pov="third">3인칭</button>
+                    </div>
+                    <div class="se-seg" id="se-len">
+                        <button data-len="short">짧게</button>
+                        <button data-len="medium" class="active">보통</button>
+                        <button data-len="long">길게</button>
+                    </div>
+                </div>
+                <button id="se-go">✨ 문학적으로 늘리기</button>
+                <div id="se-status"></div>
+                <div id="se-out"></div>
+                <button id="se-insert">💬 채팅창에 바로 넣기</button>
+                <div id="se-outbtns">
+                    <button id="se-copy">📋 복사</button>
+                    <button id="se-retry">🔄 다시 뽑기</button>
+                </div>
+            </div>
+            <div id="se-settings">
+                <label>🎭 유저 페르소나 (선택)</label>
+                <textarea id="se-persona" placeholder='예: 27세 무뚝뚝한 검사. 말수 적고 비꼬는 말투. 속은 다정함.'></textarea>
+                <label>🪪 캐릭터 이름 (3인칭일 때 사용, 선택)</label>
+                <input id="se-name" type="text" placeholder="예: 서지훈">
+                <label>🔑 Gemini API 키</label>
+                <input id="se-key" type="password" placeholder="AIza...">
+                <label>🤖 모델 (목록에서 선택)</label>
+                <select id="se-model"></select>
+                <button id="se-fetch">🔄 사용 가능한 모델 불러오기</button>
+                <div id="se-fetch-status"></div>
+                <button id="se-save">저장</button>
+                <div id="se-hint">키는 aistudio.google.com 에서 발급해요. 이 브라우저에만 저장되고 절대 공유 마세요. 페르소나·이름·시점도 함께 저장돼요.</div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+
+        const fab = document.createElement('button');
+        fab.id = 'se-fab'; fab.title = '문장 부풀리기 열기'; fab.textContent = '✨';
+        document.body.appendChild(fab);
+
+        wireUp(panel, fab);
+    }
+
+    function wireUp(panel, fab) {
+        const $ = sel => panel.querySelector(sel);
+        const dialogue = $('#se-dialogue');
+        const action   = $('#se-action');
+        const out       = $('#se-out');
+        const insertBtn = $('#se-insert');
+        const outbtns   = $('#se-outbtns');
+        const status    = $('#se-status');
+        const goBtn     = $('#se-go');
+        const settings  = $('#se-settings');
+        const modelSel  = $('#se-model');
+        const persona   = $('#se-persona');
+        const nameInput = $('#se-name');
+        const fetchBtn  = $('#se-fetch');
+        const fetchStat = $('#se-fetch-status');
+
+        const pos = GM_getValue(K_POS, null);
+        if (pos && typeof pos.left === 'number') { panel.style.left = pos.left + 'px'; panel.style.top = pos.top + 'px'; panel.style.right = 'auto'; }
+        else { panel.style.right = '18px'; panel.style.top = '90px'; }
+        if (GM_getValue(K_OPEN, true) === false) { panel.style.display = 'none'; fab.classList.add('show'); }
+
+        // 시점 토글
+        const savedPov = GM_getValue(K_POV, 'first');
+        $('#se-pov').querySelectorAll('button').forEach(b => {
+            b.classList.toggle('active', b.dataset.pov === savedPov);
+            b.addEventListener('click', () => {
+                $('#se-pov').querySelectorAll('button').forEach(x => x.classList.remove('active'));
+                b.classList.add('active'); GM_setValue(K_POV, b.dataset.pov);
+            });
+        });
+
+        // 길이
+        const savedLen = GM_getValue(K_LENGTH, 'medium');
+        $('#se-len').querySelectorAll('button').forEach(b => {
+            b.classList.toggle('active', b.dataset.len === savedLen);
+            b.addEventListener('click', () => {
+                $('#se-len').querySelectorAll('button').forEach(x => x.classList.remove('active'));
+                b.classList.add('active'); GM_setValue(K_LENGTH, b.dataset.len);
+            });
+        });
+
+        // 설정값 로드
+        $('#se-key').value = GM_getValue(K_APIKEY, '');
+        persona.value = GM_getValue(K_PERSONA, '');
+        nameInput.value = GM_getValue(K_NAME, '');
+
+        function populateModels(list, selected) {
+            modelSel.innerHTML = '';
+            list.forEach(m => { const o = document.createElement('option'); o.value = m.id; o.textContent = m.label; modelSel.appendChild(o); });
+            const want = selected || GM_getValue(K_MODEL, list[0] && list[0].id);
+            if (want && list.some(m => m.id === want)) modelSel.value = want;
+            else if (list[0]) modelSel.value = list[0].id;
+        }
+        let storedList = GM_getValue(K_MODELLIST, null);
+        if (!Array.isArray(storedList) || !storedList.length) storedList = DEFAULT_MODELS;
+        populateModels(storedList);
+
+        fetchBtn.addEventListener('click', () => {
+            GM_setValue(K_APIKEY, $('#se-key').value.trim());
+            fetchBtn.disabled = true; fetchStat.classList.remove('err'); fetchStat.textContent = '불러오는 중…';
+            fetchModels(
+                (models) => { GM_setValue(K_MODELLIST, models); populateModels(models, modelSel.value); fetchStat.textContent = models.length + '개 불러왔어요 ✅'; fetchBtn.disabled = false; },
+                (err) => { fetchStat.classList.add('err'); fetchStat.textContent = err; fetchBtn.disabled = false; }
+            );
+        });
+
+        $('#se-gear').addEventListener('click', () => settings.classList.toggle('show'));
+        $('#se-save').addEventListener('click', () => {
+            GM_setValue(K_APIKEY, $('#se-key').value.trim());
+            GM_setValue(K_PERSONA, persona.value);
+            GM_setValue(K_NAME, nameInput.value.trim());
+            if (modelSel.value) GM_setValue(K_MODEL, modelSel.value);
+            settings.classList.remove('show');
+            flash('저장됐어요 ✅');
+        });
+
+        $('#se-min').addEventListener('click', () => { panel.style.display = 'none'; fab.classList.add('show'); GM_setValue(K_OPEN, false); });
+        fab.addEventListener('click', () => { panel.style.display = 'flex'; fab.classList.remove('show'); GM_setValue(K_OPEN, true); });
+
+        let statusTimer = null;
+        function flash(msg, isErr) {
+            status.textContent = msg; status.classList.toggle('err', !!isErr);
+            if (statusTimer) clearTimeout(statusTimer);
+            if (!isErr && msg) statusTimer = setTimeout(() => { status.textContent = ''; }, 2500);
+        }
+
+        let lastResult = '';
+        function renderResult(textRaw) {
+            lastResult = textRaw;
+            const esc = textRaw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            out.innerHTML = esc.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+            out.classList.add('show'); insertBtn.classList.add('show'); outbtns.classList.add('show');
+        }
+
+        function run() {
+            const d = dialogue.value, a = action.value;
+            if (!d.trim() && !a.trim()) { flash('대사나 행동 중 하나는 입력해 주세요.', true); return; }
+            goBtn.disabled = true;
+            out.classList.remove('show'); insertBtn.classList.remove('show'); outbtns.classList.remove('show');
+            flash('늘리는 중… ✍️');
+            callGemini(d, a,
+                (result) => { renderResult(result); flash(''); goBtn.disabled = false; },
+                (err)    => { flash(err, true); goBtn.disabled = false; });
+        }
+        goBtn.addEventListener('click', run);
+        $('#se-retry').addEventListener('click', run);
+
+        [dialogue, action].forEach(ta => ta.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); run(); }
+        }));
+
+        function copyToClipboard(txt, ok, fail) {
+            (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject())
+                .then(ok)
+                .catch(() => {
+                    const ta = document.createElement('textarea');
+                    ta.value = txt; document.body.appendChild(ta); ta.select();
+                    try { document.execCommand('copy'); ok(); } catch (_) { fail(); }
+                    document.body.removeChild(ta);
+                });
+        }
+        insertBtn.addEventListener('click', () => {
+            if (!lastResult) return;
+            if (insertIntoChat(lastResult)) flash('채팅창에 넣었어요 💬');
+            else copyToClipboard(lastResult,
+                () => flash('채팅창을 못 찾아서 복사했어요. 붙여넣기 해주세요 📋', true),
+                () => flash('채팅창을 못 찾았어요 😢', true));
+        });
+        $('#se-copy').addEventListener('click', () => {
+            copyToClipboard(lastResult, () => flash('복사 완료 📋'), () => flash('복사 실패 😢', true));
+        });
+
+        const head = $('#se-head');
+        let dragging = false, offX = 0, offY = 0;
+        head.addEventListener('mousedown', (e) => {
+            if (e.target.tagName === 'BUTTON') return;
+            dragging = true; head.classList.add('dragging');
+            const r = panel.getBoundingClientRect();
+            offX = e.clientX - r.left; offY = e.clientY - r.top; panel.style.right = 'auto'; e.preventDefault();
+        });
+        document.addEventListener('mousemove', (e) => {
+            if (!dragging) return;
+            let l = e.clientX - offX, t = e.clientY - offY;
+            l = Math.max(0, Math.min(l, window.innerWidth - panel.offsetWidth));
+            t = Math.max(0, Math.min(t, window.innerHeight - 40));
+            panel.style.left = l + 'px'; panel.style.top = t + 'px';
+        });
+        document.addEventListener('mouseup', () => {
+            if (!dragging) return;
+            dragging = false; head.classList.remove('dragging');
+            const r = panel.getBoundingClientRect();
+            GM_setValue(K_POS, { left: r.left, top: r.top });
+        });
+    }
+
+    function init() { if (document.getElementById('se-panel')) return; injectStyle(); buildUI(); }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+    else init();
+})();
