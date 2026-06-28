@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.3.2
+// @version      6.4.0
 // @author       me
 // @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음). 모바일(터치 드래그·하단 잘림) 대응.
 // @match        https://crack.wrtn.ai/*
@@ -11,6 +11,8 @@
 // @connect      generativelanguage.googleapis.com
 // @homepageURL  https://github.com/voisei/crack-sentence-expander
 // @supportURL   https://github.com/voisei/crack-sentence-expander/issues
+// @updateURL    https://raw.githubusercontent.com/voisei/crack-sentence-expander/main/crack-sentence-expander.user.js
+// @downloadURL  https://raw.githubusercontent.com/voisei/crack-sentence-expander/main/crack-sentence-expander.user.js
 // @license      MIT
 // @run-at       document-idle
 // ==/UserScript==
@@ -105,6 +107,14 @@
         lines.push('- 대사와 행동이 둘 다 있으면, 서술 한 덩어리 뒤에 대사 한 덩어리를 붙이는 식의 고정된 순서로 쓰지 마라.');
         lines.push('- 대신 서술과 대사를 문장 단위로 번갈아 자연스럽게 섞어라. 서술이 대사 앞·중간·뒤 어디에 와도 좋고, 한 대사를 둘로 쪼개 사이에 짧은 서술(숨, 시선, 표정, 손짓 등)을 끼워 넣어도 좋다.');
         lines.push('- 다만 따옴표(대사)와 별표(서술) 형식 자체는 항상 지킨다.');
+        lines.push('');
+        lines.push('[절대 금지 — 반드시 지켜라]');
+        lines.push('- 같은 문장이나 같은 표현·구절을 반복하지 마라. 비슷한 의미라도 앞에서 이미 쓴 묘사·문장 구조를 또 쓰지 마라. 매 문장은 새로운 내용을 담아 진행시킨다.');
+        lines.push('- 한 응답 안에서 동어 반복(예: "그는 웃었다. 그는 미소 지었다.")이나 같은 행동·감정의 재탕을 하지 마라.');
+        lines.push('- 유저의 페르소나·문체 규칙·이름·설정 내용을 본문에서 그대로 읊거나 나열·설명·요약하지 마라. 그 설정들은 "표현 방식"으로만 쓰고, 정보 자체를 캐릭터 입이나 서술로 다시 말하게 하지 마라.');
+        lines.push('- 예: 페르소나가 "무뚝뚝한 검사"라고 해서 본문에 "그는 무뚝뚝한 검사였다" 같은 설명을 넣지 마라. 대신 무뚝뚝함이 말투·행동으로 드러나게만 한다.');
+        lines.push('- 입력에 없는 설정 소개·자기소개·배경 설명을 끼워 넣지 마라.');
+        lines.push('- 길이를 채우려고 했던 말을 늘려 반복하지 마라. 늘릴 내용이 없으면 차라리 짧게 끝내라.');
         lines.push('- 길이: ' + lenGuide);
         lines.push('');
         lines.push('[출력 규칙]');
