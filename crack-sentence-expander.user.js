@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.2.0
+// @version      6.2.2
 // @author       me
 // @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음). 모바일(터치 드래그·하단 잘림) 대응.
 // @match        https://crack.wrtn.ai/*
@@ -84,16 +84,20 @@
         lines.push('- 행동 내용이 추상적이면, 그 행동의 구체적인 내용을 창의적으로 채워서 "실제로 그것을 해내는 모습"으로 보여줘라.');
         lines.push('- 예시: 행동 칸에 "독창적인 아이디어를 낸다" 라고 적혀 있으면');
         if (isThird) {
-            lines.push('    (O) *' + (name && name.trim() ? name.trim() : '그') + '는 잠시 골똘히 생각하다 눈을 반짝였다…* "있잖아, 이렇게 해보면 어떨까?" (구체적 아이디어를 직접 떠올리고 제안하는 장면)');
+            const who = (name && name.trim() ? name.trim() : '그');
+            lines.push('    (O) *' + who + '는 손가락으로 턱을 톡톡 두드렸다.* "음…" *잠깐의 침묵 끝에 눈이 반짝였다.* "이렇게 해보면 어떨까? 순서를 아예 거꾸로 뒤집는 거야." *말하면서도 스스로 그 그림이 그려지는지 입꼬리가 슬쩍 올라갔다.*');
         } else {
-            lines.push('    (O) *나는 잠시 골똘히 생각하다 눈을 반짝였다…* "있잖아, 이렇게 해보면 어떨까?" (구체적 아이디어를 직접 떠올리고 제안하는 장면)');
+            lines.push('    (O) *나는 손가락으로 턱을 톡톡 두드렸다.* "음…" *잠깐의 침묵 끝에 눈이 반짝였다.* "이렇게 해보면 어떨까? 순서를 아예 거꾸로 뒤집는 거야." *말하면서도 스스로 그 그림이 그려지는지 입꼬리가 슬쩍 올라갔다.*');
         }
+        lines.push('    → 위처럼 서술과 대사가 한 덩어리로 몰리지 않고, 서술→짧은 대사→서술→긴 대사→서술 식으로 자연스럽게 번갈아 섞여 나오게 한다.');
         lines.push('    (X) "독창적인 아이디어 내봐!"  ← 지시문을 명령 대사로 출력하는 것은 금지');
         lines.push('');
         lines.push('[공통 규칙]');
         lines.push('- 새로운 사건·설정을 멋대로 키우지 말고, 입력이 담은 행동·의도의 범위 안에서만 살을 붙인다.');
         lines.push('- 대사는 큰따옴표 "...", 지문·행동·감정·감각 묘사는 *별표*로 감싼 이탤릭으로 쓴다.');
-        lines.push('- 대사와 행동이 둘 다 있으면 자연스럽게 한 흐름으로 엮되, 따옴표와 별표 형식은 지킨다.');
+        lines.push('- 대사와 행동이 둘 다 있으면, 서술 한 덩어리 뒤에 대사 한 덩어리를 붙이는 식의 고정된 순서로 쓰지 마라.');
+        lines.push('- 대신 서술과 대사를 문장 단위로 번갈아 자연스럽게 섞어라. 서술이 대사 앞·중간·뒤 어디에 와도 좋고, 한 대사를 둘로 쪼개 사이에 짧은 서술(숨, 시선, 표정, 손짓 등)을 끼워 넣어도 좋다.');
+        lines.push('- 다만 따옴표(대사)와 별표(서술) 형식 자체는 항상 지킨다.');
         lines.push('- 길이: ' + lenGuide);
         lines.push('');
         lines.push('[출력 규칙]');
@@ -153,7 +157,7 @@
         const body = {
             system_instruction: { parts: [{ text: system }] },
             contents: [{ role: 'user', parts: [{ text: user }] }],
-            generationConfig: { maxOutputTokens: 2048 },
+            generationConfig: { maxOutputTokens: 8192 },
         };
 
         GM_xmlhttpRequest({
@@ -175,8 +179,13 @@
                         onErr('응답이 비어 있어요 (사유: ' + reason + '). 입력을 바꾸거나 다시 시도해 보세요.'); return;
                     }
                     const out = (cand.content.parts || []).map(p => p.text || '').join('').trim();
-                    if (!out) { onErr('빈 응답이 왔어요. 다시 시도해 주세요.'); return; }
-                    onDone(out);
+                    if (!out) {
+                        const reason = cand.finishReason || '알 수 없음';
+                        if (reason === 'MAX_TOKENS') { onErr('생각하는 데 토큰을 다 써서 본문이 안 나왔어요. "짧게"로 바꾸거나 다시 시도해 주세요.'); return; }
+                        onErr('빈 응답이 왔어요 (사유: ' + reason + '). 다시 시도해 주세요.'); return;
+                    }
+                    const truncated = (cand.finishReason === 'MAX_TOKENS');
+                    onDone(out, truncated);
                 } catch (err) {
                     console.error('[문장 부풀리기] 파싱 실패:', err, res.responseText);
                     onErr('응답을 읽지 못했어요. 콘솔을 확인해 주세요.');
@@ -449,7 +458,7 @@
             out.classList.remove('show'); insertBtn.classList.remove('show'); outbtns.classList.remove('show');
             flash('늘리는 중… ✍️');
             callGemini(d, a,
-                (result) => { renderResult(result); flash(''); goBtn.disabled = false; },
+                (result, truncated) => { renderResult(result); flash(truncated ? '한도에 걸려 끝이 잘렸어요. "짧게"로 바꾸거나 다시 뽑아보세요 ⚠️' : '', !!truncated); goBtn.disabled = false; },
                 (err)    => { flash(err, true); goBtn.disabled = false; });
         }
         goBtn.addEventListener('click', run);
