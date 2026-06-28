@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.2.2
+// @version      6.3.0
 // @author       me
 // @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음). 모바일(터치 드래그·하단 잘림) 대응.
 // @match        https://crack.wrtn.ai/*
@@ -28,6 +28,8 @@
     const K_POV       = 'se_pov';
     const K_LENGTH    = 'se_length';
     const K_POS       = 'se_panel_pos';
+    const K_FABPOS    = 'se_fab_pos';
+    const K_STYLE     = 'se_style';
     const K_OPEN      = 'se_panel_open';
 
     const DEFAULT_MODELS = [
@@ -42,7 +44,7 @@
     };
 
     // ───────────────────────── 프롬프트 ─────────────────────────
-    function buildPrompt(dialogue, action, lengthKey, persona, pov, name) {
+    function buildPrompt(dialogue, action, lengthKey, persona, pov, name, style) {
         const lenGuide = (LENGTHS[lengthKey] || LENGTHS.medium).guide;
         const isThird = (pov === 'third');
         const lines = [
@@ -56,6 +58,13 @@
             lines.push('[유저 캐릭터의 페르소나]');
             lines.push(persona.trim());
             lines.push('- 위 페르소나의 성격·말투·가치관·배경에 어울리게 써라. 설정을 본문에 그대로 나열·설명하지 말고 자연스럽게 녹여라.');
+        }
+
+        if (style && style.trim()) {
+            lines.push('');
+            lines.push('[문체 규칙 — 사용자가 직접 지정함, 매우 중요]');
+            lines.push(style.trim());
+            lines.push('- 위 문체 규칙을 다른 어떤 규칙보다 우선해서 반드시 지켜라. (단, 따옴표=대사 / 별표=서술 형식과 시점 규칙은 그대로 유지)');
         }
 
         lines.push('');
@@ -144,13 +153,14 @@
         const model = GM_getValue(K_MODEL, DEFAULT_MODELS[0].id);
         const lengthKey = GM_getValue(K_LENGTH, 'medium');
         const persona = GM_getValue(K_PERSONA, '');
+        const style = GM_getValue(K_STYLE, '');
         const pov = GM_getValue(K_POV, 'first');
         const name = GM_getValue(K_NAME, '');
 
         if (!apiKey) { onErr('API 키가 없어요. ⚙️ 설정에서 먼저 넣어주세요.'); return; }
         if (!dialogue.trim() && !action.trim()) { onErr('대사나 행동 중 하나는 입력해 주세요.'); return; }
 
-        const { system, user } = buildPrompt(dialogue, action, lengthKey, persona, pov, name);
+        const { system, user } = buildPrompt(dialogue, action, lengthKey, persona, pov, name, style);
         const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/'
             + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(apiKey);
 
@@ -283,7 +293,7 @@
     #se-settings.show { display: flex; }
     #se-settings label { font-size: 12px; color: #b9bcca; font-weight: 600; }
     #se-settings input, #se-settings select, #se-settings textarea { width: 100%; background: #14161c; color: #e9eaf0; border: 1px solid #33384a; border-radius: 9px; padding: 9px; font-size: 13px; font-family: inherit; }
-    #se-persona { min-height: 64px; max-height: 160px; resize: vertical; line-height: 1.5; }
+    #se-persona, #se-style { min-height: 64px; max-height: 160px; resize: vertical; line-height: 1.5; }
     #se-settings input:focus, #se-settings select:focus, #se-settings textarea:focus { outline: none; border-color: #6c7bff; }
     #se-fetch { padding: 8px; border: 1px solid #4a4f63; border-radius: 9px; cursor: pointer; background: #23262f; color: #cdd1e0; font-size: 12px; font-weight: 600; }
     #se-fetch:hover { background: #2d3140; }
@@ -292,7 +302,7 @@
     #se-fetch-status.err { color: #ff8a8a; }
     #se-save { padding: 9px; border: none; border-radius: 9px; cursor: pointer; background: #6c7bff; color: #fff; font-weight: 700; font-size: 13px; }
     #se-hint { font-size: 11px; color: #777c8e; line-height: 1.5; }
-    #se-fab { right: 18px; bottom: 18px; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg,#6c7bff,#8a5cff); color: #fff; border: none; cursor: pointer; font-size: 22px; display: none; align-items: center; justify-content: center; box-shadow: 0 8px 24px rgba(108,123,255,.5); }
+    #se-fab { right: 18px; bottom: 18px; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); width: 52px; height: 52px; border-radius: 50%; touch-action: none; background: linear-gradient(135deg,#6c7bff,#8a5cff); color: #fff; border: none; cursor: pointer; font-size: 22px; display: none; align-items: center; justify-content: center; box-shadow: 0 8px 24px rgba(108,123,255,.5); }
     #se-fab.show { display: flex; }
     `;
 
@@ -335,6 +345,8 @@
             <div id="se-settings">
                 <label>🎭 유저 페르소나 (선택)</label>
                 <textarea id="se-persona" placeholder='예: 27세 무뚝뚝한 검사. 말수 적고 비꼬는 말투. 속은 다정함.'></textarea>
+                <label>✍️ 문체 규칙 (선택) — 원하는 말투·문장 스타일을 자유롭게</label>
+                <textarea id="se-style" placeholder='예: 짧고 건조한 문장 위주로. 비유는 적게. 감탄사 자제. 현재형으로 써줘.'></textarea>
                 <label>🪪 캐릭터 이름 (3인칭일 때 사용, 선택)</label>
                 <input id="se-name" type="text" placeholder="예: 서지훈">
                 <label>🔑 Gemini API 키</label>
@@ -344,7 +356,7 @@
                 <button id="se-fetch">🔄 사용 가능한 모델 불러오기</button>
                 <div id="se-fetch-status"></div>
                 <button id="se-save">저장</button>
-                <div id="se-hint">키는 aistudio.google.com 에서 발급해요. 이 브라우저에만 저장되고 절대 공유 마세요. 페르소나·이름·시점도 함께 저장돼요.</div>
+                <div id="se-hint">키는 aistudio.google.com 에서 발급해요. 이 브라우저에만 저장되고 절대 공유 마세요. 페르소나·문체 규칙·이름·시점도 함께 저장돼요.</div>
             </div>
         `;
         document.body.appendChild(panel);
@@ -368,6 +380,7 @@
         const settings  = $('#se-settings');
         const modelSel  = $('#se-model');
         const persona   = $('#se-persona');
+        const styleInput = $('#se-style');
         const nameInput = $('#se-name');
         const fetchBtn  = $('#se-fetch');
         const fetchStat = $('#se-fetch-status');
@@ -376,6 +389,13 @@
         if (pos && typeof pos.left === 'number') { panel.style.left = pos.left + 'px'; panel.style.top = pos.top + 'px'; panel.style.right = 'auto'; }
         else { panel.style.right = '18px'; panel.style.top = '90px'; }
         if (GM_getValue(K_OPEN, true) === false) { panel.style.display = 'none'; fab.classList.add('show'); }
+
+        // FAB(✨ 토글) 저장된 위치 복원
+        const fpos = GM_getValue(K_FABPOS, null);
+        if (fpos && typeof fpos.left === 'number') {
+            fab.style.left = fpos.left + 'px'; fab.style.top = fpos.top + 'px';
+            fab.style.right = 'auto'; fab.style.bottom = 'auto';
+        }
 
         // 시점 토글
         const savedPov = GM_getValue(K_POV, 'first');
@@ -400,6 +420,7 @@
         // 설정값 로드
         $('#se-key').value = GM_getValue(K_APIKEY, '');
         persona.value = GM_getValue(K_PERSONA, '');
+        styleInput.value = GM_getValue(K_STYLE, '');
         nameInput.value = GM_getValue(K_NAME, '');
 
         function populateModels(list, selected) {
@@ -426,6 +447,7 @@
         $('#se-save').addEventListener('click', () => {
             GM_setValue(K_APIKEY, $('#se-key').value.trim());
             GM_setValue(K_PERSONA, persona.value);
+            GM_setValue(K_STYLE, styleInput.value);
             GM_setValue(K_NAME, nameInput.value.trim());
             if (modelSel.value) GM_setValue(K_MODEL, modelSel.value);
             settings.classList.remove('show');
@@ -433,7 +455,52 @@
         });
 
         $('#se-min').addEventListener('click', () => { panel.style.display = 'none'; fab.classList.add('show'); GM_setValue(K_OPEN, false); });
-        fab.addEventListener('click', () => { panel.style.display = 'flex'; fab.classList.remove('show'); GM_setValue(K_OPEN, true); setTimeout(() => { if (wireUp._clamp) wireUp._clamp(false); }, 0); });
+        // FAB: 살짝만 누르면 열기(클릭), 끌면 위치 이동
+        let fabDrag = false, fabMoved = false, fabId = null, fabOffX = 0, fabOffY = 0, fabSX = 0, fabSY = 0;
+        function clampFab(save) {
+            const r = fab.getBoundingClientRect();
+            let l = isNaN(parseFloat(fab.style.left)) ? r.left : parseFloat(fab.style.left);
+            let t = isNaN(parseFloat(fab.style.top)) ? r.top : parseFloat(fab.style.top);
+            l = Math.max(0, Math.min(l, window.innerWidth - fab.offsetWidth));
+            t = Math.max(0, Math.min(t, window.innerHeight - fab.offsetHeight));
+            fab.style.left = l + 'px'; fab.style.top = t + 'px';
+            fab.style.right = 'auto'; fab.style.bottom = 'auto';
+            if (save) GM_setValue(K_FABPOS, { left: l, top: t });
+        }
+        fab.addEventListener('pointerdown', (e) => {
+            fabDrag = true; fabMoved = false; fabId = e.pointerId;
+            const r = fab.getBoundingClientRect();
+            fabOffX = e.clientX - r.left; fabOffY = e.clientY - r.top;
+            fabSX = e.clientX; fabSY = e.clientY;
+            try { fab.setPointerCapture(e.pointerId); } catch (_) {}
+        });
+        fab.addEventListener('pointermove', (e) => {
+            if (!fabDrag || e.pointerId !== fabId) return;
+            if (Math.abs(e.clientX - fabSX) + Math.abs(e.clientY - fabSY) > 6) fabMoved = true;
+            if (!fabMoved) return;
+            let l = e.clientX - fabOffX, t = e.clientY - fabOffY;
+            l = Math.max(0, Math.min(l, window.innerWidth - fab.offsetWidth));
+            t = Math.max(0, Math.min(t, window.innerHeight - fab.offsetHeight));
+            fab.style.left = l + 'px'; fab.style.top = t + 'px';
+            fab.style.right = 'auto'; fab.style.bottom = 'auto';
+            e.preventDefault();
+        });
+        function fabEnd(e) {
+            if (!fabDrag) return;
+            if (e && e.pointerId != null && e.pointerId !== fabId) return;
+            fabDrag = false; fabId = null;
+            if (fabMoved) {
+                const r = fab.getBoundingClientRect();
+                GM_setValue(K_FABPOS, { left: r.left, top: r.top });
+            } else {
+                // 안 움직였으면 = 클릭 → 패널 열기
+                panel.style.display = 'flex'; fab.classList.remove('show'); GM_setValue(K_OPEN, true);
+                setTimeout(() => { if (wireUp._clamp) wireUp._clamp(false); }, 0);
+            }
+        }
+        fab.addEventListener('pointerup', fabEnd);
+        fab.addEventListener('pointercancel', fabEnd);
+        window.addEventListener('resize', () => { if (fab.classList.contains('show')) clampFab(true); });
 
         let statusTimer = null;
         function flash(msg, isErr) {
