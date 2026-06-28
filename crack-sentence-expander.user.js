@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.8.3
+// @version      6.8.4
 // @author       me
-// @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 크랙 채팅창 직접 입력. ✨ 토글 버튼으로 열기/닫기 가능.
+// @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력. ✨ 토글 버튼으로 열기/닫기 가능.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -23,19 +23,28 @@
     const K_APIKEY    = 'se_gemini_key';
     const K_MODEL     = 'se_gemini_model';
     const K_MODELLIST = 'se_model_list';
+
     const K_PERSONA   = 'se_persona';
     const K_PERSONAS  = 'se_personas';
+
     const K_NAME      = 'se_name';
     const K_POV       = 'se_pov';
     const K_LENGTH    = 'se_length';
+
     const K_POS       = 'se_panel_pos';
     const K_FABPOS    = 'se_fab_pos2';
+    const K_OPEN      = 'se_panel_open';
+
     const K_STYLE     = 'se_style';
     const K_STYLES    = 'se_styles';
+
     const K_CTX_ON    = 'se_ctx_on';
     const K_CTX_N     = 'se_ctx_n';
     const K_CTX_SEL   = 'se_ctx_sel';
-    const K_OPEN      = 'se_panel_open';
+
+    const K_MEMORY_ON   = 'se_crack_memory_on';
+    const K_MEMORY_AUTO = 'se_crack_memory_auto';
+    const K_MEMORY_TEXT = 'se_crack_memory_text';
 
     const STYLE_SLOTS = 3;
     const PERSONA_SLOTS = 3;
@@ -52,7 +61,7 @@
         long:   { label: '길게', guide: '풍부한 문학적 묘사와 내면 묘사를 충분히 펼쳐서 길게.' },
     };
 
-    function buildPrompt(dialogue, action, lengthKey, persona, pov, name, style, context) {
+    function buildPrompt(dialogue, action, lengthKey, persona, pov, name, style, context, crackMemory) {
         const lenGuide = (LENGTHS[lengthKey] || LENGTHS.medium).guide;
         const isThird = pov === 'third';
 
@@ -76,6 +85,16 @@
             lines.push(style.trim());
             lines.push('- 위 문체 규칙을 다른 어떤 규칙보다 우선해서 반드시 지켜라.');
             lines.push('- 단, 따옴표=대사 / 별표=서술 형식과 시점 규칙은 그대로 유지한다.');
+        }
+
+        if (crackMemory && crackMemory.trim()) {
+            lines.push('');
+            lines.push('[크랙 요약 메모리 — 장기 기억/단기 기억/관계도/목표]');
+            lines.push(crackMemory.trim());
+            lines.push('- 위 내용은 크랙이 정리한 기억이다. 현재 장면의 배경 기억으로 반드시 참고하라.');
+            lines.push('- 단, 본문에 그대로 복붙하거나 설명문처럼 읊지 마라.');
+            lines.push('- 필요한 경우 관계성, 거리감, 감정선, 이전 사건의 여파, 목표를 자연스럽게 반영하라.');
+            lines.push('- 이번 출력은 어디까지나 유저 캐릭터의 이번 [대사]/[행동]만 확장하는 것이다.');
         }
 
         if (context && context.length) {
@@ -133,7 +152,7 @@
         lines.push('- 같은 문장이나 같은 표현·구절을 반복하지 마라.');
         lines.push('- 비슷한 의미라도 앞에서 이미 쓴 묘사·문장 구조를 또 쓰지 마라.');
         lines.push('- 동어 반복이나 같은 행동·감정의 재탕을 하지 마라.');
-        lines.push('- 페르소나·문체 규칙·이름·설정 내용을 본문에서 그대로 읊거나 설명하지 마라.');
+        lines.push('- 페르소나·문체 규칙·이름·설정·크랙 요약 메모리를 본문에서 그대로 읊거나 설명하지 마라.');
         lines.push('- 입력에 없는 자기소개·배경 설명을 끼워 넣지 마라.');
         lines.push('- 길이를 채우려고 했던 말을 늘려 반복하지 마라.');
         lines.push('- 늘릴 내용이 없으면 차라리 짧게 끝내라.');
@@ -157,6 +176,7 @@
         lines.push('- 전체를 따옴표나 코드블록으로 감싸지 마라.');
 
         const system = lines.join('\n');
+
         const user = [
             '[대사]',
             dialogue.trim() || '(없음)',
@@ -324,6 +344,102 @@
         return out.slice(-Math.max(1, maxN || 6));
     }
 
+    function collectCrackMemoryFromPage() {
+        const rootCandidates = Array.from(document.querySelectorAll('[role="dialog"], main, section, article, div'))
+            .filter(el => {
+                if (!isVisible(el)) return false;
+
+                const t = (el.innerText || '').trim();
+                if (!t) return false;
+
+                return /요약\s*메모리|장기\s*기억|단기\s*기억|관계도|목표/.test(t);
+            });
+
+        let root = null;
+
+        if (rootCandidates.length) {
+            rootCandidates.sort((a, b) => {
+                const at = (a.innerText || '').length;
+                const bt = (b.innerText || '').length;
+                return at - bt;
+            });
+
+            root = rootCandidates.find(el => {
+                const t = (el.innerText || '').trim();
+                return t.length >= 20 && t.length <= 12000;
+            }) || rootCandidates[0];
+        }
+
+        if (!root) return '';
+
+        const rawLines = (root.innerText || '')
+            .split(/\n+/)
+            .map(s => s.replace(/\s+/g, ' ').trim())
+            .filter(Boolean);
+
+        const bannedExact = new Set([
+            '요약 메모리',
+            '장기 기억',
+            '단기 기억',
+            '관계도',
+            '목표',
+            '추가',
+            '최신순',
+            '오래된순',
+            '닫기',
+            '확인',
+            '취소',
+            '저장',
+            '삭제',
+            '수정',
+            '뒤로',
+        ]);
+
+        const useful = [];
+        const seen = new Set();
+
+        for (const line of rawLines) {
+            if (!line) continue;
+            if (seen.has(line)) continue;
+            seen.add(line);
+
+            if (bannedExact.has(line)) continue;
+            if (/^총\s*\d+\s*개$/.test(line)) continue;
+            if (/^총\s*\d+개$/.test(line)) continue;
+            if (/^더 많은 메시지가 필요해요/.test(line)) continue;
+            if (/요약 메모리가 추가되려면/.test(line)) continue;
+            if (/^[<>∨⌄⌃^]+$/.test(line)) continue;
+            if (line.length < 2) continue;
+
+            useful.push(line);
+        }
+
+        if (!useful.length) return '';
+
+        const limited = useful.slice(0, 120);
+
+        return limited.join('\n').trim();
+    }
+
+    function getCrackMemoryForPrompt() {
+        if (!GM_getValue(K_MEMORY_ON, false)) return '';
+
+        let saved = GM_getValue(K_MEMORY_TEXT, '');
+
+        if (GM_getValue(K_MEMORY_AUTO, true)) {
+            try {
+                const fresh = collectCrackMemoryFromPage();
+
+                if (fresh && fresh.trim()) {
+                    saved = fresh.trim();
+                    GM_setValue(K_MEMORY_TEXT, saved);
+                }
+            } catch (_) {}
+        }
+
+        return saved || '';
+    }
+
     function callGemini(dialogue, action, onDone, onErr) {
         const apiKey = GM_getValue(K_APIKEY, '');
         const model = GM_getValue(K_MODEL, DEFAULT_MODELS[0].id);
@@ -332,6 +448,7 @@
         const style = getActiveStyle();
         const pov = GM_getValue(K_POV, 'first');
         const name = GM_getValue(K_NAME, '');
+        const crackMemory = getCrackMemoryForPrompt();
 
         let context = [];
         if (GM_getValue(K_CTX_ON, false)) {
@@ -355,7 +472,7 @@
             return;
         }
 
-        const { system, user } = buildPrompt(dialogue, action, lengthKey, persona, pov, name, style, context);
+        const { system, user } = buildPrompt(dialogue, action, lengthKey, persona, pov, name, style, context, crackMemory);
 
         const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/'
             + encodeURIComponent(model)
@@ -483,24 +600,33 @@
         el.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
+    function blurEverything() {
+        try {
+            if (document.activeElement && document.activeElement.blur) {
+                document.activeElement.blur();
+            }
+        } catch (_) {}
+
+        try {
+            if (window.getSelection) window.getSelection().removeAllRanges();
+        } catch (_) {}
+    }
+
     function insertIntoChat(text) {
         const el = findChatInput();
         if (!el) return false;
-
-        el.focus();
 
         const tag = el.tagName;
 
         if (tag === 'TEXTAREA' || tag === 'INPUT') {
             setNativeValue(el, text);
-
-            try {
-                el.selectionStart = el.selectionEnd = el.value.length;
-            } catch (_) {}
+            blurEverything();
         } else {
             let ok = false;
 
             try {
+                el.focus();
+
                 const sel = window.getSelection();
                 const range = document.createRange();
 
@@ -526,6 +652,8 @@
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                 }
             }
+
+            blurEverything();
         }
 
         return true;
@@ -789,6 +917,13 @@
         resize: vertical;
         line-height: 1.5;
     }
+    #se-crack-memory-text {
+        min-height: 90px !important;
+        max-height: 180px;
+        resize: vertical;
+        line-height: 1.5;
+        font-size: 12px;
+    }
     .se-style-slot {
         display: flex;
         flex-direction: column;
@@ -824,7 +959,9 @@
         border-color: #6c7bff;
     }
     #se-fetch,
-    #se-ctx-test {
+    #se-ctx-test,
+    #se-memory-fetch,
+    #se-memory-clear {
         padding: 8px;
         border: 1px solid #4a4f63;
         border-radius: 9px;
@@ -835,7 +972,9 @@
         font-weight: 600;
     }
     #se-fetch:hover,
-    #se-ctx-test:hover {
+    #se-ctx-test:hover,
+    #se-memory-fetch:hover,
+    #se-memory-clear:hover {
         background: #2d3140;
     }
     #se-fetch:disabled {
@@ -844,12 +983,14 @@
     }
     #se-fetch-status,
     #se-ctx-status,
+    #se-memory-status,
     #se-sync-status {
         font-size: 11px;
         color: #9aa0b4;
         min-height: 14px;
     }
     #se-fetch-status.err,
+    #se-memory-status.err,
     #se-sync-status.err {
         color: #ff8a8a;
     }
@@ -912,7 +1053,8 @@
         font-size: 12px;
         color: #b9bcca;
     }
-    #se-ctx-status {
+    #se-ctx-status,
+    #se-memory-status {
         white-space: pre-wrap;
         max-height: 120px;
         overflow-y: auto;
@@ -925,12 +1067,16 @@
         line-height: 1.45;
         font-size: 12px;
     }
-    .se-sync-btns {
+    .se-sync-btns,
+    .se-memory-btns {
         display: flex;
         gap: 6px;
     }
-    .se-sync-btns button {
+    .se-sync-btns button,
+    .se-memory-btns button {
         flex: 1;
+    }
+    .se-sync-btns button {
         padding: 9px;
         border: 1px solid #4a4f63;
         border-radius: 9px;
@@ -1048,6 +1194,26 @@
                     <textarea id="se-style-2" class="se-style-ta" placeholder='예: 감각적이고 서정적인 묘사 위주.'></textarea>
                 </div>
 
+                <label>🧠 크랙 요약 메모리 자동 참고</label>
+
+                <div class="se-ctx-row">
+                    <input type="checkbox" id="se-memory-on">
+                    <span class="se-ctx-label">프롬프트에 참고시키기</span>
+                </div>
+
+                <div class="se-ctx-row">
+                    <input type="checkbox" id="se-memory-auto">
+                    <span class="se-ctx-label">문학적으로 늘리기 누를 때, 현재 화면이 요약 메모리면 자동 새로고침</span>
+                </div>
+
+                <div class="se-memory-btns">
+                    <button id="se-memory-fetch">📥 현재 화면에서 메모리 가져오기</button>
+                    <button id="se-memory-clear">🗑 비우기</button>
+                </div>
+
+                <textarea id="se-crack-memory-text" placeholder="크랙의 요약 메모리 화면을 열고 '현재 화면에서 메모리 가져오기'를 누르면 여기에 저장돼요. 직접 붙여넣어도 돼요."></textarea>
+                <div id="se-memory-status"></div>
+
                 <label>🧠 최근 대화 맥락 참고 (실험적)</label>
 
                 <div class="se-ctx-row">
@@ -1085,9 +1251,8 @@
                 <div id="se-sync-status"></div>
 
                 <div id="se-hint">
-                    키는 aistudio.google.com 에서 발급해요. 이 브라우저에만 저장되고 절대 공유하지 마세요.
-                    페르소나·문체 각 3칸·이름·시점도 함께 저장돼요.
-                    가져오기 후 모델 목록이 비어 보이면 “사용 가능한 모델 불러오기”를 한 번 눌러주세요.
+                    크랙 요약 메모리는 화면에 보이는 텍스트만 가져와요. 요약 메모리 화면을 열고 가져오기를 눌러주세요.
+                    가져온 메모리와 최근 대화 맥락은 Gemini API로 같이 전송돼요. 개인정보/API 키/비밀번호는 넣지 마세요.
                 </div>
             </div>
         `;
@@ -1252,6 +1417,55 @@
             if (chk) chk.addEventListener('change', saveStyles);
         }
 
+        const memoryOn = $('#se-memory-on');
+        const memoryAuto = $('#se-memory-auto');
+        const memoryText = $('#se-crack-memory-text');
+        const memoryStatus = $('#se-memory-status');
+
+        memoryOn.checked = GM_getValue(K_MEMORY_ON, false);
+        memoryAuto.checked = GM_getValue(K_MEMORY_AUTO, true);
+        memoryText.value = GM_getValue(K_MEMORY_TEXT, '');
+
+        function memoryFlash(msg, isErr) {
+            memoryStatus.textContent = msg;
+            memoryStatus.classList.toggle('err', !!isErr);
+        }
+
+        function saveMemorySettings() {
+            GM_setValue(K_MEMORY_ON, memoryOn.checked);
+            GM_setValue(K_MEMORY_AUTO, memoryAuto.checked);
+            GM_setValue(K_MEMORY_TEXT, memoryText.value);
+        }
+
+        memoryOn.addEventListener('change', saveMemorySettings);
+        memoryAuto.addEventListener('change', saveMemorySettings);
+        memoryText.addEventListener('change', saveMemorySettings);
+
+        $('#se-memory-fetch').addEventListener('click', () => {
+            let mem = '';
+
+            try {
+                mem = collectCrackMemoryFromPage();
+            } catch (_) {
+                mem = '';
+            }
+
+            if (!mem || !mem.trim()) {
+                memoryFlash('가져올 메모리를 못 찾았어요. 크랙의 “요약 메모리” 화면을 열고 다시 눌러주세요. 현재 총 0개면 가져올 내용이 없어요.', true);
+                return;
+            }
+
+            memoryText.value = mem.trim();
+            saveMemorySettings();
+            memoryFlash('현재 화면에서 요약 메모리를 가져왔어요 ✅');
+        });
+
+        $('#se-memory-clear').addEventListener('click', () => {
+            memoryText.value = '';
+            GM_setValue(K_MEMORY_TEXT, '');
+            memoryFlash('요약 메모리 칸을 비웠어요.');
+        });
+
         const ctxChk = $('#se-ctx-chk');
         const ctxN = $('#se-ctx-n');
         const ctxSel = $('#se-ctx-sel');
@@ -1340,6 +1554,8 @@
             GM_setValue(K_APIKEY, $('#se-key').value.trim());
             savePersonas();
             saveStyles();
+            saveMemorySettings();
+
             GM_setValue(K_NAME, nameInput.value.trim());
             GM_setValue(K_CTX_ON, ctxChk.checked);
             GM_setValue(K_CTX_N, parseInt(ctxN.value, 10) || 6);
@@ -1362,7 +1578,10 @@
             K_LENGTH,
             K_CTX_ON,
             K_CTX_N,
-            K_CTX_SEL
+            K_CTX_SEL,
+            K_MEMORY_ON,
+            K_MEMORY_AUTO,
+            K_MEMORY_TEXT
         ];
 
         const syncBox = $('#se-sync-box');
@@ -1384,6 +1603,7 @@
         $('#se-export').addEventListener('click', () => {
             savePersonas();
             saveStyles();
+            saveMemorySettings();
 
             const obj = {};
 
@@ -1720,7 +1940,13 @@
             if (insertIntoChat(lastResult)) {
                 dialogue.value = '';
                 action.value = '';
-                flash('채팅창에 넣었어요 💬 기존 내용은 지웠어요.');
+
+                blurEverything();
+
+                panel.style.display = 'none';
+                GM_setValue(K_OPEN, false);
+
+                flash('채팅창에 넣었어요 💬 창을 닫았어요.');
             } else {
                 copyToClipboard(
                     lastResult,
