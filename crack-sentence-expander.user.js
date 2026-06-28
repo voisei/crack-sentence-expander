@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.5.1
+// @version      6.6.0
 // @author       me
 // @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음). 모바일(터치 드래그·하단 잘림) 대응.
 // @match        https://crack.wrtn.ai/*
@@ -31,6 +31,9 @@
     const K_FABPOS    = 'se_fab_pos2';
     const K_STYLE     = 'se_style';
     const K_STYLES    = 'se_styles';
+    const K_CTX_ON    = 'se_ctx_on';
+    const K_CTX_N     = 'se_ctx_n';
+    const K_CTX_SEL   = 'se_ctx_sel';
     const K_OPEN      = 'se_panel_open';
 
     const DEFAULT_MODELS = [
@@ -46,7 +49,7 @@
     };
 
     // ───────────────────────── 프롬프트 ─────────────────────────
-    function buildPrompt(dialogue, action, lengthKey, persona, pov, name, style) {
+    function buildPrompt(dialogue, action, lengthKey, persona, pov, name, style, context) {
         const lenGuide = (LENGTHS[lengthKey] || LENGTHS.medium).guide;
         const isThird = (pov === 'third');
         const lines = [
@@ -67,6 +70,15 @@
             lines.push('[문체 규칙 — 사용자가 직접 지정함, 매우 중요]');
             lines.push(style.trim());
             lines.push('- 위 문체 규칙을 다른 어떤 규칙보다 우선해서 반드시 지켜라. (단, 따옴표=대사 / 별표=서술 형식과 시점 규칙은 그대로 유지)');
+        }
+
+        if (context && context.length) {
+            lines.push('');
+            lines.push('[직전 대화 맥락 — 참고용]');
+            lines.push('아래는 지금까지 오간 대화의 최근 흐름이다(위가 과거, 아래가 최신).');
+            context.forEach(m => lines.push('  · ' + m));
+            lines.push('- 이 맥락에 자연스럽게 "이어지도록" 유저 캐릭터의 이번 입력을 늘려라.');
+            lines.push('- 단, 맥락은 참고만 한다. 맥락 속 상대·NPC의 말이나 행동을 새로 지어내거나 이어 쓰지 마라. 오직 유저 캐릭터의 이번 [대사]/[행동]만 늘린다.');
         }
 
         lines.push('');
@@ -209,19 +221,57 @@
             .join('\n');
     }
 
+    // 화면에서 최근 대화 메시지 추출 (selector 있으면 우선, 없으면 자동 추정)
+    function collectChatContext(maxN, selector) {
+        const inPanel = el => el.closest && el.closest('#se-panel');
+        let nodes = [];
+        if (selector && selector.trim()) {
+            try { nodes = Array.from(document.querySelectorAll(selector.trim())); } catch (_) { nodes = []; }
+            nodes = nodes.filter(el => !inPanel(el) && isVisible(el));
+        }
+        if (!nodes.length) {
+            // 자동 추정: 적당한 길이의 '가장 안쪽' 텍스트 블록만
+            const cands = Array.from(document.body.querySelectorAll('p, div, span, li, article'))
+                .filter(el => {
+                    if (inPanel(el)) return false;
+                    if (el.querySelector('textarea, input, button, select')) return false; // 입력창·UI 컨테이너 제외
+                    if (!isVisible(el)) return false;
+                    const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+                    return t.length >= 2 && t.length <= 1200;
+                });
+            nodes = cands.filter(el => !cands.some(o => o !== el && el.contains(o)));
+        }
+        nodes.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+        const out = [];
+        const seen = new Set();
+        for (const el of nodes) {
+            const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+            if (!t || seen.has(t)) continue;
+            seen.add(t);
+            out.push(t);
+        }
+        return out.slice(-Math.max(1, maxN || 6));
+    }
+
     function callGemini(dialogue, action, onDone, onErr) {
         const apiKey = GM_getValue(K_APIKEY, '');
         const model = GM_getValue(K_MODEL, DEFAULT_MODELS[0].id);
         const lengthKey = GM_getValue(K_LENGTH, 'medium');
         const persona = GM_getValue(K_PERSONA, '');
         const style = getActiveStyle();
+        let context = [];
+        if (GM_getValue(K_CTX_ON, false)) {
+            const n = parseInt(GM_getValue(K_CTX_N, 6), 10) || 6;
+            const sel = GM_getValue(K_CTX_SEL, '');
+            try { context = collectChatContext(n, sel); } catch (_) { context = []; }
+        }
         const pov = GM_getValue(K_POV, 'first');
         const name = GM_getValue(K_NAME, '');
 
         if (!apiKey) { onErr('API 키가 없어요. ⚙️ 설정에서 먼저 넣어주세요.'); return; }
         if (!dialogue.trim() && !action.trim()) { onErr('대사나 행동 중 하나는 입력해 주세요.'); return; }
 
-        const { system, user } = buildPrompt(dialogue, action, lengthKey, persona, pov, name, style);
+        const { system, user } = buildPrompt(dialogue, action, lengthKey, persona, pov, name, style, context);
         const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/'
             + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(apiKey);
 
@@ -369,6 +419,13 @@
     #se-save { padding: 9px; border: none; border-radius: 9px; cursor: pointer; background: #6c7bff; color: #fff; font-weight: 700; font-size: 13px; }
     #se-hint { font-size: 11px; color: #777c8e; line-height: 1.5; }
     #se-fab { right: 18px; top: 72px; top: calc(72px + env(safe-area-inset-top, 0px)); width: 52px; height: 52px; border-radius: 50%; touch-action: none; background: linear-gradient(135deg,#6c7bff,#8a5cff); color: #fff; border: none; cursor: pointer; font-size: 22px; display: none; align-items: center; justify-content: center; box-shadow: 0 8px 24px rgba(108,123,255,.5); }
+    .se-ctx-row { display: flex; align-items: center; gap: 8px; }
+    #se-settings .se-ctx-row input[type="checkbox"] { width: 18px; height: 18px; flex: 0 0 auto; padding: 0; margin: 0; accent-color: #6c7bff; cursor: pointer; }
+    #se-settings input.se-ctx-n { width: 64px; flex: 0 0 auto; text-align: center; }
+    .se-ctx-label { font-size: 12px; color: #b9bcca; }
+    #se-ctx-test { padding: 8px; border: 1px solid #4a4f63; border-radius: 9px; cursor: pointer; background: #23262f; color: #cdd1e0; font-size: 12px; font-weight: 600; }
+    #se-ctx-test:hover { background: #2d3140; }
+    #se-ctx-status { font-size: 11px; color: #9aa0b4; min-height: 14px; white-space: pre-wrap; max-height: 120px; overflow-y: auto; line-height: 1.5; }
     #se-fab.show { display: flex; }
     `;
 
@@ -434,6 +491,16 @@
                     </div>
                     <textarea id="se-style-2" class="se-style-ta" placeholder='예: 감각적이고 서정적인 묘사 위주.'></textarea>
                 </div>
+                <label>🧠 최근 대화 맥락 참고 (실험적)</label>
+                <div class="se-ctx-row">
+                    <input type="checkbox" id="se-ctx-chk">
+                    <span class="se-ctx-label">켜기 · 최근</span>
+                    <input type="number" id="se-ctx-n" class="se-ctx-n" min="1" max="30" value="6">
+                    <span class="se-ctx-label">개</span>
+                </div>
+                <input id="se-ctx-sel" type="text" placeholder="(고급) 메시지 CSS 선택자 — 비워두면 자동">
+                <button id="se-ctx-test">🔍 맥락 미리보기</button>
+                <div id="se-ctx-status"></div>
                 <label>🪪 캐릭터 이름 (3인칭일 때 사용, 선택)</label>
                 <input id="se-name" type="text" placeholder="예: 서지훈">
                 <label>🔑 Gemini API 키</label>
@@ -534,6 +601,23 @@
             if (chk) chk.addEventListener('change', saveStyles);
         }
 
+        // 대화 맥락 참고 설정
+        const ctxChk = $('#se-ctx-chk'), ctxN = $('#se-ctx-n'), ctxSel = $('#se-ctx-sel'), ctxStat = $('#se-ctx-status');
+        ctxChk.checked = GM_getValue(K_CTX_ON, false);
+        ctxN.value = GM_getValue(K_CTX_N, 6);
+        ctxSel.value = GM_getValue(K_CTX_SEL, '');
+        ctxChk.addEventListener('change', () => GM_setValue(K_CTX_ON, ctxChk.checked));
+        $('#se-ctx-test').addEventListener('click', () => {
+            const n = parseInt(ctxN.value, 10) || 6;
+            let arr = [];
+            try { arr = collectChatContext(n, ctxSel.value); } catch (_) {}
+            if (!arr.length) {
+                ctxStat.textContent = '못 잡았어요 😅 채팅이 화면에 보이는지 확인하거나, 선택자를 비워 자동으로 두고 다시 해보세요.';
+                return;
+            }
+            ctxStat.textContent = arr.length + '개 잡힘:\n' + arr.map((m, i) => (i + 1) + '. ' + (m.length > 60 ? m.slice(0, 60) + '…' : m)).join('\n');
+        });
+
         function populateModels(list, selected) {
             modelSel.innerHTML = '';
             list.forEach(m => { const o = document.createElement('option'); o.value = m.id; o.textContent = m.label; modelSel.appendChild(o); });
@@ -560,6 +644,9 @@
             GM_setValue(K_PERSONA, persona.value);
             saveStyles();
             GM_setValue(K_NAME, nameInput.value.trim());
+            GM_setValue(K_CTX_ON, ctxChk.checked);
+            GM_setValue(K_CTX_N, parseInt(ctxN.value, 10) || 6);
+            GM_setValue(K_CTX_SEL, ctxSel.value.trim());
             if (modelSel.value) GM_setValue(K_MODEL, modelSel.value);
             settings.classList.remove('show');
             flash('저장됐어요 ✅');
