@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.4.0
+// @version      6.5.0
 // @author       me
 // @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음). 모바일(터치 드래그·하단 잘림) 대응.
 // @match        https://crack.wrtn.ai/*
@@ -30,6 +30,7 @@
     const K_POS       = 'se_panel_pos';
     const K_FABPOS    = 'se_fab_pos2';
     const K_STYLE     = 'se_style';
+    const K_STYLES    = 'se_styles';
     const K_OPEN      = 'se_panel_open';
 
     const DEFAULT_MODELS = [
@@ -38,8 +39,9 @@
     ];
 
     const LENGTHS = {
+        three:  { label: '세줄', guide: '대사와 서술을 합쳐 3문장 안팎(딱 세 줄 정도)으로, 짧고 압축적으로.' },
         short:  { label: '짧게', guide: '간결하게, 핵심만 살짝 살을 붙여서.' },
-        medium: { label: '보통', guide: '감각 묘사와 감정을 적당히 풀어서 자연스러운 분량으로.' },
+        medium: { label: '중간', guide: '감각 묘사와 감정을 적당히 풀어서 자연스러운 분량으로.' },
         long:   { label: '길게', guide: '풍부한 문학적 묘사와 내면 묘사를 충분히 펼쳐서 길게.' },
     };
 
@@ -156,12 +158,35 @@
     }
 
     // ───────────────────────── 본문 생성 호출 ─────────────────────────
+    const STYLE_SLOTS = 3;
+
+    // 저장된 문체 슬롯 배열 가져오기 (구버전 단일 K_STYLE 자동 이전)
+    function getStyleSlots() {
+        let arr = GM_getValue(K_STYLES, null);
+        if (!Array.isArray(arr)) {
+            const legacy = GM_getValue(K_STYLE, '');
+            arr = [];
+            for (let i = 0; i < STYLE_SLOTS; i++) {
+                arr.push({ on: (i === 0 && !!(legacy && legacy.trim())), name: '문체 ' + (i + 1), text: (i === 0 ? (legacy || '') : '') });
+            }
+        }
+        return arr;
+    }
+
+    // 체크된 문체만 합쳐서 하나의 문자열로
+    function getActiveStyle() {
+        return getStyleSlots()
+            .filter(s => s && s.on && s.text && s.text.trim())
+            .map(s => ((s.name && s.name.trim()) ? '(' + s.name.trim() + ') ' : '') + s.text.trim())
+            .join('\n');
+    }
+
     function callGemini(dialogue, action, onDone, onErr) {
         const apiKey = GM_getValue(K_APIKEY, '');
         const model = GM_getValue(K_MODEL, DEFAULT_MODELS[0].id);
         const lengthKey = GM_getValue(K_LENGTH, 'medium');
         const persona = GM_getValue(K_PERSONA, '');
-        const style = GM_getValue(K_STYLE, '');
+        const style = getActiveStyle();
         const pov = GM_getValue(K_POV, 'first');
         const name = GM_getValue(K_NAME, '');
 
@@ -285,7 +310,7 @@
     #se-go { width: 100%; padding: 11px; border: none; border-radius: 10px; cursor: pointer; background: linear-gradient(135deg,#6c7bff,#8a5cff); color: #fff; font-size: 13px; font-weight: 700; letter-spacing: -.2px; }
     #se-go:hover { filter: brightness(1.08); }
     #se-go:disabled { opacity: .6; cursor: default; }
-    #se-out { white-space: pre-wrap; word-break: break-word; line-height: 1.65; background: #14161c; border: 1px solid #33384a; border-radius: 10px; padding: 11px; min-height: 40px; font-size: 13px; display: none; }
+    #se-out { white-space: pre-wrap; word-break: break-word; line-height: 1.65; background: #14161c; border: 1px solid #33384a; border-radius: 10px; padding: 11px; min-height: 40px; max-height: 45vh; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; font-size: 13px; display: none; }
     #se-out.show { display: block; }
     #se-out em { color: #c8bdff; font-style: italic; }
     #se-insert { width: 100%; padding: 10px; border: none; border-radius: 10px; cursor: pointer; background: linear-gradient(135deg,#3ecf8e,#2fb3c0); color: #07241c; font-size: 13px; font-weight: 800; display: none; }
@@ -301,7 +326,12 @@
     #se-settings.show { display: flex; }
     #se-settings label { font-size: 12px; color: #b9bcca; font-weight: 600; }
     #se-settings input, #se-settings select, #se-settings textarea { width: 100%; background: #14161c; color: #e9eaf0; border: 1px solid #33384a; border-radius: 9px; padding: 9px; font-size: 13px; font-family: inherit; }
-    #se-persona, #se-style { min-height: 64px; max-height: 160px; resize: vertical; line-height: 1.5; }
+    #se-persona, .se-style-ta { min-height: 64px; max-height: 160px; resize: vertical; line-height: 1.5; }
+    .se-style-slot { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid #33384a; border-radius: 10px; background: #191b22; }
+    .se-style-head { display: flex; align-items: center; gap: 8px; }
+    #se-settings .se-style-head input[type="checkbox"] { width: 18px; height: 18px; flex: 0 0 auto; padding: 0; margin: 0; accent-color: #6c7bff; cursor: pointer; }
+    #se-settings input.se-style-name { flex: 1 1 auto; padding: 6px 9px; font-size: 12px; }
+    .se-style-ta { min-height: 50px !important; }
     #se-settings input:focus, #se-settings select:focus, #se-settings textarea:focus { outline: none; border-color: #6c7bff; }
     #se-fetch { padding: 8px; border: 1px solid #4a4f63; border-radius: 9px; cursor: pointer; background: #23262f; color: #cdd1e0; font-size: 12px; font-weight: 600; }
     #se-fetch:hover { background: #2d3140; }
@@ -335,11 +365,12 @@
                         <button data-pov="first">1인칭</button>
                         <button data-pov="third">3인칭</button>
                     </div>
-                    <div class="se-seg" id="se-len">
-                        <button data-len="short">짧게</button>
-                        <button data-len="medium" class="active">보통</button>
-                        <button data-len="long">길게</button>
-                    </div>
+                </div>
+                <div class="se-seg" id="se-len">
+                    <button data-len="three">세줄</button>
+                    <button data-len="short">짧게</button>
+                    <button data-len="medium" class="active">중간</button>
+                    <button data-len="long">길게</button>
                 </div>
                 <button id="se-go">✨ 문학적으로 늘리기</button>
                 <div id="se-status"></div>
@@ -353,8 +384,28 @@
             <div id="se-settings">
                 <label>🎭 유저 페르소나 (선택)</label>
                 <textarea id="se-persona" placeholder='예: 27세 무뚝뚝한 검사. 말수 적고 비꼬는 말투. 속은 다정함.'></textarea>
-                <label>✍️ 문체 규칙 (선택) — 원하는 말투·문장 스타일을 자유롭게</label>
-                <textarea id="se-style" placeholder='예: 짧고 건조한 문장 위주로. 비유는 적게. 감탄사 자제. 현재형으로 써줘.'></textarea>
+                <label>✍️ 문체 규칙 (여러 개 저장 → 쓸 것만 체크 ✔)</label>
+                <div class="se-style-slot">
+                    <div class="se-style-head">
+                        <input type="checkbox" id="se-style-chk-0">
+                        <input type="text" id="se-style-name-0" class="se-style-name" placeholder="이름 (예: 건조체)">
+                    </div>
+                    <textarea id="se-style-0" class="se-style-ta" placeholder='예: 짧고 건조한 문장 위주로. 비유는 적게.'></textarea>
+                </div>
+                <div class="se-style-slot">
+                    <div class="se-style-head">
+                        <input type="checkbox" id="se-style-chk-1">
+                        <input type="text" id="se-style-name-1" class="se-style-name" placeholder="이름 (예: 고풍체)">
+                    </div>
+                    <textarea id="se-style-1" class="se-style-ta" placeholder='예: 고풍스러운 문어체. 한자어를 적절히.'></textarea>
+                </div>
+                <div class="se-style-slot">
+                    <div class="se-style-head">
+                        <input type="checkbox" id="se-style-chk-2">
+                        <input type="text" id="se-style-name-2" class="se-style-name" placeholder="이름 (예: 감성체)">
+                    </div>
+                    <textarea id="se-style-2" class="se-style-ta" placeholder='예: 감각적이고 서정적인 묘사 위주.'></textarea>
+                </div>
                 <label>🪪 캐릭터 이름 (3인칭일 때 사용, 선택)</label>
                 <input id="se-name" type="text" placeholder="예: 서지훈">
                 <label>🔑 Gemini API 키</label>
@@ -364,7 +415,7 @@
                 <button id="se-fetch">🔄 사용 가능한 모델 불러오기</button>
                 <div id="se-fetch-status"></div>
                 <button id="se-save">저장</button>
-                <div id="se-hint">키는 aistudio.google.com 에서 발급해요. 이 브라우저에만 저장되고 절대 공유 마세요. 페르소나·문체 규칙·이름·시점도 함께 저장돼요.</div>
+                <div id="se-hint">키는 aistudio.google.com 에서 발급해요. 이 브라우저에만 저장되고 절대 공유 마세요. 페르소나·문체 3칸·이름·시점도 함께 저장돼요. (체크한 문체는 같이 적용)</div>
             </div>
         `;
         document.body.appendChild(panel);
@@ -388,7 +439,6 @@
         const settings  = $('#se-settings');
         const modelSel  = $('#se-model');
         const persona   = $('#se-persona');
-        const styleInput = $('#se-style');
         const nameInput = $('#se-name');
         const fetchBtn  = $('#se-fetch');
         const fetchStat = $('#se-fetch-status');
@@ -428,8 +478,33 @@
         // 설정값 로드
         $('#se-key').value = GM_getValue(K_APIKEY, '');
         persona.value = GM_getValue(K_PERSONA, '');
-        styleInput.value = GM_getValue(K_STYLE, '');
         nameInput.value = GM_getValue(K_NAME, '');
+
+        // 문체 3슬롯 로드 / 저장
+        function applyStylesToUI(arr) {
+            for (let i = 0; i < STYLE_SLOTS; i++) {
+                const s = arr[i] || { on: false, name: '', text: '' };
+                const chk = $('#se-style-chk-' + i), nm = $('#se-style-name-' + i), ta = $('#se-style-' + i);
+                if (chk) chk.checked = !!s.on;
+                if (nm) nm.value = s.name || '';
+                if (ta) ta.value = s.text || '';
+            }
+        }
+        function collectStyles() {
+            const arr = [];
+            for (let i = 0; i < STYLE_SLOTS; i++) {
+                const chk = $('#se-style-chk-' + i), nm = $('#se-style-name-' + i), ta = $('#se-style-' + i);
+                arr.push({ on: !!(chk && chk.checked), name: (nm && nm.value.trim()) || ('문체 ' + (i + 1)), text: (ta && ta.value) || '' });
+            }
+            return arr;
+        }
+        function saveStyles() { GM_setValue(K_STYLES, collectStyles()); }
+        applyStylesToUI(getStyleSlots());
+        // 체크박스는 누르는 즉시 저장(저장 버튼 안 눌러도 적용)
+        for (let i = 0; i < STYLE_SLOTS; i++) {
+            const chk = $('#se-style-chk-' + i);
+            if (chk) chk.addEventListener('change', saveStyles);
+        }
 
         function populateModels(list, selected) {
             modelSel.innerHTML = '';
@@ -455,7 +530,7 @@
         $('#se-save').addEventListener('click', () => {
             GM_setValue(K_APIKEY, $('#se-key').value.trim());
             GM_setValue(K_PERSONA, persona.value);
-            GM_setValue(K_STYLE, styleInput.value);
+            saveStyles();
             GM_setValue(K_NAME, nameInput.value.trim());
             if (modelSel.value) GM_setValue(K_MODEL, modelSel.value);
             settings.classList.remove('show');
