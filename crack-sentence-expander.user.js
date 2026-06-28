@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.7.0
+// @version      6.8.0
 // @author       me
 // @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음). 모바일(터치 드래그·하단 잘림) 대응.
 // @match        https://crack.wrtn.ai/*
@@ -24,6 +24,7 @@
     const K_MODEL     = 'se_gemini_model';
     const K_MODELLIST = 'se_model_list';
     const K_PERSONA   = 'se_persona';
+    const K_PERSONAS  = 'se_personas';
     const K_NAME      = 'se_name';
     const K_POV       = 'se_pov';
     const K_LENGTH    = 'se_length';
@@ -199,6 +200,28 @@
 
     // ───────────────────────── 본문 생성 호출 ─────────────────────────
     const STYLE_SLOTS = 3;
+    const PERSONA_SLOTS = 3;
+
+    // 저장된 페르소나 슬롯 배열 (구버전 단일 K_PERSONA 자동 이전)
+    function getPersonaSlots() {
+        let arr = GM_getValue(K_PERSONAS, null);
+        if (!Array.isArray(arr)) {
+            const legacy = GM_getValue(K_PERSONA, '');
+            arr = [];
+            for (let i = 0; i < PERSONA_SLOTS; i++) {
+                arr.push({ on: (i === 0 && !!(legacy && legacy.trim())), name: '페르소나 ' + (i + 1), text: (i === 0 ? (legacy || '') : '') });
+            }
+        }
+        return arr;
+    }
+
+    // 체크된 페르소나만 합쳐서 하나의 문자열로
+    function getActivePersona() {
+        return getPersonaSlots()
+            .filter(s => s && s.on && s.text && s.text.trim())
+            .map(s => ((s.name && s.name.trim()) ? '【' + s.name.trim() + '】 ' : '') + s.text.trim())
+            .join('\n');
+    }
 
     // 저장된 문체 슬롯 배열 가져오기 (구버전 단일 K_STYLE 자동 이전)
     function getStyleSlots() {
@@ -257,7 +280,7 @@
         const apiKey = GM_getValue(K_APIKEY, '');
         const model = GM_getValue(K_MODEL, DEFAULT_MODELS[0].id);
         const lengthKey = GM_getValue(K_LENGTH, 'medium');
-        const persona = GM_getValue(K_PERSONA, '');
+        const persona = getActivePersona();
         const style = getActiveStyle();
         let context = [];
         if (GM_getValue(K_CTX_ON, false)) {
@@ -404,7 +427,7 @@
     #se-settings.show { display: flex; }
     #se-settings label { font-size: 12px; color: #b9bcca; font-weight: 600; }
     #se-settings input, #se-settings select, #se-settings textarea { width: 100%; background: #14161c; color: #e9eaf0; border: 1px solid #33384a; border-radius: 9px; padding: 9px; font-size: 13px; font-family: inherit; }
-    #se-persona, .se-style-ta { min-height: 64px; max-height: 160px; resize: vertical; line-height: 1.5; }
+    .se-style-ta { min-height: 64px; max-height: 160px; resize: vertical; line-height: 1.5; }
     .se-style-slot { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid #33384a; border-radius: 10px; background: #191b22; }
     .se-style-head { display: flex; align-items: center; gap: 8px; }
     #se-settings .se-style-head input[type="checkbox"] { width: 18px; height: 18px; flex: 0 0 auto; padding: 0; margin: 0; accent-color: #6c7bff; cursor: pointer; }
@@ -473,8 +496,28 @@
                 </div>
             </div>
             <div id="se-settings">
-                <label>🎭 유저 페르소나 (선택)</label>
-                <textarea id="se-persona" placeholder='예: 27세 무뚝뚝한 검사. 말수 적고 비꼬는 말투. 속은 다정함.'></textarea>
+                <label>🎭 유저 페르소나 (여러 개 저장 → 쓸 것만 체크 ✔)</label>
+                <div class="se-style-slot">
+                    <div class="se-style-head">
+                        <input type="checkbox" id="se-persona-chk-0">
+                        <input type="text" id="se-persona-name-0" class="se-style-name" placeholder="이름 (예: 검사 서지훈)">
+                    </div>
+                    <textarea id="se-persona-0" class="se-style-ta" placeholder='예: 27세 무뚝뚝한 검사. 말수 적고 비꼬는 말투. 속은 다정함.'></textarea>
+                </div>
+                <div class="se-style-slot">
+                    <div class="se-style-head">
+                        <input type="checkbox" id="se-persona-chk-1">
+                        <input type="text" id="se-persona-name-1" class="se-style-name" placeholder="이름 (예: 학생 ver)">
+                    </div>
+                    <textarea id="se-persona-1" class="se-style-ta" placeholder='예: 밝고 발랄한 고등학생. 호기심 많고 장난기 가득.'></textarea>
+                </div>
+                <div class="se-style-slot">
+                    <div class="se-style-head">
+                        <input type="checkbox" id="se-persona-chk-2">
+                        <input type="text" id="se-persona-name-2" class="se-style-name" placeholder="이름 (선택)">
+                    </div>
+                    <textarea id="se-persona-2" class="se-style-ta" placeholder='예: ...'></textarea>
+                </div>
                 <label>✍️ 문체 규칙 (여러 개 저장 → 쓸 것만 체크 ✔)</label>
                 <div class="se-style-slot">
                     <div class="se-style-head">
@@ -523,7 +566,7 @@
                     <button id="se-import">📥 가져오기</button>
                 </div>
                 <div id="se-sync-status"></div>
-                <div id="se-hint">키는 aistudio.google.com 에서 발급해요. 이 브라우저에만 저장되고 절대 공유 마세요. 페르소나·문체 3칸·이름·시점도 함께 저장돼요. (체크한 문체는 같이 적용)</div>
+                <div id="se-hint">키는 aistudio.google.com 에서 발급해요. 이 브라우저에만 저장되고 절대 공유 마세요. 페르소나·문체 각 3칸·이름·시점도 함께 저장돼요. (체크한 것끼리 같이 적용)</div>
             </div>
         `;
         document.body.appendChild(panel);
@@ -546,7 +589,6 @@
         const goBtn     = $('#se-go');
         const settings  = $('#se-settings');
         const modelSel  = $('#se-model');
-        const persona   = $('#se-persona');
         const nameInput = $('#se-name');
         const fetchBtn  = $('#se-fetch');
         const fetchStat = $('#se-fetch-status');
@@ -585,8 +627,32 @@
 
         // 설정값 로드
         $('#se-key').value = GM_getValue(K_APIKEY, '');
-        persona.value = GM_getValue(K_PERSONA, '');
         nameInput.value = GM_getValue(K_NAME, '');
+
+        // 페르소나 3슬롯 로드 / 저장
+        function applyPersonasToUI(arr) {
+            for (let i = 0; i < PERSONA_SLOTS; i++) {
+                const s = arr[i] || { on: false, name: '', text: '' };
+                const chk = $('#se-persona-chk-' + i), nm = $('#se-persona-name-' + i), ta = $('#se-persona-' + i);
+                if (chk) chk.checked = !!s.on;
+                if (nm) nm.value = s.name || '';
+                if (ta) ta.value = s.text || '';
+            }
+        }
+        function collectPersonas() {
+            const arr = [];
+            for (let i = 0; i < PERSONA_SLOTS; i++) {
+                const chk = $('#se-persona-chk-' + i), nm = $('#se-persona-name-' + i), ta = $('#se-persona-' + i);
+                arr.push({ on: !!(chk && chk.checked), name: (nm && nm.value.trim()) || ('페르소나 ' + (i + 1)), text: (ta && ta.value) || '' });
+            }
+            return arr;
+        }
+        function savePersonas() { GM_setValue(K_PERSONAS, collectPersonas()); }
+        applyPersonasToUI(getPersonaSlots());
+        for (let i = 0; i < PERSONA_SLOTS; i++) {
+            const chk = $('#se-persona-chk-' + i);
+            if (chk) chk.addEventListener('change', savePersonas);
+        }
 
         // 문체 3슬롯 로드 / 저장
         function applyStylesToUI(arr) {
@@ -654,7 +720,7 @@
         $('#se-gear').addEventListener('click', () => { settings.classList.toggle('show'); setTimeout(() => { if (wireUp._clamp) wireUp._clamp(false); }, 0); });
         $('#se-save').addEventListener('click', () => {
             GM_setValue(K_APIKEY, $('#se-key').value.trim());
-            GM_setValue(K_PERSONA, persona.value);
+            savePersonas();
             saveStyles();
             GM_setValue(K_NAME, nameInput.value.trim());
             GM_setValue(K_CTX_ON, ctxChk.checked);
@@ -666,24 +732,49 @@
         });
 
         // ── 설정 동기화 (다른 기기로 옮기기) ──
-        const SYNC_KEYS = [K_APIKEY, K_MODEL, K_MODELLIST, K_PERSONA, K_STYLES, K_NAME, K_POV, K_LENGTH, K_CTX_ON, K_CTX_N, K_CTX_SEL];
+        const SYNC_KEYS = [K_APIKEY, K_MODEL, K_MODELLIST, K_PERSONA, K_PERSONAS, K_STYLES, K_NAME, K_POV, K_LENGTH, K_CTX_ON, K_CTX_N, K_CTX_SEL];
         const syncBox = $('#se-sync-box'), syncStat = $('#se-sync-status');
         function syncFlash(msg, isErr) { syncStat.textContent = msg; syncStat.classList.toggle('err', !!isErr); }
+        function b64encUtf8(s) { return btoa(unescape(encodeURIComponent(s))); }
+        function b64decUtf8(b) { return decodeURIComponent(escape(atob(b))); }
         $('#se-export').addEventListener('click', () => {
             const obj = {};
             SYNC_KEYS.forEach(k => { const v = GM_getValue(k, null); if (v !== null && v !== undefined) obj[k] = v; });
-            const code = JSON.stringify({ v: 1, app: 'crack-se', data: obj });
+            const json = JSON.stringify({ v: 1, app: 'crack-se', data: obj });
+            let code;
+            try { code = 'CSE1:' + b64encUtf8(json); } catch (_) { code = json; }
             syncBox.value = code;
             syncBox.focus(); try { syncBox.select(); } catch (_) {}
             copyToClipboard(code,
                 () => syncFlash('내보냈어요! 코드가 복사됐으니 다른 기기에 붙여넣으세요 📋'),
                 () => syncFlash('코드를 만들었어요. 위 칸을 길게 눌러 직접 복사해 주세요.'));
         });
+        function parseSyncCode(rawIn) {
+            let raw = (rawIn || '').trim();
+            // 휘어진 따옴표·백틱·공백 정리
+            raw = raw.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'").replace(/^`+|`+$/g, '').trim();
+            let jsonStr = null;
+            // 1) Base64 형태 (CSE1: 접두사 또는 순수 base64)
+            let b = raw;
+            const m = raw.match(/CSE1:\s*([A-Za-z0-9+/=\s]+)/);
+            if (m) b = m[1];
+            b = b.replace(/\s+/g, '');
+            if (/^[A-Za-z0-9+/=]+$/.test(b) && b.length > 20) {
+                try { const dec = b64decUtf8(b); if (dec.indexOf('{') >= 0) jsonStr = dec; } catch (_) {}
+            }
+            // 2) 그냥 JSON 형태
+            if (!jsonStr) {
+                const s = raw.indexOf('{'), e = raw.lastIndexOf('}');
+                if (s >= 0 && e > s) jsonStr = raw.slice(s, e + 1);
+            }
+            if (!jsonStr) return null;
+            try { return JSON.parse(jsonStr); } catch (_) { return null; }
+        }
         $('#se-import').addEventListener('click', () => {
             const raw = (syncBox.value || '').trim();
             if (!raw) { syncFlash('가져올 코드를 먼저 붙여넣어 주세요.', true); return; }
-            let parsed;
-            try { parsed = JSON.parse(raw); } catch (_) { syncFlash('코드 형식이 이상해요. 전체를 정확히 붙여넣었는지 확인해 주세요.', true); return; }
+            const parsed = parseSyncCode(raw);
+            if (!parsed) { syncFlash('코드를 못 읽었어요 😢 코드 "전체"를 빠짐없이 붙여넣었는지 확인해 주세요.', true); return; }
             const data = parsed && parsed.data;
             if (!data || typeof data !== 'object') { syncFlash('이 코드엔 설정이 없어요 😢', true); return; }
             let cnt = 0;
