@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.1.0
+// @version      6.2.0
 // @author       me
-// @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음).
+// @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음). 모바일(터치 드래그·하단 잘림) 대응.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -238,13 +238,13 @@
     const CSS = `
     #se-panel, #se-fab { position: fixed; z-index: 2147483600; font-family: 'Pretendard','Noto Sans KR',system-ui,sans-serif; box-sizing: border-box; }
     #se-panel *, #se-fab * { box-sizing: border-box; }
-    #se-panel { width: 350px; max-width: calc(100vw - 24px); background: #1d1f27; color: #e9eaf0; border: 1px solid #33384a; border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.45); display: flex; flex-direction: column; overflow: hidden; font-size: 13px; max-height: calc(100vh - 40px); }
-    #se-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; cursor: grab; user-select: none; background: linear-gradient(135deg,#2a2d3a,#23262f); border-bottom: 1px solid #33384a; }
+    #se-panel { width: 350px; max-width: calc(100vw - 24px); background: #1d1f27; color: #e9eaf0; border: 1px solid #33384a; border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.45); display: flex; flex-direction: column; overflow: hidden; font-size: 13px; max-height: calc(100vh - 24px); max-height: calc(100dvh - 24px); }
+    #se-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; cursor: grab; user-select: none; touch-action: none; -webkit-user-select: none; background: linear-gradient(135deg,#2a2d3a,#23262f); border-bottom: 1px solid #33384a; }
     #se-head.dragging { cursor: grabbing; }
     #se-title { font-weight: 700; font-size: 13px; flex: 1; letter-spacing: -.2px; }
     #se-head button { background: transparent; border: none; color: #b9bcca; cursor: pointer; font-size: 15px; padding: 2px 5px; border-radius: 6px; line-height: 1; }
     #se-head button:hover { background: #3a3f52; color: #fff; }
-    #se-body { padding: 12px; display: flex; flex-direction: column; gap: 9px; overflow-y: auto; }
+    #se-body { padding: 12px; display: flex; flex-direction: column; gap: 9px; overflow-y: auto; -webkit-overflow-scrolling: touch; flex: 1 1 auto; min-height: 0; }
     .se-field-label { font-size: 11px; font-weight: 700; color: #9aa0b4; margin: 0 0 -4px 2px; letter-spacing: -.2px; }
     .se-ta { width: 100%; min-height: 48px; max-height: 160px; resize: vertical; background: #14161c; color: #e9eaf0; border: 1px solid #33384a; border-radius: 10px; padding: 9px; font-size: 13px; line-height: 1.5; font-family: inherit; }
     .se-ta:focus { outline: none; border-color: #6c7bff; }
@@ -270,7 +270,7 @@
     #se-outbtns button:hover { background: #2d3140; }
     #se-status { font-size: 12px; color: #9aa0b4; min-height: 16px; }
     #se-status.err { color: #ff8a8a; }
-    #se-settings { display: none; flex-direction: column; gap: 9px; padding: 12px; border-top: 1px solid #33384a; background: #191b22; overflow-y: auto; }
+    #se-settings { display: none; flex-direction: column; gap: 9px; padding: 12px; border-top: 1px solid #33384a; background: #191b22; overflow-y: auto; -webkit-overflow-scrolling: touch; min-height: 0; }
     #se-settings.show { display: flex; }
     #se-settings label { font-size: 12px; color: #b9bcca; font-weight: 600; }
     #se-settings input, #se-settings select, #se-settings textarea { width: 100%; background: #14161c; color: #e9eaf0; border: 1px solid #33384a; border-radius: 9px; padding: 9px; font-size: 13px; font-family: inherit; }
@@ -283,7 +283,7 @@
     #se-fetch-status.err { color: #ff8a8a; }
     #se-save { padding: 9px; border: none; border-radius: 9px; cursor: pointer; background: #6c7bff; color: #fff; font-weight: 700; font-size: 13px; }
     #se-hint { font-size: 11px; color: #777c8e; line-height: 1.5; }
-    #se-fab { right: 18px; bottom: 18px; width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg,#6c7bff,#8a5cff); color: #fff; border: none; cursor: pointer; font-size: 22px; display: none; align-items: center; justify-content: center; box-shadow: 0 8px 24px rgba(108,123,255,.5); }
+    #se-fab { right: 18px; bottom: 18px; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg,#6c7bff,#8a5cff); color: #fff; border: none; cursor: pointer; font-size: 22px; display: none; align-items: center; justify-content: center; box-shadow: 0 8px 24px rgba(108,123,255,.5); }
     #se-fab.show { display: flex; }
     `;
 
@@ -413,7 +413,7 @@
             );
         });
 
-        $('#se-gear').addEventListener('click', () => settings.classList.toggle('show'));
+        $('#se-gear').addEventListener('click', () => { settings.classList.toggle('show'); setTimeout(() => { if (wireUp._clamp) wireUp._clamp(false); }, 0); });
         $('#se-save').addEventListener('click', () => {
             GM_setValue(K_APIKEY, $('#se-key').value.trim());
             GM_setValue(K_PERSONA, persona.value);
@@ -424,7 +424,7 @@
         });
 
         $('#se-min').addEventListener('click', () => { panel.style.display = 'none'; fab.classList.add('show'); GM_setValue(K_OPEN, false); });
-        fab.addEventListener('click', () => { panel.style.display = 'flex'; fab.classList.remove('show'); GM_setValue(K_OPEN, true); });
+        fab.addEventListener('click', () => { panel.style.display = 'flex'; fab.classList.remove('show'); GM_setValue(K_OPEN, true); setTimeout(() => { if (wireUp._clamp) wireUp._clamp(false); }, 0); });
 
         let statusTimer = null;
         function flash(msg, isErr) {
@@ -439,6 +439,7 @@
             const esc = textRaw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
             out.innerHTML = esc.replace(/\*([^*]+)\*/g, '<em>$1</em>');
             out.classList.add('show'); insertBtn.classList.add('show'); outbtns.classList.add('show');
+            setTimeout(() => { if (wireUp._clamp) wireUp._clamp(false); }, 0);
         }
 
         function run() {
@@ -479,27 +480,64 @@
             copyToClipboard(lastResult, () => flash('복사 완료 📋'), () => flash('복사 실패 😢', true));
         });
 
-        const head = $('#se-head');
-        let dragging = false, offX = 0, offY = 0;
-        head.addEventListener('mousedown', (e) => {
-            if (e.target.tagName === 'BUTTON') return;
-            dragging = true; head.classList.add('dragging');
+        // 패널을 항상 화면 안에 가두기 (모바일 주소창/키보드/회전 대응)
+        function clampIntoView(savePos) {
+            const w = panel.offsetWidth, h = panel.offsetHeight;
+            let l = parseFloat(panel.style.left);
+            let t = parseFloat(panel.style.top);
             const r = panel.getBoundingClientRect();
-            offX = e.clientX - r.left; offY = e.clientY - r.top; panel.style.right = 'auto'; e.preventDefault();
+            if (isNaN(l)) l = r.left;
+            if (isNaN(t)) t = r.top;
+            const maxL = Math.max(0, window.innerWidth - w);
+            const maxT = Math.max(0, window.innerHeight - h);
+            l = Math.max(0, Math.min(l, maxL));
+            t = Math.max(0, Math.min(t, maxT));
+            panel.style.left = l + 'px';
+            panel.style.top = t + 'px';
+            panel.style.right = 'auto';
+            if (savePos) GM_setValue(K_POS, { left: l, top: t });
+        }
+        wireUp._clamp = clampIntoView;
+
+        const head = $('#se-head');
+        let dragging = false, offX = 0, offY = 0, activeId = null;
+
+        head.addEventListener('pointerdown', (e) => {
+            if (e.target.tagName === 'BUTTON') return;
+            dragging = true; activeId = e.pointerId; head.classList.add('dragging');
+            const r = panel.getBoundingClientRect();
+            offX = e.clientX - r.left; offY = e.clientY - r.top;
+            panel.style.right = 'auto';
+            try { head.setPointerCapture(e.pointerId); } catch (_) {}
+            e.preventDefault();
         });
-        document.addEventListener('mousemove', (e) => {
-            if (!dragging) return;
+        head.addEventListener('pointermove', (e) => {
+            if (!dragging || e.pointerId !== activeId) return;
             let l = e.clientX - offX, t = e.clientY - offY;
             l = Math.max(0, Math.min(l, window.innerWidth - panel.offsetWidth));
-            t = Math.max(0, Math.min(t, window.innerHeight - 40));
+            t = Math.max(0, Math.min(t, window.innerHeight - panel.offsetHeight));
             panel.style.left = l + 'px'; panel.style.top = t + 'px';
+            e.preventDefault();
         });
-        document.addEventListener('mouseup', () => {
+        function endDrag(e) {
             if (!dragging) return;
-            dragging = false; head.classList.remove('dragging');
+            if (e && e.pointerId != null && e.pointerId !== activeId) return;
+            dragging = false; activeId = null; head.classList.remove('dragging');
             const r = panel.getBoundingClientRect();
             GM_setValue(K_POS, { left: r.left, top: r.top });
-        });
+        }
+        head.addEventListener('pointerup', endDrag);
+        head.addEventListener('pointercancel', endDrag);
+
+        // 화면 크기·회전·키보드 변화 시 패널을 다시 화면 안으로
+        window.addEventListener('resize', () => clampIntoView(true));
+        window.addEventListener('orientationchange', () => setTimeout(() => clampIntoView(true), 300));
+        if (window.visualViewport) {
+            window.visualViewport.addEventListener('resize', () => clampIntoView(false));
+        }
+
+        // 첫 렌더 직후, 저장된 위치가 화면 밖이면 끌어오기
+        setTimeout(() => clampIntoView(false), 0);
     }
 
     function init() { if (document.getElementById('se-panel')) return; injectStyle(); buildUI(); }
