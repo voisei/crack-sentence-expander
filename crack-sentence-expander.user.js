@@ -9,10 +9,10 @@
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @connect      generativelanguage.googleapis.com
-// @homepageURL  https://github.com/YOUR_ID/crack-sentence-expander
-// @supportURL   https://github.com/YOUR_ID/crack-sentence-expander/issues
-// @updateURL    https://raw.githubusercontent.com/YOUR_ID/crack-sentence-expander/main/crack-sentence-expander.user.js
-// @downloadURL  https://raw.githubusercontent.com/YOUR_ID/crack-sentence-expander/main/crack-sentence-expander.user.js
+// @homepageURL  https://github.com/voisei/crack-sentence-expander
+// @supportURL   https://github.com/voisei/crack-sentence-expander/issues
+// @updateURL    https://raw.githubusercontent.com/voisei/crack-sentence-expander/main/crack-sentence-expander.user.js
+// @downloadURL  https://raw.githubusercontent.com/voisei/crack-sentence-expander/main/crack-sentence-expander.user.js
 // @license      MIT
 // @run-at       document-idle
 // ==/UserScript==
