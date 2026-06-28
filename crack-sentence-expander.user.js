@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.3.0
+// @version      6.3.1
 // @author       me
 // @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음). 모바일(터치 드래그·하단 잘림) 대응.
 // @match        https://crack.wrtn.ai/*
@@ -11,8 +11,6 @@
 // @connect      generativelanguage.googleapis.com
 // @homepageURL  https://github.com/voisei/crack-sentence-expander
 // @supportURL   https://github.com/voisei/crack-sentence-expander/issues
-// @updateURL    https://raw.githubusercontent.com/voisei/crack-sentence-expander/main/crack-sentence-expander.user.js
-// @downloadURL  https://raw.githubusercontent.com/voisei/crack-sentence-expander/main/crack-sentence-expander.user.js
 // @license      MIT
 // @run-at       document-idle
 // ==/UserScript==
