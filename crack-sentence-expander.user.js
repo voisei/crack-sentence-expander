@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.6.0
+// @version      6.7.0
 // @author       me
 // @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음). 모바일(터치 드래그·하단 잘림) 대응.
 // @match        https://crack.wrtn.ai/*
@@ -426,6 +426,12 @@
     #se-ctx-test { padding: 8px; border: 1px solid #4a4f63; border-radius: 9px; cursor: pointer; background: #23262f; color: #cdd1e0; font-size: 12px; font-weight: 600; }
     #se-ctx-test:hover { background: #2d3140; }
     #se-ctx-status { font-size: 11px; color: #9aa0b4; min-height: 14px; white-space: pre-wrap; max-height: 120px; overflow-y: auto; line-height: 1.5; }
+    #se-sync-box { min-height: 56px; max-height: 120px; resize: vertical; line-height: 1.45; font-size: 12px; }
+    .se-sync-btns { display: flex; gap: 6px; }
+    .se-sync-btns button { flex: 1; padding: 9px; border: 1px solid #4a4f63; border-radius: 9px; cursor: pointer; background: #23262f; color: #cdd1e0; font-size: 12px; font-weight: 700; }
+    .se-sync-btns button:hover { background: #2d3140; }
+    #se-sync-status { font-size: 11px; color: #9aa0b4; min-height: 14px; }
+    #se-sync-status.err { color: #ff8a8a; }
     #se-fab.show { display: flex; }
     `;
 
@@ -510,6 +516,13 @@
                 <button id="se-fetch">🔄 사용 가능한 모델 불러오기</button>
                 <div id="se-fetch-status"></div>
                 <button id="se-save">저장</button>
+                <label>🔄 설정 동기화 (다른 기기로 옮기기)</label>
+                <textarea id="se-sync-box" placeholder="여기서 '내보내기'를 누르면 코드가 생겨요. 다른 기기에선 그 코드를 붙여넣고 '가져오기'를 누르면 똑같이 맞춰져요."></textarea>
+                <div class="se-sync-btns">
+                    <button id="se-export">📤 내보내기</button>
+                    <button id="se-import">📥 가져오기</button>
+                </div>
+                <div id="se-sync-status"></div>
                 <div id="se-hint">키는 aistudio.google.com 에서 발급해요. 이 브라우저에만 저장되고 절대 공유 마세요. 페르소나·문체 3칸·이름·시점도 함께 저장돼요. (체크한 문체는 같이 적용)</div>
             </div>
         `;
@@ -650,6 +663,34 @@
             if (modelSel.value) GM_setValue(K_MODEL, modelSel.value);
             settings.classList.remove('show');
             flash('저장됐어요 ✅');
+        });
+
+        // ── 설정 동기화 (다른 기기로 옮기기) ──
+        const SYNC_KEYS = [K_APIKEY, K_MODEL, K_MODELLIST, K_PERSONA, K_STYLES, K_NAME, K_POV, K_LENGTH, K_CTX_ON, K_CTX_N, K_CTX_SEL];
+        const syncBox = $('#se-sync-box'), syncStat = $('#se-sync-status');
+        function syncFlash(msg, isErr) { syncStat.textContent = msg; syncStat.classList.toggle('err', !!isErr); }
+        $('#se-export').addEventListener('click', () => {
+            const obj = {};
+            SYNC_KEYS.forEach(k => { const v = GM_getValue(k, null); if (v !== null && v !== undefined) obj[k] = v; });
+            const code = JSON.stringify({ v: 1, app: 'crack-se', data: obj });
+            syncBox.value = code;
+            syncBox.focus(); try { syncBox.select(); } catch (_) {}
+            copyToClipboard(code,
+                () => syncFlash('내보냈어요! 코드가 복사됐으니 다른 기기에 붙여넣으세요 📋'),
+                () => syncFlash('코드를 만들었어요. 위 칸을 길게 눌러 직접 복사해 주세요.'));
+        });
+        $('#se-import').addEventListener('click', () => {
+            const raw = (syncBox.value || '').trim();
+            if (!raw) { syncFlash('가져올 코드를 먼저 붙여넣어 주세요.', true); return; }
+            let parsed;
+            try { parsed = JSON.parse(raw); } catch (_) { syncFlash('코드 형식이 이상해요. 전체를 정확히 붙여넣었는지 확인해 주세요.', true); return; }
+            const data = parsed && parsed.data;
+            if (!data || typeof data !== 'object') { syncFlash('이 코드엔 설정이 없어요 😢', true); return; }
+            let cnt = 0;
+            SYNC_KEYS.forEach(k => { if (Object.prototype.hasOwnProperty.call(data, k)) { GM_setValue(k, data[k]); cnt++; } });
+            if (!cnt) { syncFlash('적용할 설정을 못 찾았어요.', true); return; }
+            syncFlash(cnt + '개 설정을 가져왔어요. 잠시 후 새로고침해서 적용할게요… 🔄');
+            setTimeout(() => location.reload(), 900);
         });
 
         $('#se-min').addEventListener('click', () => { panel.style.display = 'none'; fab.classList.add('show'); GM_setValue(K_OPEN, false); });
