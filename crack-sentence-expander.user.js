@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.8.0
+// @version      6.8.1
 // @author       me
 // @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음). 모바일(터치 드래그·하단 잘림) 대응.
 // @match        https://crack.wrtn.ai/*
@@ -732,11 +732,22 @@
         });
 
         // ── 설정 동기화 (다른 기기로 옮기기) ──
-        const SYNC_KEYS = [K_APIKEY, K_MODEL, K_MODELLIST, K_PERSONA, K_PERSONAS, K_STYLES, K_NAME, K_POV, K_LENGTH, K_CTX_ON, K_CTX_N, K_CTX_SEL];
+        const SYNC_KEYS = [K_APIKEY, K_MODEL, K_PERSONA, K_PERSONAS, K_STYLES, K_NAME, K_POV, K_LENGTH, K_CTX_ON, K_CTX_N, K_CTX_SEL];
         const syncBox = $('#se-sync-box'), syncStat = $('#se-sync-status');
         function syncFlash(msg, isErr) { syncStat.textContent = msg; syncStat.classList.toggle('err', !!isErr); }
-        function b64encUtf8(s) { return btoa(unescape(encodeURIComponent(s))); }
-        function b64decUtf8(b) { return decodeURIComponent(escape(atob(b))); }
+        function b64encUtf8(s) {
+            const bytes = new TextEncoder().encode(s);
+            let bin = '';
+            bytes.forEach(byte => { bin += String.fromCharCode(byte); });
+            return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+        }
+        function b64decUtf8(b) {
+            b = (b || '').trim().replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
+            while (b.length % 4) b += '=';
+            const bin = atob(b);
+            const bytes = Uint8Array.from(bin, ch => ch.charCodeAt(0));
+            return new TextDecoder().decode(bytes);
+        }
         $('#se-export').addEventListener('click', () => {
             const obj = {};
             SYNC_KEYS.forEach(k => { const v = GM_getValue(k, null); if (v !== null && v !== undefined) obj[k] = v; });
@@ -751,26 +762,50 @@
         });
         function parseSyncCode(rawIn) {
             let raw = (rawIn || '').trim();
-            // 휘어진 따옴표·백틱·공백 정리
-            raw = raw.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'").replace(/^`+|`+$/g, '').trim();
-            let jsonStr = null;
-            // 1) Base64 형태 (CSE1: 접두사 또는 순수 base64)
-            let b = raw;
-            const m = raw.match(/CSE1:\s*([A-Za-z0-9+/=\s]+)/);
-            if (m) b = m[1];
-            b = b.replace(/\s+/g, '');
-            if (/^[A-Za-z0-9+/=]+$/.test(b) && b.length > 20) {
-                try { const dec = b64decUtf8(b); if (dec.indexOf('{') >= 0) jsonStr = dec; } catch (_) {}
+            raw = raw
+                .replace(/[\u201C\u201D]/g, '"')
+                .replace(/[\u2018\u2019]/g, "'")
+                .replace(/^```(?:txt|json|js)?/i, '')
+                .replace(/```$/i, '')
+                .replace(/^`+|`+$/g, '')
+                .trim();
+
+            function tryParseJsonText(txt) {
+                if (!txt) return null;
+                try { return JSON.parse(txt); } catch (_) { return null; }
             }
-            // 2) 그냥 JSON 형태
-            if (!jsonStr) {
-                const s = raw.indexOf('{'), e = raw.lastIndexOf('}');
-                if (s >= 0 && e > s) jsonStr = raw.slice(s, e + 1);
+
+            // 1) JSON이 그대로 붙어온 경우
+            const s = raw.indexOf('{'), e = raw.lastIndexOf('}');
+            if (s >= 0 && e > s) {
+                const parsedJson = tryParseJsonText(raw.slice(s, e + 1));
+                if (parsedJson) return parsedJson;
             }
-            if (!jsonStr) return null;
-            try { return JSON.parse(jsonStr); } catch (_) { return null; }
+
+            // 2) CSE1: 코드 또는 base64/base64url만 붙어온 경우
+            const candidates = [];
+            const cse = raw.match(/CSE1:\s*([A-Za-z0-9+/_=\-\s]+)/);
+            if (cse) candidates.push(cse[1]);
+
+            // 코드가 CSE1: 없이 eyJ...부터 붙어온 경우도 잡기
+            const eyj = raw.match(/eyJ[A-Za-z0-9+/_=\-\s]{20,}/);
+            if (eyj) candidates.push(eyj[0]);
+
+            // 입력칸 전체가 base64처럼 보이면 그것도 시도
+            const compact = raw.replace(/\s+/g, '');
+            if (/^[A-Za-z0-9+/_=\-]{20,}$/.test(compact)) candidates.push(compact);
+
+            for (const c of candidates) {
+                try {
+                    const dec = b64decUtf8(c);
+                    const parsed = tryParseJsonText(dec);
+                    if (parsed) return parsed;
+                } catch (_) {}
+            }
+
+            return null;
         }
-        $('#se-import').addEventListener('click', () => {
+                $('#se-import').addEventListener('click', () => {
             const raw = (syncBox.value || '').trim();
             if (!raw) { syncFlash('가져올 코드를 먼저 붙여넣어 주세요.', true); return; }
             const parsed = parseSyncCode(raw);
