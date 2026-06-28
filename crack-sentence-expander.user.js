@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.3.1
+// @version      6.3.2
 // @author       me
 // @description  대사칸/행동칸 분리, 유저 페르소나 반영, 1인칭/3인칭 전환, 3인칭에선 단역 NPC 대사·묘사 허용(주요 캐릭터 제외), 모델 목록 선택, 크랙 채팅창 직접 입력. 행동칸은 '실제로 그 행동을 하는 장면'으로 묘사(명령 대사로 바꾸지 않음). 모바일(터치 드래그·하단 잘림) 대응.
 // @match        https://crack.wrtn.ai/*
@@ -26,7 +26,7 @@
     const K_POV       = 'se_pov';
     const K_LENGTH    = 'se_length';
     const K_POS       = 'se_panel_pos';
-    const K_FABPOS    = 'se_fab_pos';
+    const K_FABPOS    = 'se_fab_pos2';
     const K_STYLE     = 'se_style';
     const K_OPEN      = 'se_panel_open';
 
@@ -300,7 +300,7 @@
     #se-fetch-status.err { color: #ff8a8a; }
     #se-save { padding: 9px; border: none; border-radius: 9px; cursor: pointer; background: #6c7bff; color: #fff; font-weight: 700; font-size: 13px; }
     #se-hint { font-size: 11px; color: #777c8e; line-height: 1.5; }
-    #se-fab { right: 18px; bottom: 18px; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); width: 52px; height: 52px; border-radius: 50%; touch-action: none; background: linear-gradient(135deg,#6c7bff,#8a5cff); color: #fff; border: none; cursor: pointer; font-size: 22px; display: none; align-items: center; justify-content: center; box-shadow: 0 8px 24px rgba(108,123,255,.5); }
+    #se-fab { right: 18px; top: 72px; top: calc(72px + env(safe-area-inset-top, 0px)); width: 52px; height: 52px; border-radius: 50%; touch-action: none; background: linear-gradient(135deg,#6c7bff,#8a5cff); color: #fff; border: none; cursor: pointer; font-size: 22px; display: none; align-items: center; justify-content: center; box-shadow: 0 8px 24px rgba(108,123,255,.5); }
     #se-fab.show { display: flex; }
     `;
 
