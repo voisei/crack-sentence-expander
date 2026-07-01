@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.8.4
+// @version      6.8.5
 // @author       me
-// @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력. ✨ 토글 버튼으로 열기/닫기 가능.
+// @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 안 보이는 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -41,6 +41,7 @@
     const K_CTX_ON    = 'se_ctx_on';
     const K_CTX_N     = 'se_ctx_n';
     const K_CTX_SEL   = 'se_ctx_sel';
+    const K_CTX_CACHE = 'se_ctx_cache';
 
     const K_MEMORY_ON   = 'se_crack_memory_on';
     const K_MEMORY_AUTO = 'se_crack_memory_auto';
@@ -48,6 +49,7 @@
 
     const STYLE_SLOTS = 3;
     const PERSONA_SLOTS = 3;
+    const CTX_CACHE_LIMIT = 300;
 
     const DEFAULT_MODELS = [
         { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
@@ -192,6 +194,7 @@
 
     function fetchModels(onDone, onErr) {
         const apiKey = GM_getValue(K_APIKEY, '');
+
         if (!apiKey) {
             onErr('API 키를 먼저 넣고 저장해 주세요.');
             return;
@@ -300,7 +303,88 @@
         return true;
     }
 
-    function collectChatContext(maxN, selector) {
+    function cleanContextLine(t) {
+        return (t || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function isBadContextLine(line) {
+        if (!line) return true;
+
+        const bannedExact = new Set([
+            '문장 부풀리기',
+            '대사',
+            '행동',
+            '1인칭',
+            '3인칭',
+            '세줄',
+            '짧게',
+            '중간',
+            '길게',
+            '문학적으로 늘리기',
+            '채팅창에 바로 넣기',
+            '복사',
+            '다시 뽑기',
+            '설정',
+            '저장',
+            '닫기',
+            '확인',
+            '취소',
+            '삭제',
+            '수정',
+            '뒤로',
+            '추가',
+            '최신순',
+            '오래된순',
+        ]);
+
+        if (bannedExact.has(line)) return true;
+        if (/^✨?\s*문장 부풀리기/.test(line)) return true;
+        if (/Gemini API|API 키|모델|페르소나|문체 규칙/.test(line)) return true;
+        if (/최근 대화 맥락 참고|맥락 미리보기|요약 메모리/.test(line)) return true;
+        if (/현재 화면에서 메모리 가져오기|프롬프트에 참고시키기/.test(line)) return true;
+        if (/사용 가능한 모델 불러오기|설정 동기화|내보내기|가져오기/.test(line)) return true;
+        if (/^[\s\W_]+$/.test(line)) return true;
+
+        return false;
+    }
+
+    function getCtxCache() {
+        const arr = GM_getValue(K_CTX_CACHE, []);
+        return Array.isArray(arr) ? arr : [];
+    }
+
+    function saveCtxCache(arr) {
+        GM_setValue(K_CTX_CACHE, arr.slice(-CTX_CACHE_LIMIT));
+    }
+
+    function rememberCtxLines(lines) {
+        const old = getCtxCache();
+        const seen = new Set(old);
+        const merged = old.slice();
+
+        for (const raw of lines || []) {
+            const t = cleanContextLine(raw);
+
+            if (!t) continue;
+            if (isBadContextLine(t)) continue;
+            if (t.length < 2) continue;
+            if (t.length > 1200) continue;
+            if (seen.has(t)) continue;
+
+            seen.add(t);
+            merged.push(t);
+        }
+
+        saveCtxCache(merged);
+    }
+
+    function clearCtxCache() {
+        GM_setValue(K_CTX_CACHE, []);
+    }
+
+    function collectChatContextFromDOM(maxN, selector) {
         const inPanel = el => el.closest && el.closest('#se-panel');
         let nodes = [];
 
@@ -321,7 +405,10 @@
                     if (el.querySelector('textarea, input, button, select')) return false;
                     if (!isVisible(el)) return false;
 
-                    const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+                    const t = cleanContextLine(el.innerText || '');
+
+                    if (isBadContextLine(t)) return false;
+
                     return t.length >= 2 && t.length <= 1200;
                 });
 
@@ -334,14 +421,48 @@
         const seen = new Set();
 
         for (const el of nodes) {
-            const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
-            if (!t || seen.has(t)) continue;
+            const t = cleanContextLine(el.innerText || '');
+
+            if (!t) continue;
+            if (isBadContextLine(t)) continue;
+            if (seen.has(t)) continue;
 
             seen.add(t);
             out.push(t);
         }
 
         return out.slice(-Math.max(1, maxN || 6));
+    }
+
+    function collectChatContext(maxN, selector) {
+        const n = Math.max(1, maxN || 6);
+
+        let domLines = [];
+
+        try {
+            domLines = collectChatContextFromDOM(Math.max(n, 80), selector);
+            rememberCtxLines(domLines);
+        } catch (_) {
+            domLines = [];
+        }
+
+        const cached = getCtxCache();
+
+        const merged = [];
+        const seen = new Set();
+
+        for (const raw of cached.concat(domLines)) {
+            const line = cleanContextLine(raw);
+
+            if (!line) continue;
+            if (isBadContextLine(line)) continue;
+            if (seen.has(line)) continue;
+
+            seen.add(line);
+            merged.push(line);
+        }
+
+        return merged.slice(-n);
     }
 
     function collectCrackMemoryFromPage() {
@@ -451,6 +572,7 @@
         const crackMemory = getCrackMemoryForPrompt();
 
         let context = [];
+
         if (GM_getValue(K_CTX_ON, false)) {
             const n = parseInt(GM_getValue(K_CTX_N, 6), 10) || 6;
             const sel = GM_getValue(K_CTX_SEL, '');
@@ -960,6 +1082,7 @@
     }
     #se-fetch,
     #se-ctx-test,
+    #se-ctx-clear,
     #se-memory-fetch,
     #se-memory-clear {
         padding: 8px;
@@ -973,6 +1096,7 @@
     }
     #se-fetch:hover,
     #se-ctx-test:hover,
+    #se-ctx-clear:hover,
     #se-memory-fetch:hover,
     #se-memory-clear:hover {
         background: #2d3140;
@@ -1068,12 +1192,14 @@
         font-size: 12px;
     }
     .se-sync-btns,
-    .se-memory-btns {
+    .se-memory-btns,
+    .se-ctx-btns {
         display: flex;
         gap: 6px;
     }
     .se-sync-btns button,
-    .se-memory-btns button {
+    .se-memory-btns button,
+    .se-ctx-btns button {
         flex: 1;
     }
     .se-sync-btns button {
@@ -1214,7 +1340,7 @@
                 <textarea id="se-crack-memory-text" placeholder="크랙의 요약 메모리 화면을 열고 '현재 화면에서 메모리 가져오기'를 누르면 여기에 저장돼요. 직접 붙여넣어도 돼요."></textarea>
                 <div id="se-memory-status"></div>
 
-                <label>🧠 최근 대화 맥락 참고 (실험적)</label>
+                <label>🧠 최근 대화 맥락 참고 + 자동 캐시</label>
 
                 <div class="se-ctx-row">
                     <input type="checkbox" id="se-ctx-chk">
@@ -1224,7 +1350,12 @@
                 </div>
 
                 <input id="se-ctx-sel" type="text" placeholder="(고급) 메시지 CSS 선택자 — 비워두면 자동">
-                <button id="se-ctx-test">🔍 맥락 미리보기</button>
+
+                <div class="se-ctx-btns">
+                    <button id="se-ctx-test">🔍 맥락 미리보기</button>
+                    <button id="se-ctx-clear">🧹 캐시 비우기</button>
+                </div>
+
                 <div id="se-ctx-status"></div>
 
                 <label>🪪 캐릭터 이름 (3인칭일 때 사용, 선택)</label>
@@ -1251,7 +1382,8 @@
                 <div id="se-sync-status"></div>
 
                 <div id="se-hint">
-                    크랙 요약 메모리는 화면에 보이는 텍스트만 가져와요. 요약 메모리 화면을 열고 가져오기를 눌러주세요.
+                    최근 대화 맥락 캐시는 크랙 화면에 한 번이라도 표시된 채팅을 최대 300개까지 저장해요.
+                    그래서 화면에서 사라진 최근 채팅도 나중에 참고할 수 있어요. 단, 한 번도 로딩되지 않은 오래된 대화는 위로 스크롤해서 불러와야 저장돼요.
                     가져온 메모리와 최근 대화 맥락은 Gemini API로 같이 전송돼요. 개인정보/API 키/비밀번호는 넣지 마세요.
                 </div>
             </div>
@@ -1483,20 +1615,30 @@
             const n = parseInt(ctxN.value, 10) || 6;
             let arr = [];
 
+            GM_setValue(K_CTX_N, n);
+            GM_setValue(K_CTX_SEL, ctxSel.value.trim());
+
             try {
                 arr = collectChatContext(n, ctxSel.value);
             } catch (_) {
                 arr = [];
             }
 
+            const cacheCount = getCtxCache().length;
+
             if (!arr.length) {
-                ctxStat.textContent = '못 잡았어요 😅 채팅이 화면에 보이는지 확인하거나, 선택자를 비워 자동으로 두고 다시 해보세요.';
+                ctxStat.textContent = '못 잡았어요 😅 채팅이 화면에 보이는지 확인하거나, 선택자를 비워 자동으로 두고 다시 해보세요.\n현재 캐시: ' + cacheCount + '개';
                 return;
             }
 
             ctxStat.textContent =
-                arr.length + '개 잡힘:\n'
-                + arr.map((m, i) => (i + 1) + '. ' + (m.length > 60 ? m.slice(0, 60) + '…' : m)).join('\n');
+                arr.length + '개 참고 예정 / 현재 캐시 ' + cacheCount + '개:\n'
+                + arr.map((m, i) => (i + 1) + '. ' + (m.length > 80 ? m.slice(0, 80) + '…' : m)).join('\n');
+        });
+
+        $('#se-ctx-clear').addEventListener('click', () => {
+            clearCtxCache();
+            ctxStat.textContent = '최근 대화 맥락 캐시를 비웠어요 🧹';
         });
 
         function populateModels(list, selected) {
@@ -2066,11 +2208,38 @@
         setTimeout(() => clampIntoView(false), 0);
     }
 
+    function startContextCacheObserver() {
+        let timer = null;
+
+        const scan = () => {
+            if (timer) clearTimeout(timer);
+
+            timer = setTimeout(() => {
+                try {
+                    const sel = GM_getValue(K_CTX_SEL, '');
+                    const lines = collectChatContextFromDOM(80, sel);
+                    rememberCtxLines(lines);
+                } catch (_) {}
+            }, 700);
+        };
+
+        const mo = new MutationObserver(scan);
+
+        mo.observe(document.body, {
+            childList: true,
+            subtree: true,
+            characterData: true
+        });
+
+        scan();
+    }
+
     function init() {
         if (document.getElementById('se-panel')) return;
 
         injectStyle();
         buildUI();
+        startContextCacheObserver();
     }
 
     if (document.readyState === 'loading') {
