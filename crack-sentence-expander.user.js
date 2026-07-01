@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.8.5
+// @version      6.8.6
 // @author       me
-// @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 안 보이는 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
+// @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -41,7 +41,7 @@
     const K_CTX_ON    = 'se_ctx_on';
     const K_CTX_N     = 'se_ctx_n';
     const K_CTX_SEL   = 'se_ctx_sel';
-    const K_CTX_CACHE = 'se_ctx_cache';
+    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room';
 
     const K_MEMORY_ON   = 'se_crack_memory_on';
     const K_MEMORY_AUTO = 'se_crack_memory_auto';
@@ -350,13 +350,25 @@
         return false;
     }
 
+    function getCurrentChatCacheKey() {
+        const path = location.pathname || '';
+        const search = location.search || '';
+        const hash = location.hash || '';
+
+        return K_CTX_CACHE_BASE + '::' + path + search + hash;
+    }
+
     function getCtxCache() {
-        const arr = GM_getValue(K_CTX_CACHE, []);
+        const key = getCurrentChatCacheKey();
+        const arr = GM_getValue(key, []);
+
         return Array.isArray(arr) ? arr : [];
     }
 
     function saveCtxCache(arr) {
-        GM_setValue(K_CTX_CACHE, arr.slice(-CTX_CACHE_LIMIT));
+        const key = getCurrentChatCacheKey();
+
+        GM_setValue(key, arr.slice(-CTX_CACHE_LIMIT));
     }
 
     function rememberCtxLines(lines) {
@@ -381,7 +393,9 @@
     }
 
     function clearCtxCache() {
-        GM_setValue(K_CTX_CACHE, []);
+        const key = getCurrentChatCacheKey();
+
+        GM_setValue(key, []);
     }
 
     function collectChatContextFromDOM(maxN, selector) {
@@ -1340,7 +1354,7 @@
                 <textarea id="se-crack-memory-text" placeholder="크랙의 요약 메모리 화면을 열고 '현재 화면에서 메모리 가져오기'를 누르면 여기에 저장돼요. 직접 붙여넣어도 돼요."></textarea>
                 <div id="se-memory-status"></div>
 
-                <label>🧠 최근 대화 맥락 참고 + 자동 캐시</label>
+                <label>🧠 최근 대화 맥락 참고 + 채팅방별 자동 캐시</label>
 
                 <div class="se-ctx-row">
                     <input type="checkbox" id="se-ctx-chk">
@@ -1353,7 +1367,7 @@
 
                 <div class="se-ctx-btns">
                     <button id="se-ctx-test">🔍 맥락 미리보기</button>
-                    <button id="se-ctx-clear">🧹 캐시 비우기</button>
+                    <button id="se-ctx-clear">🧹 이 채팅방 캐시 비우기</button>
                 </div>
 
                 <div id="se-ctx-status"></div>
@@ -1382,8 +1396,10 @@
                 <div id="se-sync-status"></div>
 
                 <div id="se-hint">
-                    최근 대화 맥락 캐시는 크랙 화면에 한 번이라도 표시된 채팅을 최대 300개까지 저장해요.
-                    그래서 화면에서 사라진 최근 채팅도 나중에 참고할 수 있어요. 단, 한 번도 로딩되지 않은 오래된 대화는 위로 스크롤해서 불러와야 저장돼요.
+                    최근 대화 맥락 캐시는 채팅방 주소별로 따로 저장돼요.
+                    A 채팅방에서 저장된 맥락은 B 채팅방에 섞이지 않아요.
+                    단, 크랙이 여러 채팅방을 같은 주소로 표시하면 완벽히 분리되지 않을 수 있어요.
+                    캐시는 화면에 한 번이라도 표시된 채팅을 최대 300개까지 저장해요.
                     가져온 메모리와 최근 대화 맥락은 Gemini API로 같이 전송돼요. 개인정보/API 키/비밀번호는 넣지 마세요.
                 </div>
             </div>
@@ -1625,20 +1641,25 @@
             }
 
             const cacheCount = getCtxCache().length;
+            const roomKey = getCurrentChatCacheKey().replace(K_CTX_CACHE_BASE + '::', '');
 
             if (!arr.length) {
-                ctxStat.textContent = '못 잡았어요 😅 채팅이 화면에 보이는지 확인하거나, 선택자를 비워 자동으로 두고 다시 해보세요.\n현재 캐시: ' + cacheCount + '개';
+                ctxStat.textContent =
+                    '못 잡았어요 😅 채팅이 화면에 보이는지 확인하거나, 선택자를 비워 자동으로 두고 다시 해보세요.\n'
+                    + '현재 채팅방 캐시: ' + cacheCount + '개\n'
+                    + '캐시 기준: ' + roomKey;
                 return;
             }
 
             ctxStat.textContent =
-                arr.length + '개 참고 예정 / 현재 캐시 ' + cacheCount + '개:\n'
+                arr.length + '개 참고 예정 / 현재 채팅방 캐시 ' + cacheCount + '개\n'
+                + '캐시 기준: ' + roomKey + '\n'
                 + arr.map((m, i) => (i + 1) + '. ' + (m.length > 80 ? m.slice(0, 80) + '…' : m)).join('\n');
         });
 
         $('#se-ctx-clear').addEventListener('click', () => {
             clearCtxCache();
-            ctxStat.textContent = '최근 대화 맥락 캐시를 비웠어요 🧹';
+            ctxStat.textContent = '현재 채팅방의 최근 대화 맥락 캐시를 비웠어요 🧹';
         });
 
         function populateModels(list, selected) {
