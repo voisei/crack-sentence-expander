@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.9.1
+// @version      6.9.2
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -504,6 +504,14 @@
             nodes = nodes.filter(el => !inPanel(el) && isVisible(el));
         }
 
+        // 크랙 UI는 채팅 말풍선/메시지 묶음에 data-message-group-id를 붙인다.
+        // 그래서 p/div/span을 막 긁기 전에 이 메시지 묶음을 최우선으로 읽는다.
+        if (!nodes.length) {
+            nodes = Array.from(document.querySelectorAll('div[data-message-group-id]'))
+                .filter(el => !inPanel(el) && isVisible(el));
+        }
+
+        // 그래도 못 잡으면 기존 자동 탐색 방식으로 fallback한다.
         if (!nodes.length) {
             const cands = Array.from(document.body.querySelectorAll('p, div, span, li, article'))
                 .filter(el => {
@@ -527,7 +535,22 @@
         const seen = new Set();
 
         for (const el of nodes) {
-            const t = cleanContextLine(el.innerText || '');
+            let t = cleanContextLine(el.innerText || '');
+
+            if (!t) continue;
+            if (isBadContextLine(t)) continue;
+            if (t.length < 2) continue;
+            if (t.length > 2000) continue;
+
+            // 메시지 묶음 안에 섞일 수 있는 UI 버튼/메뉴 텍스트를 최대한 제거한다.
+            t = t
+                .replace(/\b복사\b/g, '')
+                .replace(/\b다시 생성\b/g, '')
+                .replace(/\b삭제\b/g, '')
+                .replace(/\b수정\b/g, '')
+                .replace(/\b공유\b/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
 
             if (!t) continue;
             if (isBadContextLine(t)) continue;
@@ -537,7 +560,6 @@
             out.push(t);
         }
 
-        // 화면에서 읽은 순간에도 스트리밍 접두사 조각을 정리한다.
         return dropStreamingPrefixes(out).slice(-Math.max(1, maxN || 6));
     }
 
@@ -1458,7 +1480,7 @@
                     <span class="se-ctx-label">개</span>
                 </div>
 
-                <input id="se-ctx-sel" type="text" placeholder="(고급) 메시지 CSS 선택자 — 비워두면 자동">
+                <input id="se-ctx-sel" type="text" placeholder="(고급) 메시지 CSS 선택자 — 추천: div[data-message-group-id]">
 
                 <div class="se-ctx-btns">
                     <button id="se-ctx-test">🔍 맥락 미리보기</button>
