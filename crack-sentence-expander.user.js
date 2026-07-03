@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.10.0
+// @version      6.10.1
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -806,7 +806,7 @@
                 }
             ],
             generationConfig: {
-                maxOutputTokens: 2048
+                maxOutputTokens: 8192
             },
         };
 
@@ -852,6 +852,11 @@
 
                     if (!out) {
                         onErr('빈 추천이 왔어요. 다시 시도해 주세요.');
+                        return;
+                    }
+
+                    if (cand.finishReason === 'MAX_TOKENS') {
+                        onErr('페르소나가 너무 길어서 중간에 잘렸어요. 키워드를 조금 줄이거나 다시 시도해 주세요.');
                         return;
                     }
 
