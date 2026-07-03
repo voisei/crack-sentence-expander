@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.8.6
+// @version      6.8.7
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -75,9 +75,12 @@
 
         if (persona && persona.trim()) {
             lines.push('');
-            lines.push('[유저 캐릭터의 페르소나]');
+            lines.push('[유저 캐릭터의 페르소나 — 기본 설정일 뿐, 현재 상태가 아님]');
             lines.push(persona.trim());
-            lines.push('- 위 페르소나의 성격·말투·가치관·배경에 어울리게 써라.');
+            lines.push('- 위 페르소나는 캐릭터의 기본 성격·말투·가치관·배경이다.');
+            lines.push('- 페르소나에 적힌 외모·상태·차림·기분 등은 "평소의 기본값"일 뿐, 지금 이 순간의 사실로 단정하지 마라.');
+            lines.push('- 페르소나 내용이 [직전 대화 맥락]이나 이번 [행동]/[대사]와 어긋나면, 항상 최근 상황을 우선한다.');
+            lines.push('- 예: 페르소나에 "평소 지저분하다"가 있어도, 방금 씻었거나 옷을 갈아입은 맥락이면 그 순간엔 깨끗한 상태로 묘사한다.');
             lines.push('- 설정을 본문에 그대로 나열·설명하지 말고 자연스럽게 녹여라.');
         }
 
@@ -96,15 +99,17 @@
             lines.push('- 위 내용은 크랙이 정리한 기억이다. 현재 장면의 배경 기억으로 반드시 참고하라.');
             lines.push('- 단, 본문에 그대로 복붙하거나 설명문처럼 읊지 마라.');
             lines.push('- 필요한 경우 관계성, 거리감, 감정선, 이전 사건의 여파, 목표를 자연스럽게 반영하라.');
+            lines.push('- 요약 메모리와 [직전 대화 맥락]이 어긋나면, 더 최근 상황인 직전 대화 맥락을 우선한다.');
             lines.push('- 이번 출력은 어디까지나 유저 캐릭터의 이번 [대사]/[행동]만 확장하는 것이다.');
         }
 
         if (context && context.length) {
             lines.push('');
-            lines.push('[직전 대화 맥락 — 참고용]');
+            lines.push('[직전 대화 맥락 — 참고용, 현재 상황의 최우선 근거]');
             lines.push('아래는 지금까지 오간 대화의 최근 흐름이다. 위가 과거, 아래가 최신이다.');
             context.forEach(m => lines.push('  · ' + m));
             lines.push('- 이 맥락에 자연스럽게 이어지도록 유저 캐릭터의 이번 입력을 늘려라.');
+            lines.push('- 이 맥락은 "지금 이 순간"의 상황을 알려주는 가장 신뢰할 근거다. 페르소나나 요약 메모리와 충돌하면 이 맥락을 따른다.');
             lines.push('- 단, 맥락은 참고만 한다. 맥락 속 상대·NPC의 말이나 행동을 새로 지어내거나 이어 쓰지 마라.');
             lines.push('- 오직 유저 캐릭터의 이번 [대사]/[행동]만 늘린다.');
         }
@@ -155,6 +160,7 @@
         lines.push('- 비슷한 의미라도 앞에서 이미 쓴 묘사·문장 구조를 또 쓰지 마라.');
         lines.push('- 동어 반복이나 같은 행동·감정의 재탕을 하지 마라.');
         lines.push('- 페르소나·문체 규칙·이름·설정·크랙 요약 메모리를 본문에서 그대로 읊거나 설명하지 마라.');
+        lines.push('- 페르소나의 "평소 상태"를 최근 상황과 충돌하게 억지로 끼워 넣지 마라. (예: 방금 씻었는데 더럽다고 묘사)');
         lines.push('- 입력에 없는 자기소개·배경 설명을 끼워 넣지 마라.');
         lines.push('- 길이를 채우려고 했던 말을 늘려 반복하지 마라.');
         lines.push('- 늘릴 내용이 없으면 차라리 짧게 끝내라.');
@@ -371,10 +377,33 @@
         GM_setValue(key, arr.slice(-CTX_CACHE_LIMIT));
     }
 
+    // 스트리밍 중간 조각("안녕","안녕하","안녕하세"…)이 캐시를 오염시키지 않도록,
+    // 뒤 항목이 앞 항목을 접두사로 포함하면(=자라나는 중이면) 앞의 짧은 조각을 제거한다.
+    function dropStreamingPrefixes(arr) {
+        const out = [];
+
+        for (const cur of arr) {
+            while (out.length) {
+                const last = out[out.length - 1];
+
+                // 마지막에 쌓인 게 현재 줄의 앞부분(접두사)이고, 현재 줄이 그걸 이어붙여 자란 형태면
+                // 마지막 조각은 미완성 스트리밍 조각으로 보고 버린다.
+                if (cur.length > last.length && cur.startsWith(last)) {
+                    out.pop();
+                    continue;
+                }
+                break;
+            }
+            out.push(cur);
+        }
+
+        return out;
+    }
+
     function rememberCtxLines(lines) {
         const old = getCtxCache();
         const seen = new Set(old);
-        const merged = old.slice();
+        let merged = old.slice();
 
         for (const raw of lines || []) {
             const t = cleanContextLine(raw);
@@ -388,6 +417,8 @@
             seen.add(t);
             merged.push(t);
         }
+
+        merged = dropStreamingPrefixes(merged);
 
         saveCtxCache(merged);
     }
@@ -445,7 +476,8 @@
             out.push(t);
         }
 
-        return out.slice(-Math.max(1, maxN || 6));
+        // 화면에서 읽은 순간에도 스트리밍 접두사 조각을 정리한다.
+        return dropStreamingPrefixes(out).slice(-Math.max(1, maxN || 6));
     }
 
     function collectChatContext(maxN, selector) {
@@ -460,12 +492,14 @@
             domLines = [];
         }
 
-        const cached = getCtxCache();
+        // 지금 화면에 실제로 보이는 대화(순서가 정확함)를 최우선으로 쓴다.
+        // 화면에서 아무것도 못 잡았을 때만 캐시를 대체로 사용한다.
+        const base = domLines.length ? domLines : getCtxCache();
 
         const merged = [];
         const seen = new Set();
 
-        for (const raw of cached.concat(domLines)) {
+        for (const raw of base) {
             const line = cleanContextLine(raw);
 
             if (!line) continue;
