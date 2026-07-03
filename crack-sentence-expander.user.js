@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.8.8
+// @version      6.8.9
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -11,8 +11,8 @@
 // @connect      generativelanguage.googleapis.com
 // @homepageURL  https://github.com/voisei/crack-sentence-expander
 // @supportURL   https://github.com/voisei/crack-sentence-expander/issues
-// @updateURL    https://raw.githubusercontent.com/voisei/crack-sentence-expander/main/crack-sentence-expander.user.js
-// @downloadURL  https://raw.githubusercontent.com/voisei/crack-sentence-expander/main/crack-sentence-expander.user.js
+// @updateURL    https://raw.githubusercontent.com/voisei/crack-sentence-expander/refs/heads/main/crack-sentence-expander.user.js
+// @downloadURL  https://raw.githubusercontent.com/voisei/crack-sentence-expander/refs/heads/main/crack-sentence-expander.user.js
 // @license      MIT
 // @run-at       document-idle
 // ==/UserScript==
@@ -77,11 +77,16 @@
             lines.push('');
             lines.push('[유저 캐릭터의 페르소나 — 기본 설정일 뿐, 현재 상태가 아님]');
             lines.push(persona.trim());
-            lines.push('- 위 페르소나는 캐릭터의 기본 성격·말투·가치관·배경이다.');
-            lines.push('- 페르소나에 적힌 외모·상태·차림·기분 등은 "평소의 기본값"일 뿐, 지금 이 순간의 사실로 단정하지 마라.');
-            lines.push('- 페르소나 내용이 [직전 대화 맥락]이나 이번 [행동]/[대사]와 어긋나면, 항상 최근 상황을 우선한다.');
+            lines.push('- 위 페르소나는 캐릭터의 기본 성격·말투·가치관·배경·평소 습관이다.');
+            lines.push('- 페르소나에 적힌 외모·상태·차림·소지품·기분 등은 "평소의 기본값"일 뿐, 지금 이 순간의 사실로 단정하지 마라.');
+            lines.push('- 현재 상태, 옷차림, 노출 정도, 청결 상태, 자세, 위치, 소지품은 항상 [직전 대화 맥락]과 이번 [행동]/[대사]를 우선한다.');
+            lines.push('- 페르소나 내용이 [직전 대화 맥락]이나 이번 [행동]/[대사]와 어긋나면, 반드시 더 최근 상황을 따른다.');
             lines.push('- 예: 페르소나에 "평소 지저분하다"가 있어도, 방금 씻었거나 옷을 갈아입은 맥락이면 그 순간엔 깨끗한 상태로 묘사한다.');
+            lines.push('- 예: 페르소나에 "평소 메리야스를 입는다"가 있어도, 방금 샤워하고 나왔거나 벗고 있거나 수건만 걸친 맥락이면 메리야스를 입었다고 묘사하지 마라.');
+            lines.push('- 예: 페르소나에 특정 옷차림이 적혀 있어도, 최근 대화에서 벗었다/갈아입었다/젖었다/찢어졌다/벗겨졌다/입었다는 변화가 있으면 그 변화 후의 상태를 현재 상태로 유지하라.');
+            lines.push('- 현재 장면에 없는 옷, 장신구, 소지품을 페르소나에 있다는 이유만으로 새로 착용시키거나 들려주지 마라.');
             lines.push('- 설정을 본문에 그대로 나열·설명하지 말고 자연스럽게 녹여라.');
+            lines.push('- 페르소나의 평소 옷차림·청결 상태·소지품을 최근 상황과 충돌하게 되살리지 마라. (예: 샤워 후 벗고 있는데 메리야스를 입었다고 묘사)');
         }
 
         if (style && style.trim()) {
