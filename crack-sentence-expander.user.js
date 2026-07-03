@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.9.2
+// @version      6.10.0
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -46,6 +46,8 @@
     const K_MEMORY_ON   = 'se_crack_memory_on';
     const K_MEMORY_AUTO = 'se_crack_memory_auto';
     const K_MEMORY_TEXT = 'se_crack_memory_text';
+
+    const K_PERSONA_HINT = 'se_persona_hint';
 
     const STYLE_SLOTS = 3;
     const PERSONA_SLOTS = 3;
@@ -692,6 +694,183 @@
         return saved || '';
     }
 
+
+    function collectCrackStoryDetailFromPage() {
+        const roots = Array.from(document.querySelectorAll('#story-detail-scroll .wrtn-markdown, #story-detail-scroll'))
+            .filter(el => isVisible(el));
+
+        const texts = [];
+        const seen = new Set();
+
+        for (const el of roots) {
+            let t = (el.innerText || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            if (!t) continue;
+            if (t.length < 10) continue;
+            if (t.length > 12000) t = t.slice(0, 12000).trim() + '…';
+            if (seen.has(t)) continue;
+
+            seen.add(t);
+            texts.push(t);
+        }
+
+        return texts.join('\n\n---\n\n').trim();
+    }
+
+    function buildPersonaSuggestPrompt(keywords, storyDetail, recentContext) {
+        const system = [
+            '너는 롤플레이 캐릭터 채팅용 "유저 캐릭터 페르소나"를 만들어주는 설정 보조다.',
+            '목표는 제작자 설정, 상세 설명, 프롤로그/시작 상황을 읽고 그 세계관에 자연스럽게 들어맞는 유저 캐릭터 페르소나를 작성하는 것이다.',
+            '사용자가 준 키워드를 반드시 반영하되, 제작자 설정과 충돌하지 않게 조정한다.',
+            '',
+            '[중요 원칙]',
+            '- "유저 캐릭터"의 페르소나만 만든다. 상대 캐릭터, 크랙 캐릭터, NPC의 설정을 대신 확정하지 마라.',
+            '- 제작자 설정/프롤로그에 이미 있는 사실을 우선한다.',
+            '- 사용자가 준 키워드가 제작자 설정과 충돌하면, 충돌하지 않는 방향으로 자연스럽게 완화한다.',
+            '- 페르소나는 현재 장면의 고정 상태가 아니라 기본 성격, 배경, 말투, 습관, 관계성 중심으로 쓴다.',
+            '- 옷차림, 청결 상태, 자세, 소지품처럼 장면마다 바뀌는 것은 "평소"로만 조심스럽게 적고 현재 사실로 고정하지 않는다.',
+            '- 선정적/폭력적/과한 설정을 새로 만들지 말고, 필요한 경우 간접적이고 안전하게 정리한다.',
+            '- 한국어로 작성한다.',
+            '',
+            '[출력 형식]',
+            '설명 없이 페르소나 본문만 출력한다.',
+            '아래 항목을 자연스럽게 포함하되, 너무 길게 장황하게 쓰지 마라.',
+            '- 기본 정보: 나이대, 성별/젠더 표현이 사용자가 준 경우, 직업/신분',
+            '- 성격: 핵심 성향 3~5개',
+            '- 말투: 대사 톤과 대화 습관',
+            '- 배경: 제작자 설정에 맞는 최소한의 과거/직업 배경',
+            '- 관계/목표: 현재 시작상황에서 왜 이 장면에 있는지, 무엇을 원하거나 경계하는지',
+            '- 금지/주의: 상대 캐릭터의 행동이나 감정을 대신 정하지 않는 방향',
+            '',
+            '최종 출력은 8~14문장 정도의 한 덩어리 페르소나로 작성한다.'
+        ].join('\n');
+
+        const user = [
+            '[사용자 키워드]',
+            keywords && keywords.trim() ? keywords.trim() : '(없음)',
+            '',
+            '[크랙 상세 설명/제작자 설정/프롤로그]',
+            storyDetail && storyDetail.trim() ? storyDetail.trim() : '(현재 화면에서 읽은 설정 없음)',
+            '',
+            '[최근 채팅 맥락]',
+            recentContext && recentContext.length ? recentContext.map(m => '· ' + m).join('\n') : '(없음)',
+            '',
+            '위 자료를 바탕으로 유저 페르소나 칸에 넣기 좋은 완성형 페르소나만 출력해줘.'
+        ].join('\n');
+
+        return { system, user };
+    }
+
+    function callGeminiPersonaSuggest(keywords, onDone, onErr) {
+        const apiKey = GM_getValue(K_APIKEY, '');
+        const model = GM_getValue(K_MODEL, DEFAULT_MODELS[0].id);
+
+        if (!apiKey) {
+            onErr('API 키가 없어요. ⚙️ 설정에서 먼저 넣어주세요.');
+            return;
+        }
+
+        const storyDetail = collectCrackStoryDetailFromPage();
+
+        let recentContext = [];
+        try {
+            const n = parseInt(GM_getValue(K_CTX_N, 10), 10) || 10;
+            const sel = GM_getValue(K_CTX_SEL, '') || 'div[data-message-group-id]';
+            recentContext = collectChatContext(Math.min(Math.max(n, 6), 20), sel);
+        } catch (_) {
+            recentContext = [];
+        }
+
+        if (!storyDetail && !recentContext.length && !(keywords && keywords.trim())) {
+            onErr('읽을 설정이나 키워드가 없어요. 크랙 상세 설명/프롤로그 화면을 열거나 키워드를 적어주세요.');
+            return;
+        }
+
+        const { system, user } = buildPersonaSuggestPrompt(keywords, storyDetail, recentContext);
+
+        const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/'
+            + encodeURIComponent(model)
+            + ':generateContent?key='
+            + encodeURIComponent(apiKey);
+
+        const body = {
+            system_instruction: {
+                parts: [{ text: system }]
+            },
+            contents: [
+                {
+                    role: 'user',
+                    parts: [{ text: user }]
+                }
+            ],
+            generationConfig: {
+                maxOutputTokens: 2048
+            },
+        };
+
+        GM_xmlhttpRequest({
+            method: 'POST',
+            url: endpoint,
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            data: JSON.stringify(body),
+            onload: function (res) {
+                if (res.status < 200 || res.status >= 300) {
+                    let msg = 'API 에러 (' + res.status + ')';
+
+                    try {
+                        const e = JSON.parse(res.responseText);
+                        if (e.error && e.error.message) msg += ': ' + e.error.message;
+                    } catch (_) {}
+
+                    console.error('[문장 부풀리기] 페르소나 추천 API 에러:', res.responseText);
+                    onErr(msg);
+                    return;
+                }
+
+                try {
+                    const data = JSON.parse(res.responseText);
+                    const cand = data.candidates && data.candidates[0];
+
+                    if (!cand || !cand.content) {
+                        const reason =
+                            (cand && cand.finishReason)
+                            || (data.promptFeedback && data.promptFeedback.blockReason)
+                            || '알 수 없음';
+
+                        onErr('추천 응답이 비어 있어요 (사유: ' + reason + '). 키워드를 조금 바꿔보세요.');
+                        return;
+                    }
+
+                    const out = (cand.content.parts || [])
+                        .map(p => p.text || '')
+                        .join('')
+                        .trim();
+
+                    if (!out) {
+                        onErr('빈 추천이 왔어요. 다시 시도해 주세요.');
+                        return;
+                    }
+
+                    onDone(out);
+                } catch (err) {
+                    console.error('[문장 부풀리기] 페르소나 추천 파싱 실패:', err, res.responseText);
+                    onErr('추천 응답을 읽지 못했어요. 콘솔을 확인해 주세요.');
+                }
+            },
+            onerror: function () {
+                onErr('네트워크 오류예요. 연결을 확인해 주세요.');
+            },
+            ontimeout: function () {
+                onErr('시간 초과예요. 다시 시도해 주세요.');
+            },
+            timeout: 60000,
+        });
+    }
+
     function callGemini(dialogue, action, onDone, onErr) {
         const apiKey = GM_getValue(K_APIKEY, '');
         const model = GM_getValue(K_MODEL, DEFAULT_MODELS[0].id);
@@ -1170,6 +1349,13 @@
         resize: vertical;
         line-height: 1.5;
     }
+    #se-persona-hint {
+        min-height: 44px !important;
+        max-height: 100px;
+        resize: vertical;
+        line-height: 1.5;
+        font-size: 12px;
+    }
     #se-crack-memory-text {
         min-height: 90px !important;
         max-height: 180px;
@@ -1215,7 +1401,8 @@
     #se-ctx-test,
     #se-ctx-clear,
     #se-memory-fetch,
-    #se-memory-clear {
+    #se-memory-clear,
+    #se-persona-suggest {
         padding: 8px;
         border: 1px solid #4a4f63;
         border-radius: 9px;
@@ -1229,7 +1416,8 @@
     #se-ctx-test:hover,
     #se-ctx-clear:hover,
     #se-memory-fetch:hover,
-    #se-memory-clear:hover {
+    #se-memory-clear:hover,
+    #se-persona-suggest:hover {
         background: #2d3140;
     }
     #se-fetch:disabled {
@@ -1239,14 +1427,16 @@
     #se-fetch-status,
     #se-ctx-status,
     #se-memory-status,
-    #se-sync-status {
+    #se-sync-status,
+    #se-persona-suggest-status {
         font-size: 11px;
         color: #9aa0b4;
         min-height: 14px;
     }
     #se-fetch-status.err,
     #se-memory-status.err,
-    #se-sync-status.err {
+    #se-sync-status.err,
+    #se-persona-suggest-status.err {
         color: #ff8a8a;
     }
     #se-save {
@@ -1324,13 +1514,15 @@
     }
     .se-sync-btns,
     .se-memory-btns,
-    .se-ctx-btns {
+    .se-ctx-btns,
+    .se-persona-suggest-btns {
         display: flex;
         gap: 6px;
     }
     .se-sync-btns button,
     .se-memory-btns button,
-    .se-ctx-btns button {
+    .se-ctx-btns button,
+    .se-persona-suggest-btns button {
         flex: 1;
     }
     .se-sync-btns button {
@@ -1400,6 +1592,14 @@
 
             <div id="se-settings">
                 <label>🎭 유저 페르소나 (여러 개 저장 → 쓸 것만 체크 ✔)</label>
+
+                <textarea id="se-persona-hint" class="se-style-ta" placeholder="자동추천 키워드 예: 여자 검사, 무뚝뚝, 책임감 강함, 30대 초반"></textarea>
+
+                <div class="se-persona-suggest-btns">
+                    <button id="se-persona-suggest">✨ 현재 설정으로 페르소나 추천</button>
+                </div>
+
+                <div id="se-persona-suggest-status"></div>
 
                 <div class="se-style-slot">
                     <div class="se-style-head">
@@ -1635,6 +1835,67 @@
 
         applyPersonasToUI(getPersonaSlots());
 
+        const personaHint = $('#se-persona-hint');
+        const personaSuggestBtn = $('#se-persona-suggest');
+        const personaSuggestStatus = $('#se-persona-suggest-status');
+
+        if (personaHint) personaHint.value = GM_getValue(K_PERSONA_HINT, '');
+
+        function personaSuggestFlash(msg, isErr) {
+            if (!personaSuggestStatus) return;
+            personaSuggestStatus.textContent = msg;
+            personaSuggestStatus.classList.toggle('err', !!isErr);
+        }
+
+        function putSuggestedPersona(text) {
+            const arr = collectPersonas();
+            let idx = arr.findIndex(s => s && s.on);
+            if (idx < 0) idx = arr.findIndex(s => !s || !s.text || !s.text.trim());
+            if (idx < 0) idx = 0;
+
+            const ta = $('#se-persona-' + idx);
+            const chk = $('#se-persona-chk-' + idx);
+            const nm = $('#se-persona-name-' + idx);
+
+            if (ta) ta.value = text;
+            if (chk) chk.checked = true;
+            if (nm && (!nm.value || /^페르소나\s*\d+$/.test(nm.value.trim()))) {
+                nm.value = '자동추천 페르소나';
+            }
+
+            savePersonas();
+        }
+
+        if (personaHint) {
+            personaHint.addEventListener('change', () => {
+                GM_setValue(K_PERSONA_HINT, personaHint.value);
+            });
+        }
+
+        if (personaSuggestBtn) {
+            personaSuggestBtn.addEventListener('click', () => {
+                const keywords = personaHint ? personaHint.value.trim() : '';
+                GM_setValue(K_PERSONA_HINT, keywords);
+
+                personaSuggestBtn.disabled = true;
+                personaSuggestFlash('크랙 상세 설명/프롤로그와 최근 맥락을 읽고 추천 중…', false);
+
+                callGeminiPersonaSuggest(
+                    keywords,
+                    outText => {
+                        putSuggestedPersona(outText);
+                        personaSuggestBtn.disabled = false;
+                        personaSuggestFlash('페르소나를 자동으로 넣었어요 ✅ 마음에 안 들면 키워드를 고쳐서 다시 눌러도 돼요.');
+                    },
+                    err => {
+                        personaSuggestBtn.disabled = false;
+                        personaSuggestFlash(err, true);
+                    }
+                );
+            });
+        }
+
+
         for (let i = 0; i < PERSONA_SLOTS; i++) {
             const chk = $('#se-persona-chk-' + i);
             if (chk) chk.addEventListener('change', savePersonas);
@@ -1802,6 +2063,7 @@
 
         fetchBtn.addEventListener('click', () => {
             GM_setValue(K_APIKEY, $('#se-key').value.trim());
+            GM_setValue(K_PERSONA_HINT, personaHint ? personaHint.value.trim() : '');
 
             fetchBtn.disabled = true;
             fetchStat.classList.remove('err');
@@ -1832,6 +2094,7 @@
 
         $('#se-save').addEventListener('click', () => {
             GM_setValue(K_APIKEY, $('#se-key').value.trim());
+            GM_setValue(K_PERSONA_HINT, personaHint ? personaHint.value.trim() : '');
             savePersonas();
             saveStyles();
             saveMemorySettings();
@@ -1852,6 +2115,7 @@
             K_MODEL,
             K_PERSONA,
             K_PERSONAS,
+            K_PERSONA_HINT,
             K_STYLES,
             K_NAME,
             K_POV,
