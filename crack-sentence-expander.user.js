@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.8.7
+// @version      6.8.8
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -494,7 +494,7 @@
 
         // 지금 화면에 실제로 보이는 대화(순서가 정확함)를 최우선으로 쓴다.
         // 화면에서 아무것도 못 잡았을 때만 캐시를 대체로 사용한다.
-        const base = domLines.length ? domLines : getCtxCache();
+        const base = getCtxCache().concat(domLines);
 
         const merged = [];
         const seen = new Set();
