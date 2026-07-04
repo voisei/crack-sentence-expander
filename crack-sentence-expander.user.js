@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.10.3
+// @version      6.10.4
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -1484,6 +1484,62 @@
     #se-status.err {
         color: #ff8a8a;
     }
+
+    .se-section-note {
+        color: #9aa0b4;
+        font-size: 11px;
+        line-height: 1.45;
+        padding: 2px 2px 4px;
+    }
+    .se-section {
+        border: 1px solid rgba(148, 163, 184, .22);
+        border-radius: 12px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, .035);
+    }
+    .se-section + .se-section {
+        margin-top: 2px;
+    }
+    .se-section > summary {
+        list-style: none;
+        cursor: pointer;
+        user-select: none;
+        padding: 10px 11px;
+        font-size: 13px;
+        font-weight: 750;
+        color: #f2f5ff;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+    }
+    .se-section > summary::-webkit-details-marker {
+        display: none;
+    }
+    .se-section > summary::after {
+        content: '열기';
+        font-size: 11px;
+        font-weight: 650;
+        color: #9aa0b4;
+        border: 1px solid rgba(148, 163, 184, .28);
+        border-radius: 999px;
+        padding: 2px 7px;
+        flex: 0 0 auto;
+    }
+    .se-section[open] > summary {
+        border-bottom: 1px solid rgba(148, 163, 184, .18);
+        background: rgba(255, 255, 255, .035);
+    }
+    .se-section[open] > summary::after {
+        content: '닫기';
+    }
+    .se-section-body {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 9px;
+    }
+
     #se-settings {
         display: none;
         flex-direction: column;
@@ -1654,10 +1710,75 @@
             max-height: calc(100dvh - 12px);
         }
         #se-body,
-        #se-settings {
+    
+    .se-section-note {
+        color: #9aa0b4;
+        font-size: 11px;
+        line-height: 1.45;
+        padding: 2px 2px 4px;
+    }
+    .se-section {
+        border: 1px solid rgba(148, 163, 184, .22);
+        border-radius: 12px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, .035);
+    }
+    .se-section + .se-section {
+        margin-top: 2px;
+    }
+    .se-section > summary {
+        list-style: none;
+        cursor: pointer;
+        user-select: none;
+        padding: 10px 11px;
+        font-size: 13px;
+        font-weight: 750;
+        color: #f2f5ff;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+    }
+    .se-section > summary::-webkit-details-marker {
+        display: none;
+    }
+    .se-section > summary::after {
+        content: '열기';
+        font-size: 11px;
+        font-weight: 650;
+        color: #9aa0b4;
+        border: 1px solid rgba(148, 163, 184, .28);
+        border-radius: 999px;
+        padding: 2px 7px;
+        flex: 0 0 auto;
+    }
+    .se-section[open] > summary {
+        border-bottom: 1px solid rgba(148, 163, 184, .18);
+        background: rgba(255, 255, 255, .035);
+    }
+    .se-section[open] > summary::after {
+        content: '닫기';
+    }
+    .se-section-body {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 9px;
+    }
+
+    #se-settings {
             padding: 8px;
             gap: 6px;
         }
+        .se-section > summary {
+            padding: 8px 9px;
+            font-size: 12px;
+        }
+        .se-section-body {
+            padding: 7px;
+            gap: 6px;
+        }
+
         .se-style-slot {
             padding: 6px;
             gap: 4px;
@@ -1827,149 +1948,175 @@
             </div>
 
             <div id="se-settings">
-                <label>🎭 유저 페르소나 (여러 개 저장 → 쓸 것만 체크 ✔)</label>
+                <div class="se-section-note">필요한 항목만 눌러서 열어 쓰세요.</div>
 
-                <textarea id="se-persona-hint" class="se-style-ta" placeholder="자동추천 키워드 예: 여자 검사, 무뚝뚝, 책임감 강함, 30대 초반"></textarea>
+                <details class="se-section">
+                    <summary>🎭 유저 페르소나 / 자동추천</summary>
+                    <div class="se-section-body">
+                        <textarea id="se-persona-hint" class="se-style-ta" placeholder="자동추천 키워드 예: 여자 검사, 무뚝뚝, 책임감 강함, 30대 초반"></textarea>
 
-                <div class="se-persona-suggest-btns">
-                    <button id="se-persona-suggest">✨ 현재 설정으로 페르소나 추천</button>
-                </div>
+                        <div class="se-persona-suggest-btns">
+                            <button id="se-persona-suggest">✨ 현재 설정으로 페르소나 추천</button>
+                        </div>
 
-                <div id="se-persona-suggest-status"></div>
+                        <div id="se-persona-suggest-status"></div>
 
-                <div class="se-style-slot">
-                    <div class="se-style-head">
-                        <input type="checkbox" id="se-persona-chk-0">
-                        <input type="text" id="se-persona-name-0" class="se-style-name" placeholder="이름 (예: 검사 서지훈)">
+                        <div class="se-style-slot">
+                            <div class="se-style-head">
+                                <input type="checkbox" id="se-persona-chk-0">
+                                <input type="text" id="se-persona-name-0" class="se-style-name" placeholder="이름 (예: 검사 서지훈)">
+                            </div>
+                            <textarea id="se-persona-0" class="se-style-ta" placeholder='예: 27세 무뚝뚝한 검사. 말수 적고 비꼬는 말투. 속은 다정함.'></textarea>
+                        </div>
+
+                        <div class="se-style-slot">
+                            <div class="se-style-head">
+                                <input type="checkbox" id="se-persona-chk-1">
+                                <input type="text" id="se-persona-name-1" class="se-style-name" placeholder="이름 (예: 학생 ver)">
+                            </div>
+                            <textarea id="se-persona-1" class="se-style-ta" placeholder='예: 밝고 발랄한 고등학생. 호기심 많고 장난기 가득.'></textarea>
+                        </div>
+
+                        <div class="se-style-slot">
+                            <div class="se-style-head">
+                                <input type="checkbox" id="se-persona-chk-2">
+                                <input type="text" id="se-persona-name-2" class="se-style-name" placeholder="이름 (선택)">
+                            </div>
+                            <textarea id="se-persona-2" class="se-style-ta" placeholder='예: ...'></textarea>
+                        </div>
                     </div>
-                    <textarea id="se-persona-0" class="se-style-ta" placeholder='예: 27세 무뚝뚝한 검사. 말수 적고 비꼬는 말투. 속은 다정함.'></textarea>
-                </div>
+                </details>
 
-                <div class="se-style-slot">
-                    <div class="se-style-head">
-                        <input type="checkbox" id="se-persona-chk-1">
-                        <input type="text" id="se-persona-name-1" class="se-style-name" placeholder="이름 (예: 학생 ver)">
+                <details class="se-section">
+                    <summary>✍️ 문체 규칙</summary>
+                    <div class="se-section-body">
+                        <div class="se-style-slot">
+                            <div class="se-style-head">
+                                <input type="checkbox" id="se-style-chk-0">
+                                <input type="text" id="se-style-name-0" class="se-style-name" placeholder="이름 (예: 건조체)">
+                            </div>
+                            <textarea id="se-style-0" class="se-style-ta" placeholder='예: 짧고 건조한 문장 위주로. 비유는 적게.'></textarea>
+                        </div>
+
+                        <div class="se-style-slot">
+                            <div class="se-style-head">
+                                <input type="checkbox" id="se-style-chk-1">
+                                <input type="text" id="se-style-name-1" class="se-style-name" placeholder="이름 (예: 고풍체)">
+                            </div>
+                            <textarea id="se-style-1" class="se-style-ta" placeholder='예: 고풍스러운 문어체. 한자어를 적절히.'></textarea>
+                        </div>
+
+                        <div class="se-style-slot">
+                            <div class="se-style-head">
+                                <input type="checkbox" id="se-style-chk-2">
+                                <input type="text" id="se-style-name-2" class="se-style-name" placeholder="이름 (예: 감성체)">
+                            </div>
+                            <textarea id="se-style-2" class="se-style-ta" placeholder='예: 감각적이고 서정적인 묘사 위주.'></textarea>
+                        </div>
                     </div>
-                    <textarea id="se-persona-1" class="se-style-ta" placeholder='예: 밝고 발랄한 고등학생. 호기심 많고 장난기 가득.'></textarea>
-                </div>
+                </details>
 
-                <div class="se-style-slot">
-                    <div class="se-style-head">
-                        <input type="checkbox" id="se-persona-chk-2">
-                        <input type="text" id="se-persona-name-2" class="se-style-name" placeholder="이름 (선택)">
+                <details class="se-section">
+                    <summary>🧠 크랙 요약 메모리</summary>
+                    <div class="se-section-body">
+                        <div class="se-ctx-row">
+                            <input type="checkbox" id="se-memory-on">
+                            <span class="se-ctx-label">프롬프트에 참고시키기</span>
+                        </div>
+
+                        <div class="se-ctx-row">
+                            <input type="checkbox" id="se-memory-auto">
+                            <span class="se-ctx-label">문학적으로 늘리기 누를 때, 현재 화면이 요약 메모리면 자동 새로고침</span>
+                        </div>
+
+                        <div class="se-memory-btns">
+                            <button id="se-memory-fetch">📥 현재 화면에서 메모리 가져오기</button>
+                            <button id="se-memory-clear">🗑 비우기</button>
+                        </div>
+
+                        <textarea id="se-crack-memory-text" placeholder="크랙의 요약 메모리 화면을 열고 '현재 화면에서 메모리 가져오기'를 누르면 여기에 저장돼요. 직접 붙여넣어도 돼요."></textarea>
+                        <div id="se-memory-status"></div>
                     </div>
-                    <textarea id="se-persona-2" class="se-style-ta" placeholder='예: ...'></textarea>
-                </div>
+                </details>
 
-                <label>✍️ 문체 규칙 (여러 개 저장 → 쓸 것만 체크 ✔)</label>
+                <details class="se-section">
+                    <summary>💬 최근 대화 맥락</summary>
+                    <div class="se-section-body">
+                        <div class="se-ctx-row">
+                            <input type="checkbox" id="se-ctx-chk">
+                            <span class="se-ctx-label">켜기 · 최근</span>
+                            <input type="number" id="se-ctx-n" class="se-ctx-n" min="1" max="30" value="6">
+                            <span class="se-ctx-label">개</span>
+                        </div>
 
-                <div class="se-style-slot">
-                    <div class="se-style-head">
-                        <input type="checkbox" id="se-style-chk-0">
-                        <input type="text" id="se-style-name-0" class="se-style-name" placeholder="이름 (예: 건조체)">
+                        <input id="se-ctx-sel" type="text" placeholder="(고급) 메시지 CSS 선택자 — 추천: div[data-message-group-id]">
+
+                        <div class="se-ctx-btns">
+                            <button id="se-ctx-test">🔍 맥락 미리보기</button>
+                            <button id="se-ctx-clear">🧹 이 채팅방 캐시 비우기</button>
+                        </div>
+
+                        <div id="se-ctx-status"></div>
                     </div>
-                    <textarea id="se-style-0" class="se-style-ta" placeholder='예: 짧고 건조한 문장 위주로. 비유는 적게.'></textarea>
-                </div>
+                </details>
 
-                <div class="se-style-slot">
-                    <div class="se-style-head">
-                        <input type="checkbox" id="se-style-chk-1">
-                        <input type="text" id="se-style-name-1" class="se-style-name" placeholder="이름 (예: 고풍체)">
+                <details class="se-section">
+                    <summary>⚙️ 기본 설정 / API / 모델</summary>
+                    <div class="se-section-body">
+                        <label>🪪 캐릭터 이름 (3인칭일 때 사용, 선택)</label>
+                        <input id="se-name" type="text" placeholder="예: 서지훈">
+
+                        <label>🔑 Gemini API 키</label>
+                        <input id="se-key" type="password" placeholder="AIza...">
+
+                        <label>🤖 모델 (목록에서 선택)</label>
+                        <select id="se-model"></select>
+                        <button id="se-fetch">🔄 사용 가능한 모델 불러오기</button>
+                        <div id="se-fetch-status"></div>
                     </div>
-                    <textarea id="se-style-1" class="se-style-ta" placeholder='예: 고풍스러운 문어체. 한자어를 적절히.'></textarea>
-                </div>
+                </details>
 
-                <div class="se-style-slot">
-                    <div class="se-style-head">
-                        <input type="checkbox" id="se-style-chk-2">
-                        <input type="text" id="se-style-name-2" class="se-style-name" placeholder="이름 (예: 감성체)">
+                <details class="se-section">
+                    <summary>💸 API 비용 추정</summary>
+                    <div class="se-section-body">
+                        <div class="se-ctx-row">
+                            <input type="checkbox" id="se-cost-on">
+                            <span class="se-ctx-label">실시간 표시 · 환율</span>
+                            <input type="number" id="se-cost-usdkrw" min="1" step="1" value="1400">
+                            <span class="se-ctx-label">원/USD</span>
+                        </div>
+
+                        <div class="se-cost-btns">
+                            <button id="se-cost-reset">🧹 비용 누적 초기화</button>
+                        </div>
+
+                        <div id="se-cost-status"></div>
                     </div>
-                    <textarea id="se-style-2" class="se-style-ta" placeholder='예: 감각적이고 서정적인 묘사 위주.'></textarea>
-                </div>
-
-                <label>🧠 크랙 요약 메모리 자동 참고</label>
-
-                <div class="se-ctx-row">
-                    <input type="checkbox" id="se-memory-on">
-                    <span class="se-ctx-label">프롬프트에 참고시키기</span>
-                </div>
-
-                <div class="se-ctx-row">
-                    <input type="checkbox" id="se-memory-auto">
-                    <span class="se-ctx-label">문학적으로 늘리기 누를 때, 현재 화면이 요약 메모리면 자동 새로고침</span>
-                </div>
-
-                <div class="se-memory-btns">
-                    <button id="se-memory-fetch">📥 현재 화면에서 메모리 가져오기</button>
-                    <button id="se-memory-clear">🗑 비우기</button>
-                </div>
-
-                <textarea id="se-crack-memory-text" placeholder="크랙의 요약 메모리 화면을 열고 '현재 화면에서 메모리 가져오기'를 누르면 여기에 저장돼요. 직접 붙여넣어도 돼요."></textarea>
-                <div id="se-memory-status"></div>
-
-                <label>🧠 최근 대화 맥락 참고 + 채팅방별 자동 캐시</label>
-
-                <div class="se-ctx-row">
-                    <input type="checkbox" id="se-ctx-chk">
-                    <span class="se-ctx-label">켜기 · 최근</span>
-                    <input type="number" id="se-ctx-n" class="se-ctx-n" min="1" max="30" value="6">
-                    <span class="se-ctx-label">개</span>
-                </div>
-
-                <input id="se-ctx-sel" type="text" placeholder="(고급) 메시지 CSS 선택자 — 추천: div[data-message-group-id]">
-
-                <div class="se-ctx-btns">
-                    <button id="se-ctx-test">🔍 맥락 미리보기</button>
-                    <button id="se-ctx-clear">🧹 이 채팅방 캐시 비우기</button>
-                </div>
-
-                <div id="se-ctx-status"></div>
-
-                <label>🪪 캐릭터 이름 (3인칭일 때 사용, 선택)</label>
-                <input id="se-name" type="text" placeholder="예: 서지훈">
-
-                <label>🔑 Gemini API 키</label>
-                <input id="se-key" type="password" placeholder="AIza...">
-
-                <label>🤖 모델 (목록에서 선택)</label>
-                <select id="se-model"></select>
-                <button id="se-fetch">🔄 사용 가능한 모델 불러오기</button>
-                <div id="se-fetch-status"></div>
-
-                <label>💸 API 비용 추정</label>
-
-                <div class="se-ctx-row">
-                    <input type="checkbox" id="se-cost-on">
-                    <span class="se-ctx-label">실시간 표시 · 환율</span>
-                    <input type="number" id="se-cost-usdkrw" min="1" step="1" value="1400">
-                    <span class="se-ctx-label">원/USD</span>
-                </div>
-
-                <div class="se-cost-btns">
-                    <button id="se-cost-reset">🧹 비용 누적 초기화</button>
-                </div>
-
-                <div id="se-cost-status"></div>
+                </details>
 
                 <button id="se-save">저장</button>
 
-                <label>🔄 설정 동기화 (다른 기기로 옮기기)</label>
-                <textarea id="se-sync-box" placeholder="내보내기를 누르면 코드가 생겨요. 다른 기기에서는 그 코드를 붙여넣고 가져오기를 누르면 돼요."></textarea>
+                <details class="se-section">
+                    <summary>🔄 설정 동기화 / 안내</summary>
+                    <div class="se-section-body">
+                        <textarea id="se-sync-box" placeholder="내보내기를 누르면 코드가 생겨요. 다른 기기에서는 그 코드를 붙여넣고 가져오기를 누르면 돼요."></textarea>
 
-                <div class="se-sync-btns">
-                    <button id="se-export">📤 내보내기</button>
-                    <button id="se-import">📥 가져오기</button>
-                </div>
+                        <div class="se-sync-btns">
+                            <button id="se-export">📤 내보내기</button>
+                            <button id="se-import">📥 가져오기</button>
+                        </div>
 
-                <div id="se-sync-status"></div>
+                        <div id="se-sync-status"></div>
 
-                <div id="se-hint">
-                    최근 대화 맥락 캐시는 채팅방 주소별로 따로 저장돼요.
-                    A 채팅방에서 저장된 맥락은 B 채팅방에 섞이지 않아요.
-                    단, 크랙이 여러 채팅방을 같은 주소로 표시하면 완벽히 분리되지 않을 수 있어요.
-                    캐시는 화면에 한 번이라도 표시된 채팅을 최대 300개까지 저장해요.
-                    가져온 메모리와 최근 대화 맥락은 Gemini API로 같이 전송돼요. 개인정보/API 키/비밀번호는 넣지 마세요.
-                </div>
+                        <div id="se-hint">
+                            최근 대화 맥락 캐시는 채팅방 주소별로 따로 저장돼요.
+                            A 채팅방에서 저장된 맥락은 B 채팅방에 섞이지 않아요.
+                            단, 크랙이 여러 채팅방을 같은 주소로 표시하면 완벽히 분리되지 않을 수 있어요.
+                            캐시는 화면에 한 번이라도 표시된 채팅을 최대 300개까지 저장해요.
+                            가져온 메모리와 최근 대화 맥락은 Gemini API로 같이 전송돼요. 개인정보/API 키/비밀번호는 넣지 마세요.
+                        </div>
+                    </div>
+                </details>
             </div>
         `;
 
@@ -2330,6 +2477,24 @@
             costOnInput.addEventListener('change', () => {
                 GM_setValue(K_COST_ON, costOnInput.checked);
                 refreshCostStatus();
+
+        function setupSettingsAccordion() {
+            const sections = Array.from(panel.querySelectorAll('#se-settings .se-section'));
+            const isMobile = () => window.matchMedia && window.matchMedia('(max-width: 640px)').matches;
+
+            sections.forEach(section => {
+                section.addEventListener('toggle', () => {
+                    if (!section.open || !isMobile()) return;
+
+                    sections.forEach(other => {
+                        if (other !== section) other.open = false;
+                    });
+                });
+            });
+        }
+
+        setupSettingsAccordion();
+
             });
         }
 
@@ -2337,6 +2502,24 @@
             costUsdKrwInput.addEventListener('change', () => {
                 GM_setValue(K_COST_USDKRW, parseFloat(costUsdKrwInput.value) || 1400);
                 refreshCostStatus();
+
+        function setupSettingsAccordion() {
+            const sections = Array.from(panel.querySelectorAll('#se-settings .se-section'));
+            const isMobile = () => window.matchMedia && window.matchMedia('(max-width: 640px)').matches;
+
+            sections.forEach(section => {
+                section.addEventListener('toggle', () => {
+                    if (!section.open || !isMobile()) return;
+
+                    sections.forEach(other => {
+                        if (other !== section) other.open = false;
+                    });
+                });
+            });
+        }
+
+        setupSettingsAccordion();
+
             });
         }
 
@@ -2344,10 +2527,46 @@
             costResetBtn.addEventListener('click', () => {
                 resetCostStats();
                 refreshCostStatus();
+
+        function setupSettingsAccordion() {
+            const sections = Array.from(panel.querySelectorAll('#se-settings .se-section'));
+            const isMobile = () => window.matchMedia && window.matchMedia('(max-width: 640px)').matches;
+
+            sections.forEach(section => {
+                section.addEventListener('toggle', () => {
+                    if (!section.open || !isMobile()) return;
+
+                    sections.forEach(other => {
+                        if (other !== section) other.open = false;
+                    });
+                });
+            });
+        }
+
+        setupSettingsAccordion();
+
             });
         }
 
         refreshCostStatus();
+
+        function setupSettingsAccordion() {
+            const sections = Array.from(panel.querySelectorAll('#se-settings .se-section'));
+            const isMobile = () => window.matchMedia && window.matchMedia('(max-width: 640px)').matches;
+
+            sections.forEach(section => {
+                section.addEventListener('toggle', () => {
+                    if (!section.open || !isMobile()) return;
+
+                    sections.forEach(other => {
+                        if (other !== section) other.open = false;
+                    });
+                });
+            });
+        }
+
+        setupSettingsAccordion();
+
 
         fetchBtn.addEventListener('click', () => {
             GM_setValue(K_APIKEY, $('#se-key').value.trim());
