@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.10.4
+// @version      6.10.5
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -55,6 +55,7 @@
     const K_COST_TOTAL_IN = 'se_cost_total_input_tokens';
     const K_COST_TOTAL_OUT = 'se_cost_total_output_tokens';
     const K_COST_REQ_COUNT = 'se_cost_request_count';
+    const K_COST_LOG = 'se_cost_log';
 
     const STYLE_SLOTS = 3;
     const PERSONA_SLOTS = 3;
@@ -790,9 +791,14 @@
         return Math.round(v).toLocaleString('ko-KR');
     }
 
-    function recordCostUsage(modelId, usage, label) {
-        if (!GM_getValue(K_COST_ON, false)) return null;
+    function getCostLog() {
+        const raw = GM_getValue(K_COST_LOG, []);
+        return Array.isArray(raw) ? raw : [];
+    }
 
+    function recordCostUsage(modelId, usage, label) {
+        // 비용 추정은 "페르소나 추천"뿐 아니라 이 스크립트가 Gemini API를 호출한 모든 요청을 기록한다.
+        // K_COST_ON은 상단 표시 여부만 담당하고, 기록 자체는 항상 누적한다.
         const info = estimateCost(modelId, usage);
         if (!info) return null;
 
@@ -813,13 +819,23 @@
 
         const totalKrw = totalUsd * info.usdkrw;
 
-        return {
+        const entry = {
+            at: new Date().toLocaleString('ko-KR'),
             label: label || '요청',
+            model: modelId || '',
             modelLabel: info.rates.label,
             input: info.tokens.input,
             output: info.tokens.output,
             usd: info.usd,
-            krw: info.krw,
+            krw: info.krw
+        };
+
+        const log = getCostLog();
+        log.unshift(entry);
+        GM_setValue(K_COST_LOG, log.slice(0, 50));
+
+        return {
+            ...entry,
             totalUsd,
             totalKrw,
             totalIn,
@@ -829,8 +845,11 @@
         };
     }
 
-    function getCostSummaryText(lastInfo) {
-        const on = GM_getValue(K_COST_ON, false);
+    function getCostTopText(lastInfo) {
+        if (!GM_getValue(K_COST_ON, true)) {
+            return '표시 꺼짐 · 비용 기록은 계속 누적 중이에요.';
+        }
+
         const usdkrw = Math.max(1, parseFloat(GM_getValue(K_COST_USDKRW, 1400)) || 1400);
         const totalUsd = parseFloat(GM_getValue(K_COST_TOTAL_USD, 0)) || 0;
         const totalIn = parseInt(GM_getValue(K_COST_TOTAL_IN, 0), 10) || 0;
@@ -838,17 +857,62 @@
         const totalReq = parseInt(GM_getValue(K_COST_REQ_COUNT, 0), 10) || 0;
         const totalKrw = totalUsd * usdkrw;
 
+        const last = lastInfo || getCostLog()[0];
+
+        const lines = [
+            '누적 약 ₩' + fmtMoney(totalKrw) + ' · 요청 ' + totalReq + '회',
+            '입력 ' + totalIn.toLocaleString('ko-KR') + 'tok · 출력 ' + totalOut.toLocaleString('ko-KR') + 'tok'
+        ];
+
+        if (last) {
+            lines.push('방금/최근: ' + last.label + ' · 약 ₩' + fmtMoney(last.krw));
+        }
+
+        return lines.join('\n');
+    }
+
+    function getCostSummaryText(lastInfo) {
+        const usdkrw = Math.max(1, parseFloat(GM_getValue(K_COST_USDKRW, 1400)) || 1400);
+        const totalUsd = parseFloat(GM_getValue(K_COST_TOTAL_USD, 0)) || 0;
+        const totalIn = parseInt(GM_getValue(K_COST_TOTAL_IN, 0), 10) || 0;
+        const totalOut = parseInt(GM_getValue(K_COST_TOTAL_OUT, 0), 10) || 0;
+        const totalReq = parseInt(GM_getValue(K_COST_REQ_COUNT, 0), 10) || 0;
+        const totalKrw = totalUsd * usdkrw;
+        const log = getCostLog();
+
         const lines = [];
 
-        lines.push(on ? '켜짐 · Google 가격표 기준 추정치예요.' : '꺼짐 · 체크하면 다음 요청부터 추정해요.');
+        lines.push('상단 표시: ' + (GM_getValue(K_COST_ON, true) ? '켜짐' : '꺼짐') + ' · 기록은 모든 Gemini 요청에 누적돼요.');
         lines.push('누적: 약 ₩' + fmtMoney(totalKrw) + ' / $' + totalUsd.toFixed(6));
-        lines.push('요청 ' + totalReq + '회 · 입력 ' + totalIn.toLocaleString('ko-KR') + 'tok · 출력 ' + totalOut.toLocaleString('ko-KR') + 'tok');
+        lines.push('전체 요청 ' + totalReq + '회 · 입력 ' + totalIn.toLocaleString('ko-KR') + 'tok · 출력 ' + totalOut.toLocaleString('ko-KR') + 'tok');
 
         if (lastInfo) {
             lines.push('방금: ' + lastInfo.label + ' · ' + lastInfo.modelLabel + ' · 약 ₩' + fmtMoney(lastInfo.krw));
         }
 
-        lines.push('※ 무료 티어/캐시/세금/Batch/Flex/Priority/실제 청구 환율은 반영 안 된 Standard 기준 대략값.');
+        if (log.length) {
+            lines.push('');
+            lines.push('최근 사용내역 최대 50건');
+            log.slice(0, 20).forEach((x, i) => {
+                lines.push(
+                    (i + 1) + '. ' + x.at + ' · ' + x.label
+                    + ' · ' + x.modelLabel
+                    + ' · 입력 ' + Number(x.input || 0).toLocaleString('ko-KR') + 'tok'
+                    + ' / 출력 ' + Number(x.output || 0).toLocaleString('ko-KR') + 'tok'
+                    + ' · 약 ₩' + fmtMoney(x.krw)
+                );
+            });
+
+            if (log.length > 20) {
+                lines.push('…나머지 ' + (log.length - 20) + '건은 내부에 저장돼요.');
+            }
+        } else {
+            lines.push('');
+            lines.push('아직 기록된 요청이 없어요.');
+        }
+
+        lines.push('');
+        lines.push('※ 문장 부풀리기 + 페르소나 자동추천 둘 다 포함. 무료 티어/캐시/세금/Batch/Flex/Priority/실제 청구 환율은 반영 안 된 Standard 기준 대략값.');
 
         return lines.join('\n');
     }
@@ -858,6 +922,7 @@
         GM_setValue(K_COST_TOTAL_IN, 0);
         GM_setValue(K_COST_TOTAL_OUT, 0);
         GM_setValue(K_COST_REQ_COUNT, 0);
+        GM_setValue(K_COST_LOG, []);
     }
 
     function collectCrackStoryDetailFromPage() {
@@ -1485,6 +1550,26 @@
         color: #ff8a8a;
     }
 
+    #se-cost-top-wrap {
+        border: 1px solid rgba(244, 114, 182, .34);
+        border-radius: 13px;
+        padding: 8px 10px;
+        background: rgba(244, 114, 182, .085);
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+    .se-cost-top-title {
+        font-size: 12px;
+        font-weight: 850;
+        color: #ffd3ea;
+    }
+    #se-cost-top-status {
+        white-space: pre-wrap;
+        line-height: 1.45;
+        font-size: 11px;
+        color: #f5f7ff;
+    }
     .se-section-note {
         color: #9aa0b4;
         font-size: 11px;
@@ -1711,6 +1796,26 @@
         }
         #se-body,
     
+    #se-cost-top-wrap {
+        border: 1px solid rgba(244, 114, 182, .34);
+        border-radius: 13px;
+        padding: 8px 10px;
+        background: rgba(244, 114, 182, .085);
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+    .se-cost-top-title {
+        font-size: 12px;
+        font-weight: 850;
+        color: #ffd3ea;
+    }
+    #se-cost-top-status {
+        white-space: pre-wrap;
+        line-height: 1.45;
+        font-size: 11px;
+        color: #f5f7ff;
+    }
     .se-section-note {
         color: #9aa0b4;
         font-size: 11px;
@@ -1777,6 +1882,9 @@
         .se-section-body {
             padding: 7px;
             gap: 6px;
+        }
+        #se-cost-top-wrap {
+            padding: 7px 8px;
         }
 
         .se-style-slot {
@@ -1915,6 +2023,10 @@
             </div>
 
             <div id="se-body">
+                <div id="se-cost-top-wrap">
+                    <div class="se-cost-top-title">💸 실시간 API 요금</div>
+                    <div id="se-cost-top-status">아직 계산된 사용량이 없어요.</div>
+                </div>
                 <div class="se-field-label">💬 대사 (말하는 내용)</div>
                 <textarea id="se-dialogue" class="se-ta" placeholder='예: 괜찮아, 내가 도와줄게'></textarea>
 
@@ -1948,7 +2060,25 @@
             </div>
 
             <div id="se-settings">
-                <div class="se-section-note">필요한 항목만 눌러서 열어 쓰세요.</div>
+                <div class="se-section-note">필요한 항목만 눌러서 열어 쓰세요. 요금은 위쪽에 항상 보여요.</div>
+
+                <details class="se-section" open>
+                    <summary>💸 API 비용 추정 / 사용내역</summary>
+                    <div class="se-section-body">
+                        <div class="se-ctx-row">
+                            <input type="checkbox" id="se-cost-on">
+                            <span class="se-ctx-label">상단 요금 표시 · 환율</span>
+                            <input type="number" id="se-cost-usdkrw" min="1" step="1" value="1400">
+                            <span class="se-ctx-label">원/USD</span>
+                        </div>
+
+                        <div class="se-cost-btns">
+                            <button id="se-cost-reset">🧹 비용 누적 초기화</button>
+                        </div>
+
+                        <div id="se-cost-status"></div>
+                    </div>
+                </details>
 
                 <details class="se-section">
                     <summary>🎭 유저 페르소나 / 자동추천</summary>
@@ -2076,24 +2206,6 @@
                     </div>
                 </details>
 
-                <details class="se-section">
-                    <summary>💸 API 비용 추정</summary>
-                    <div class="se-section-body">
-                        <div class="se-ctx-row">
-                            <input type="checkbox" id="se-cost-on">
-                            <span class="se-ctx-label">실시간 표시 · 환율</span>
-                            <input type="number" id="se-cost-usdkrw" min="1" step="1" value="1400">
-                            <span class="se-ctx-label">원/USD</span>
-                        </div>
-
-                        <div class="se-cost-btns">
-                            <button id="se-cost-reset">🧹 비용 누적 초기화</button>
-                        </div>
-
-                        <div id="se-cost-status"></div>
-                    </div>
-                </details>
-
                 <button id="se-save">저장</button>
 
                 <details class="se-section">
@@ -2150,6 +2262,7 @@
         const costUsdKrwInput = $('#se-cost-usdkrw');
         const costResetBtn = $('#se-cost-reset');
         const costStatus = $('#se-cost-status');
+        const costTopStatus = $('#se-cost-top-status');
 
         const pos = GM_getValue(K_POS, null);
         if (pos && typeof pos.left === 'number') {
@@ -2466,35 +2579,17 @@
 
 
         function refreshCostStatus(lastInfo) {
-            if (!costStatus) return;
-            costStatus.textContent = getCostSummaryText(lastInfo);
+            if (costStatus) costStatus.textContent = getCostSummaryText(lastInfo);
+            if (costTopStatus) costTopStatus.textContent = getCostTopText(lastInfo);
         }
 
-        if (costOnInput) costOnInput.checked = GM_getValue(K_COST_ON, false);
+        if (costOnInput) costOnInput.checked = GM_getValue(K_COST_ON, true);
         if (costUsdKrwInput) costUsdKrwInput.value = GM_getValue(K_COST_USDKRW, 1400);
 
         if (costOnInput) {
             costOnInput.addEventListener('change', () => {
                 GM_setValue(K_COST_ON, costOnInput.checked);
                 refreshCostStatus();
-
-        function setupSettingsAccordion() {
-            const sections = Array.from(panel.querySelectorAll('#se-settings .se-section'));
-            const isMobile = () => window.matchMedia && window.matchMedia('(max-width: 640px)').matches;
-
-            sections.forEach(section => {
-                section.addEventListener('toggle', () => {
-                    if (!section.open || !isMobile()) return;
-
-                    sections.forEach(other => {
-                        if (other !== section) other.open = false;
-                    });
-                });
-            });
-        }
-
-        setupSettingsAccordion();
-
             });
         }
 
@@ -2502,24 +2597,6 @@
             costUsdKrwInput.addEventListener('change', () => {
                 GM_setValue(K_COST_USDKRW, parseFloat(costUsdKrwInput.value) || 1400);
                 refreshCostStatus();
-
-        function setupSettingsAccordion() {
-            const sections = Array.from(panel.querySelectorAll('#se-settings .se-section'));
-            const isMobile = () => window.matchMedia && window.matchMedia('(max-width: 640px)').matches;
-
-            sections.forEach(section => {
-                section.addEventListener('toggle', () => {
-                    if (!section.open || !isMobile()) return;
-
-                    sections.forEach(other => {
-                        if (other !== section) other.open = false;
-                    });
-                });
-            });
-        }
-
-        setupSettingsAccordion();
-
             });
         }
 
@@ -2527,29 +2604,12 @@
             costResetBtn.addEventListener('click', () => {
                 resetCostStats();
                 refreshCostStatus();
-
-        function setupSettingsAccordion() {
-            const sections = Array.from(panel.querySelectorAll('#se-settings .se-section'));
-            const isMobile = () => window.matchMedia && window.matchMedia('(max-width: 640px)').matches;
-
-            sections.forEach(section => {
-                section.addEventListener('toggle', () => {
-                    if (!section.open || !isMobile()) return;
-
-                    sections.forEach(other => {
-                        if (other !== section) other.open = false;
-                    });
-                });
-            });
-        }
-
-        setupSettingsAccordion();
-
             });
         }
 
         refreshCostStatus();
 
+
         function setupSettingsAccordion() {
             const sections = Array.from(panel.querySelectorAll('#se-settings .se-section'));
             const isMobile = () => window.matchMedia && window.matchMedia('(max-width: 640px)').matches;
@@ -2567,10 +2627,11 @@
 
         setupSettingsAccordion();
 
-
         fetchBtn.addEventListener('click', () => {
             GM_setValue(K_APIKEY, $('#se-key').value.trim());
             GM_setValue(K_PERSONA_HINT, personaHint ? personaHint.value.trim() : '');
+            GM_setValue(K_COST_ON, costOnInput ? costOnInput.checked : true);
+            GM_setValue(K_COST_USDKRW, costUsdKrwInput ? (parseFloat(costUsdKrwInput.value) || 1400) : 1400);
 
             fetchBtn.disabled = true;
             fetchStat.classList.remove('err');
@@ -2602,6 +2663,8 @@
         $('#se-save').addEventListener('click', () => {
             GM_setValue(K_APIKEY, $('#se-key').value.trim());
             GM_setValue(K_PERSONA_HINT, personaHint ? personaHint.value.trim() : '');
+            GM_setValue(K_COST_ON, costOnInput ? costOnInput.checked : true);
+            GM_setValue(K_COST_USDKRW, costUsdKrwInput ? (parseFloat(costUsdKrwInput.value) || 1400) : 1400);
             savePersonas();
             saveStyles();
             saveMemorySettings();
@@ -2629,6 +2692,7 @@
             K_COST_TOTAL_IN,
             K_COST_TOTAL_OUT,
             K_COST_REQ_COUNT,
+            K_COST_LOG,
             K_STYLES,
             K_NAME,
             K_POV,
