@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.10.5
+// @version      6.10.6
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -1339,7 +1339,7 @@
         box-sizing: border-box;
     }
     #se-panel {
-        width: 350px;
+        width: 320px;
         max-width: calc(100vw - 24px);
         background: #1d1f27;
         color: #e9eaf0;
@@ -1790,8 +1790,8 @@
     }
     @media (max-width: 640px) {
         #se-panel {
-            width: calc(100vw - 12px);
-            max-width: calc(100vw - 12px);
+            width: min(320px, calc(100vw - 44px));
+            max-width: calc(100vw - 44px);
             max-height: calc(100dvh - 12px);
         }
         #se-body,
@@ -2003,6 +2003,75 @@
     .se-sync-btns button:hover {
         background: #2d3140;
     }
+
+    /* 6.10.6 slim panel override */
+    #se-panel {
+        width: 320px !important;
+        max-width: calc(100vw - 48px) !important;
+    }
+    #se-body,
+    #se-settings {
+        padding-left: 9px !important;
+        padding-right: 9px !important;
+    }
+    #se-settings input,
+    #se-settings select,
+    #se-settings textarea {
+        min-width: 0;
+    }
+    .se-sync-btns,
+    .se-memory-btns,
+    .se-ctx-btns,
+    .se-persona-suggest-btns,
+    .se-cost-btns {
+        flex-wrap: wrap;
+    }
+    .se-ctx-row {
+        flex-wrap: wrap;
+    }
+    #se-cost-usdkrw {
+        max-width: 92px;
+    }
+    @media (max-width: 640px) {
+        #se-panel {
+            width: min(318px, calc(100vw - 44px)) !important;
+            max-width: calc(100vw - 44px) !important;
+        }
+        #se-head {
+            padding: 8px 9px !important;
+        }
+        #se-title {
+            font-size: 12px !important;
+        }
+        #se-body,
+        #se-settings {
+            padding-left: 7px !important;
+            padding-right: 7px !important;
+        }
+        .se-section > summary {
+            padding: 8px 8px !important;
+        }
+        .se-section-body {
+            padding: 7px !important;
+        }
+        .se-ta,
+        .se-style-ta,
+        #se-crack-memory-text,
+        #se-sync-box {
+            font-size: 12px !important;
+        }
+        #se-cost-top-status,
+        #se-cost-status {
+            font-size: 10.5px !important;
+        }
+    }
+    @media (max-width: 360px) {
+        #se-panel {
+            width: calc(100vw - 28px) !important;
+            max-width: calc(100vw - 28px) !important;
+        }
+    }
+
     `;
 
     function injectStyle() {
