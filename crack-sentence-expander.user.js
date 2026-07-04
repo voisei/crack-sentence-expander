@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.10.6
+// @version      6.10.7
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -2072,6 +2072,41 @@
         }
     }
 
+
+    /* 6.10.7 settings scroll fix */
+    #se-panel.se-settings-open {
+        height: min(640px, calc(100dvh - 24px)) !important;
+        max-height: calc(100dvh - 24px) !important;
+    }
+    #se-panel.se-settings-open #se-body {
+        display: none !important;
+    }
+    #se-panel.se-settings-open #se-settings.show {
+        display: flex !important;
+        flex: 1 1 auto !important;
+        height: auto !important;
+        max-height: none !important;
+        overflow-y: auto !important;
+        -webkit-overflow-scrolling: touch !important;
+        overscroll-behavior: contain;
+        min-height: 0 !important;
+    }
+    #se-panel.se-settings-open .se-section[open] {
+        overflow: visible !important;
+    }
+    #se-panel.se-settings-open .se-section[open] .se-section-body {
+        overflow: visible !important;
+    }
+    @media (max-width: 640px) {
+        #se-panel.se-settings-open {
+            height: calc(100dvh - 12px) !important;
+            max-height: calc(100dvh - 12px) !important;
+        }
+        #se-panel.se-settings-open #se-settings.show {
+            padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px)) !important;
+        }
+    }
+
     `;
 
     function injectStyle() {
@@ -2722,7 +2757,12 @@
         });
 
         $('#se-gear').addEventListener('click', () => {
-            settings.classList.toggle('show');
+            const isOpen = settings.classList.toggle('show');
+            panel.classList.toggle('se-settings-open', isOpen);
+
+            if (isOpen) {
+                settings.scrollTop = 0;
+            }
 
             setTimeout(() => {
                 if (wireUp._clamp) wireUp._clamp(false);
@@ -2746,6 +2786,7 @@
             if (modelSel.value) GM_setValue(K_MODEL, modelSel.value);
 
             settings.classList.remove('show');
+            panel.classList.remove('se-settings-open');
             flash('저장됐어요 ✅');
         });
 
@@ -3001,6 +3042,8 @@
 
             if (isOpen) {
                 panel.style.display = 'none';
+                settings.classList.remove('show');
+                panel.classList.remove('se-settings-open');
                 GM_setValue(K_OPEN, false);
             } else {
                 panel.style.display = 'flex';
