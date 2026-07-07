@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.10.7
+// @version      6.10.8
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -590,25 +590,49 @@
             domLines = [];
         }
 
-        // 지금 화면에 실제로 보이는 대화(순서가 정확함)를 최우선으로 쓴다.
-        // 화면에서 아무것도 못 잡았을 때만 캐시를 대체로 사용한다.
-        const base = getCtxCache().concat(domLines);
+        // 클릭한 "지금" 화면에 보이는 대화가 순서·최신성이 가장 정확하다.
+        // 그래서 화면(domLines)을 기준으로 삼고,
+        // 캐시는 화면에 안 잡힌 "그 이전 과거"를 채우는 용도로만 쓴다.
+        let source;
 
-        const merged = [];
+        if (domLines.length) {
+            const cache = getCtxCache();
+            const firstDom = cleanContextLine(domLines[0]);
+
+            // 캐시에서 '지금 화면 첫 줄'이 마지막으로 등장한 위치를 뒤에서부터 찾는다.
+            // 그 앞쪽(더 과거)만 가져오면, 스크롤·재렌더로 옛 줄이 캐시 꼬리에
+            // 다시 붙어도 그걸 최신으로 오인하지 않는다.
+            let cutIdx = -1;
+            for (let i = cache.length - 1; i >= 0; i--) {
+                if (cleanContextLine(cache[i]) === firstDom) { cutIdx = i; break; }
+            }
+
+            const past = cutIdx > 0 ? cache.slice(0, cutIdx) : [];
+            source = past.concat(domLines);
+        } else {
+            // 화면에서 아무것도 못 잡았을 때만 캐시 전체를 대체로 쓴다.
+            source = getCtxCache();
+        }
+
+        // 뒤(최신)에서부터 훑어서, 중복은 '가장 최신 위치'만 남긴다.
+        // (예전 코드는 '가장 오래된 위치'를 남겨서 옛 줄이 최신인 척 끼어들었음)
+        const picked = [];
         const seen = new Set();
 
-        for (const raw of base) {
-            const line = cleanContextLine(raw);
+        for (let i = source.length - 1; i >= 0; i--) {
+            const line = cleanContextLine(source[i]);
 
             if (!line) continue;
             if (isBadContextLine(line)) continue;
             if (seen.has(line)) continue;
 
             seen.add(line);
-            merged.push(line);
+            picked.push(line);
+
+            if (picked.length >= n) break;
         }
 
-        return merged.slice(-n);
+        return picked.reverse();
     }
 
     function collectCrackMemoryFromPage() {
@@ -1611,12 +1635,12 @@
         padding: 2px 7px;
         flex: 0 0 auto;
     }
+    .se-section[open] > summary::after {
+        content: '닫기';
+    }
     .se-section[open] > summary {
         border-bottom: 1px solid rgba(148, 163, 184, .18);
         background: rgba(255, 255, 255, .035);
-    }
-    .se-section[open] > summary::after {
-        content: '닫기';
     }
     .se-section-body {
         display: flex;
@@ -1795,83 +1819,7 @@
             max-height: calc(100dvh - 12px);
         }
         #se-body,
-    
-    #se-cost-top-wrap {
-        border: 1px solid rgba(244, 114, 182, .34);
-        border-radius: 13px;
-        padding: 8px 10px;
-        background: rgba(244, 114, 182, .085);
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-    }
-    .se-cost-top-title {
-        font-size: 12px;
-        font-weight: 850;
-        color: #ffd3ea;
-    }
-    #se-cost-top-status {
-        white-space: pre-wrap;
-        line-height: 1.45;
-        font-size: 11px;
-        color: #f5f7ff;
-    }
-    .se-section-note {
-        color: #9aa0b4;
-        font-size: 11px;
-        line-height: 1.45;
-        padding: 2px 2px 4px;
-    }
-    .se-section {
-        border: 1px solid rgba(148, 163, 184, .22);
-        border-radius: 12px;
-        overflow: hidden;
-        background: rgba(255, 255, 255, .035);
-    }
-    .se-section + .se-section {
-        margin-top: 2px;
-    }
-    .se-section > summary {
-        list-style: none;
-        cursor: pointer;
-        user-select: none;
-        padding: 10px 11px;
-        font-size: 13px;
-        font-weight: 750;
-        color: #f2f5ff;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-    }
-    .se-section > summary::-webkit-details-marker {
-        display: none;
-    }
-    .se-section > summary::after {
-        content: '열기';
-        font-size: 11px;
-        font-weight: 650;
-        color: #9aa0b4;
-        border: 1px solid rgba(148, 163, 184, .28);
-        border-radius: 999px;
-        padding: 2px 7px;
-        flex: 0 0 auto;
-    }
-    .se-section[open] > summary {
-        border-bottom: 1px solid rgba(148, 163, 184, .18);
-        background: rgba(255, 255, 255, .035);
-    }
-    .se-section[open] > summary::after {
-        content: '닫기';
-    }
-    .se-section-body {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-        padding: 9px;
-    }
-
-    #se-settings {
+        #se-settings {
             padding: 8px;
             gap: 6px;
         }
