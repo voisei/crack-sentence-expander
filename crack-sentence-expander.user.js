@@ -3,7 +3,7 @@
 // @namespace    https://crack.wrtn.ai
 // @version      6.12.2
 // @author       me
-// @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
+// @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -40,12 +40,8 @@
 
     const K_CTX_ON    = 'se_ctx_on';
     const K_CTX_N     = 'se_ctx_n';
-    const K_CTX_SEL   = 'se_ctx_sel';
     const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room';
 
-    const K_MEMORY_ON   = 'se_crack_memory_on';
-    const K_MEMORY_AUTO = 'se_crack_memory_auto';
-    const K_MEMORY_TEXT = 'se_crack_memory_text';
 
     const K_PERSONA_HINT = 'se_persona_hint';
 
@@ -77,7 +73,7 @@
         long:   { label: '길게', guide: '풍부한 문학적 묘사와 내면 묘사를 충분히 펼쳐서 길게.' },
     };
 
-    function buildPrompt(dialogue, action, lengthKey, persona, pov, name, style, context, crackMemory) {
+    function buildPrompt(dialogue, action, lengthKey, persona, pov, name, style, context) {
         const lenGuide = (LENGTHS[lengthKey] || LENGTHS.medium).guide;
         const isThird = pov === 'third';
 
@@ -111,17 +107,6 @@
             lines.push(style.trim());
             lines.push('- 위 문체 규칙을 다른 어떤 규칙보다 우선해서 최대한 지켜라.');
             lines.push('- 단, 따옴표=대사 / 별표=서술 형식, 시점 규칙, 상대 캐릭터를 대신 쓰지 않는 규칙은 절대 깨지 마라.');
-        }
-
-        if (crackMemory && crackMemory.trim()) {
-            lines.push('');
-            lines.push('[크랙 요약 메모리 — 장기 기억/단기 기억/관계도/목표]');
-            lines.push(crackMemory.trim());
-            lines.push('- 위 내용은 크랙이 정리한 기억이다. 현재 장면의 배경 기억으로 참고하라.');
-            lines.push('- 단, 본문에 그대로 복붙하거나 설명문처럼 읊지 마라.');
-            lines.push('- 필요한 경우 관계성, 거리감, 감정선, 이전 사건의 여파, 목표를 자연스럽게 반영하라.');
-            lines.push('- 요약 메모리와 [직전 채팅 맥락]이 어긋나면, 더 최근 상황인 직전 채팅 맥락을 우선한다.');
-            lines.push('- 이번 출력은 어디까지나 유저 캐릭터의 이번 [대사]/[행동]만 확장하는 것이다.');
         }
 
         if (context && context.length) {
@@ -509,97 +494,93 @@
 
         GM_setValue(key, []);
     }
-    function collectChatContextFromDOM(maxN, selector) {
-    const inPanel = el => el.closest && el.closest('#se-panel');
-    let nodes = [];
-
-    let safeSelector = (selector || '').trim();
-
-    // 예전에 저장된 잘못된 선택자는 사용하지 않고 자동 탐색으로 돌린다.
-    if (safeSelector === 'div[data-message-group-id]') {
-        safeSelector = '';
+    function stripContextNoise(text) {
+        return cleanContextLine(text || '')
+            .replace(/\/stories\/[^\s]+\/episodes\/[^\s]+/g, ' ')
+            .replace(/\b(?:복사|다시 생성|삭제|수정|공유)\b/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
     }
 
-    // (1) 사용자가 고급 선택자를 직접 지정한 경우 그걸 최우선.
-    if (safeSelector) {
-        try {
-            nodes = Array.from(document.querySelectorAll(safeSelector));
-        } catch (_) {
-            nodes = [];
+    function collectChatContextFromDOM(maxN) {
+        const inPanel = el => el.closest && el.closest('#se-panel');
+        const candidates = [];
+        const pushed = new Set();
+
+        function addElement(el) {
+            if (!el || inPanel(el) || !isVisible(el)) return;
+
+            const text = stripContextNoise(el.innerText || el.textContent || '');
+
+            if (!text || text.length < 2 || text.length > 4000) return;
+            if (isBadContextLine(text)) return;
+            if (pushed.has(text)) return;
+
+            pushed.add(text);
+            candidates.push({ el, text });
         }
 
-        nodes = nodes.filter(el => !inPanel(el) && isVisible(el));
-    }
-    
-        // (2) 크랙 대화 본문은 div.wrtn-markdown 안에 <p>로 들어있다.
-        //     data-message-group-id 는 빈 껍데기라서 최신 대화를 못 잡는다.
-        //     그래서 wrtn-markdown 블록을 "한 메시지 = 한 블록"으로 읽는다.
-        if (!nodes.length) {
-            nodes = Array.from(document.querySelectorAll('.wrtn-markdown'))
-                .filter(el => {
-                    if (inPanel(el)) return false;
+        // 1) 메시지 그룹 내부에서 AI의 markdown 블록과 유저의 일반 말풍선을 따로 수집한다.
+        const groups = Array.from(document.querySelectorAll('[data-message-group-id], [data-message-id], [data-testid*="message"]'))
+            .filter(el => !inPanel(el));
 
-                    const st = getComputedStyle(el);
-                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+        for (const group of groups) {
+            const markdowns = Array.from(group.querySelectorAll('.wrtn-markdown'))
+                .filter(el => !el.querySelector('.wrtn-markdown'));
 
-                    const t = (el.innerText || '').trim();
-                    if (t.length < 2) return false;
+            markdowns.forEach(addElement);
 
-                    return true;
+            const plain = Array.from(group.querySelectorAll(
+                '[class*="whitespace-pre-wrap"], [class*="break-words"], p'
+            )).filter(el => {
+                if (el.closest('.wrtn-markdown')) return false;
+                if (el.querySelector('textarea, input, button, select')) return false;
+                return !Array.from(el.children || []).some(child => {
+                    const childText = stripContextNoise(child.innerText || child.textContent || '');
+                    return childText && childText === stripContextNoise(el.innerText || el.textContent || '');
                 });
+            });
+
+            plain.forEach(addElement);
         }
 
-        // (3) 그래도 없으면 data-message-group-id 로 fallback.
-        if (!nodes.length) {
-            nodes = Array.from(document.querySelectorAll('div[data-message-group-id]'))
-                .filter(el => !inPanel(el) && isVisible(el));
+        // 2) 그룹 구조가 바뀐 경우에도 모든 leaf markdown은 반드시 수집한다.
+        Array.from(document.querySelectorAll('.wrtn-markdown'))
+            .filter(el => !el.querySelector('.wrtn-markdown'))
+            .forEach(addElement);
+
+        // 3) 유저 말풍선이 markdown이 아닌 사이트 버전에 대한 보조 탐색.
+        if (candidates.length < 2) {
+            Array.from(document.querySelectorAll(
+                'main [class*="whitespace-pre-wrap"], main [class*="break-words"], main p, article p'
+            )).filter(el => {
+                if (inPanel(el)) return false;
+                if (el.closest('.wrtn-markdown')) return false;
+                if (el.querySelector('textarea, input, button, select')) return false;
+                return true;
+            }).forEach(addElement);
         }
 
-        // (4) 최후의 fallback: 기존 자동 탐색.
-        if (!nodes.length) {
-            const cands = Array.from(document.body.querySelectorAll('p, div, span, li, article'))
-                .filter(el => {
-                    if (inPanel(el)) return false;
-                    if (el.querySelector('textarea, input, button, select')) return false;
-                    if (!isVisible(el)) return false;
-
-                    const t = cleanContextLine(el.innerText || '');
-
-                    if (isBadContextLine(t)) return false;
-
-                    return t.length >= 2 && t.length <= 1200;
-                });
-
-            nodes = cands.filter(el => !cands.some(o => o !== el && el.contains(o)));
-        }
-
-        // ★ 화면상 위쪽(과거)~아래쪽(최신) 순서로 정렬. (DOM 순서가 시각 순서와 다를 수 있어서)
-        //   슬라이스 하기 전에 정렬부터 해야 최신이 잘리지 않는다.
-        nodes.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+        // DOM 순서가 실제 대화의 과거→최신 순서에 가장 안정적이다.
+        candidates.sort((a, b) => {
+            if (a.el === b.el) return 0;
+            const pos = a.el.compareDocumentPosition(b.el);
+            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+            if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+            return 0;
+        });
 
         const out = [];
         const seen = new Set();
 
-        for (const el of nodes) {
-            let t = cleanContextLine(el.innerText || '');
+        for (const item of candidates) {
+            const t = item.text;
+            if (!t || seen.has(t)) continue;
 
-            if (!t) continue;
-
-            // 메시지 묶음 안에 섞일 수 있는 UI 버튼/메뉴 텍스트 제거.
-            t = t
-                .replace(/\b복사\b/g, '')
-                .replace(/\b다시 생성\b/g, '')
-                .replace(/\b삭제\b/g, '')
-                .replace(/\b수정\b/g, '')
-                .replace(/\b공유\b/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
-
-            if (!t) continue;
-            if (isBadContextLine(t)) continue;
-            if (t.length < 2) continue;
-            if (t.length > 2000) continue;
-            if (seen.has(t)) continue;
+            // 큰 부모 텍스트가 이미 수집한 여러 메시지를 통째로 포함한 경우 제외한다.
+            if (out.some(prev => t !== prev && t.includes(prev) && t.length > prev.length * 1.8)) {
+                continue;
+            }
 
             seen.add(t);
             out.push(t);
@@ -607,13 +588,13 @@
 
         return dropStreamingPrefixes(out).slice(-Math.max(1, maxN || 6));
     }
-    function collectChatContext(maxN, selector) {
+    function collectChatContext(maxN) {
         const n = Math.max(1, maxN || 6);
 
         let domLines = [];
 
         try {
-            domLines = collectChatContextFromDOM(Math.max(n, 80), selector);
+            domLines = collectChatContextFromDOM(Math.max(n, 80));
             rememberCtxLines(domLines);
         } catch (_) {
             domLines = [];
@@ -652,104 +633,6 @@
         return picked.reverse();
     }
     
-    function collectCrackMemoryFromPage() {
-        const rootCandidates = Array.from(document.querySelectorAll('[role="dialog"], main, section, article, div'))
-            .filter(el => {
-                if (!isVisible(el)) return false;
-
-                const t = (el.innerText || '').trim();
-                if (!t) return false;
-
-                return /요약\s*메모리|장기\s*기억|단기\s*기억|관계도|목표/.test(t);
-            });
-
-        let root = null;
-
-        if (rootCandidates.length) {
-            rootCandidates.sort((a, b) => {
-                const at = (a.innerText || '').length;
-                const bt = (b.innerText || '').length;
-                return at - bt;
-            });
-
-            root = rootCandidates.find(el => {
-                const t = (el.innerText || '').trim();
-                return t.length >= 20 && t.length <= 12000;
-            }) || rootCandidates[0];
-        }
-
-        if (!root) return '';
-
-        const rawLines = (root.innerText || '')
-            .split(/\n+/)
-            .map(s => s.replace(/\s+/g, ' ').trim())
-            .filter(Boolean);
-
-        const bannedExact = new Set([
-            '요약 메모리',
-            '장기 기억',
-            '단기 기억',
-            '관계도',
-            '목표',
-            '추가',
-            '최신순',
-            '오래된순',
-            '닫기',
-            '확인',
-            '취소',
-            '저장',
-            '삭제',
-            '수정',
-            '뒤로',
-        ]);
-
-        const useful = [];
-        const seen = new Set();
-
-        for (const line of rawLines) {
-            if (!line) continue;
-            if (seen.has(line)) continue;
-            seen.add(line);
-
-            if (bannedExact.has(line)) continue;
-            if (/^총\s*\d+\s*개$/.test(line)) continue;
-            if (/^총\s*\d+개$/.test(line)) continue;
-            if (/^더 많은 메시지가 필요해요/.test(line)) continue;
-            if (/요약 메모리가 추가되려면/.test(line)) continue;
-            if (/^[<>∨⌄⌃^]+$/.test(line)) continue;
-            if (line.length < 2) continue;
-
-            useful.push(line);
-        }
-
-        if (!useful.length) return '';
-
-        const limited = useful.slice(0, 120);
-
-        return limited.join('\n').trim();
-    }
-
-    function getCrackMemoryForPrompt() {
-        if (!GM_getValue(K_MEMORY_ON, false)) return '';
-
-        let saved = GM_getValue(K_MEMORY_TEXT, '');
-
-        if (GM_getValue(K_MEMORY_AUTO, true)) {
-            try {
-                const fresh = collectCrackMemoryFromPage();
-
-                if (fresh && fresh.trim()) {
-                    saved = fresh.trim();
-                    GM_setValue(K_MEMORY_TEXT, saved);
-                }
-            } catch (_) {}
-        }
-
-        return saved || '';
-    }
-
-
-
     function getModelCostRates(modelId, inputTokens) {
         const id = (modelId || '').toLowerCase();
         const inputN = Number(inputTokens || 0);
@@ -1051,8 +934,7 @@
         let recentContext = [];
         try {
             const n = parseInt(GM_getValue(K_CTX_N, 10), 10) || 10;
-            const sel = GM_getValue(K_CTX_SEL, '');
-            recentContext = collectChatContext(Math.min(Math.max(n, 6), 20), sel);
+            recentContext = collectChatContext(Math.min(Math.max(n, 6), 20));
         } catch (_) {
             recentContext = [];
         }
@@ -1159,16 +1041,13 @@
         const style = getActiveStyle();
         const pov = GM_getValue(K_POV, 'first');
         const name = GM_getValue(K_NAME, '');
-        const crackMemory = getCrackMemoryForPrompt();
 
         let context = [];
 
         if (GM_getValue(K_CTX_ON, false)) {
             const n = parseInt(GM_getValue(K_CTX_N, 6), 10) || 6;
-            const sel = GM_getValue(K_CTX_SEL, '');
-
             try {
-                context = collectChatContext(n, sel);
+                context = collectChatContext(n);
             } catch (_) {
                 context = [];
             }
@@ -1184,7 +1063,7 @@
             return;
         }
 
-        const { system, user } = buildPrompt(dialogue, action, lengthKey, persona, pov, name, style, context, crackMemory);
+        const { system, user } = buildPrompt(dialogue, action, lengthKey, persona, pov, name, style, context);
 
         const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/'
             + encodeURIComponent(model)
@@ -1757,8 +1636,6 @@
     #se-fetch,
     #se-ctx-test,
     #se-ctx-clear,
-    #se-memory-fetch,
-    #se-memory-clear,
     #se-persona-suggest,
     #se-cost-reset {
         padding: 8px;
@@ -1772,9 +1649,7 @@
     }
     #se-fetch:hover,
     #se-ctx-test:hover,
-    #se-ctx-clear:hover,
-    #se-memory-fetch:hover,
-    #se-memory-clear:hover,
+    #se-ctx-clear:hover:hover:hover,
     #se-persona-suggest:hover,
     #se-cost-reset:hover {
         background: #2d3140;
@@ -1785,7 +1660,6 @@
     }
     #se-fetch-status,
     #se-ctx-status,
-    #se-memory-status,
     #se-sync-status,
     #se-persona-suggest-status,
     #se-cost-status {
@@ -1793,8 +1667,7 @@
         color: #9aa0b4;
         min-height: 14px;
     }
-    #se-fetch-status.err,
-    #se-memory-status.err,
+    #se-fetch-status.err.err,
     #se-sync-status.err,
     #se-persona-suggest-status.err,
     #se-cost-status.err {
@@ -1929,8 +1802,7 @@
         font-size: 12px;
         color: #b9bcca;
     }
-    #se-ctx-status,
-    #se-memory-status {
+    #se-ctx-status {
         white-space: pre-wrap;
         max-height: 120px;
         overflow-y: auto;
@@ -1944,15 +1816,13 @@
         font-size: 12px;
     }
     .se-sync-btns,
-    .se-memory-btns,
     .se-ctx-btns,
     .se-persona-suggest-btns,
     .se-cost-btns {
         display: flex;
         gap: 6px;
     }
-    .se-sync-btns button,
-    .se-memory-btns button,
+    .se-sync-btns button button,
     .se-ctx-btns button,
     .se-persona-suggest-btns button,
     .se-cost-btns button {
@@ -1988,7 +1858,6 @@
         min-width: 0;
     }
     .se-sync-btns,
-    .se-memory-btns,
     .se-ctx-btns,
     .se-persona-suggest-btns,
     .se-cost-btns {
@@ -2219,29 +2088,6 @@
                 </details>
 
                 <details class="se-section">
-                    <summary>🧠 크랙 요약 메모리</summary>
-                    <div class="se-section-body">
-                        <div class="se-ctx-row">
-                            <input type="checkbox" id="se-memory-on">
-                            <span class="se-ctx-label">프롬프트에 참고시키기</span>
-                        </div>
-
-                        <div class="se-ctx-row">
-                            <input type="checkbox" id="se-memory-auto">
-                            <span class="se-ctx-label">문학적으로 늘리기 누를 때, 현재 화면이 요약 메모리면 자동 새로고침</span>
-                        </div>
-
-                        <div class="se-memory-btns">
-                            <button id="se-memory-fetch">📥 현재 화면에서 메모리 가져오기</button>
-                            <button id="se-memory-clear">🗑 비우기</button>
-                        </div>
-
-                        <textarea id="se-crack-memory-text" placeholder="크랙의 요약 메모리 화면을 열고 '현재 화면에서 메모리 가져오기'를 누르면 여기에 저장돼요. 직접 붙여넣어도 돼요."></textarea>
-                        <div id="se-memory-status"></div>
-                    </div>
-                </details>
-
-                <details class="se-section">
                     <summary>💬 최근 대화 맥락</summary>
                     <div class="se-section-body">
                         <div class="se-ctx-row">
@@ -2251,7 +2097,6 @@
                             <span class="se-ctx-label">개</span>
                         </div>
 
-                        <input id="se-ctx-sel" type="text" placeholder="(고급) 메시지 CSS 선택자 — 비워두면 자동 탐색">
 
                         <div class="se-ctx-btns">
                             <button id="se-ctx-test">🔍 맥락 미리보기</button>
@@ -2531,63 +2376,12 @@
             if (chk) chk.addEventListener('change', saveStyles);
         }
 
-        const memoryOn = $('#se-memory-on');
-        const memoryAuto = $('#se-memory-auto');
-        const memoryText = $('#se-crack-memory-text');
-        const memoryStatus = $('#se-memory-status');
-
-        memoryOn.checked = GM_getValue(K_MEMORY_ON, false);
-        memoryAuto.checked = GM_getValue(K_MEMORY_AUTO, true);
-        memoryText.value = GM_getValue(K_MEMORY_TEXT, '');
-
-        function memoryFlash(msg, isErr) {
-            memoryStatus.textContent = msg;
-            memoryStatus.classList.toggle('err', !!isErr);
-        }
-
-        function saveMemorySettings() {
-            GM_setValue(K_MEMORY_ON, memoryOn.checked);
-            GM_setValue(K_MEMORY_AUTO, memoryAuto.checked);
-            GM_setValue(K_MEMORY_TEXT, memoryText.value);
-        }
-
-        memoryOn.addEventListener('change', saveMemorySettings);
-        memoryAuto.addEventListener('change', saveMemorySettings);
-        memoryText.addEventListener('change', saveMemorySettings);
-
-        $('#se-memory-fetch').addEventListener('click', () => {
-            let mem = '';
-
-            try {
-                mem = collectCrackMemoryFromPage();
-            } catch (_) {
-                mem = '';
-            }
-
-            if (!mem || !mem.trim()) {
-                memoryFlash('가져올 메모리를 못 찾았어요. 크랙의 “요약 메모리” 화면을 열고 다시 눌러주세요. 현재 총 0개면 가져올 내용이 없어요.', true);
-                return;
-            }
-
-            memoryText.value = mem.trim();
-            saveMemorySettings();
-            memoryFlash('현재 화면에서 요약 메모리를 가져왔어요 ✅');
-        });
-
-        $('#se-memory-clear').addEventListener('click', () => {
-            memoryText.value = '';
-            GM_setValue(K_MEMORY_TEXT, '');
-            memoryFlash('요약 메모리 칸을 비웠어요.');
-        });
-
         const ctxChk = $('#se-ctx-chk');
         const ctxN = $('#se-ctx-n');
-        const ctxSel = $('#se-ctx-sel');
         const ctxStat = $('#se-ctx-status');
 
         ctxChk.checked = GM_getValue(K_CTX_ON, false);
         ctxN.value = GM_getValue(K_CTX_N, 6);
-        ctxSel.value = GM_getValue(K_CTX_SEL, '');
 
         ctxChk.addEventListener('change', () => {
             GM_setValue(K_CTX_ON, ctxChk.checked);
@@ -2598,10 +2392,8 @@
             let arr = [];
 
             GM_setValue(K_CTX_N, n);
-            GM_setValue(K_CTX_SEL, ctxSel.value.trim());
-
             try {
-                arr = collectChatContext(n, ctxSel.value);
+                arr = collectChatContext(n);
             } catch (_) {
                 arr = [];
             }
@@ -2611,7 +2403,7 @@
 
             if (!arr.length) {
                 ctxStat.textContent =
-                    '못 잡았어요 😅 채팅이 화면에 보이는지 확인하거나, 선택자를 비워 자동으로 두고 다시 해보세요.\n'
+                    '못 잡았어요 😅 채팅 화면을 위로 조금 스크롤한 뒤 다시 눌러보세요.\n'
                     + '현재 채팅방 캐시: ' + cacheCount + '개\n'
                     + '캐시 기준: ' + roomKey;
                 return;
@@ -2744,12 +2536,10 @@
             GM_setValue(K_COST_USDKRW, costUsdKrwInput ? (parseFloat(costUsdKrwInput.value) || 1400) : 1400);
             savePersonas();
             saveStyles();
-            saveMemorySettings();
 
             GM_setValue(K_NAME, nameInput.value.trim());
             GM_setValue(K_CTX_ON, ctxChk.checked);
             GM_setValue(K_CTX_N, parseInt(ctxN.value, 10) || 6);
-            GM_setValue(K_CTX_SEL, ctxSel.value.trim());
 
             if (modelSel.value) GM_setValue(K_MODEL, modelSel.value);
 
@@ -2777,10 +2567,6 @@
             K_LENGTH,
             K_CTX_ON,
             K_CTX_N,
-            K_CTX_SEL,
-            K_MEMORY_ON,
-            K_MEMORY_AUTO,
-            K_MEMORY_TEXT
         ];
 
         const syncBox = $('#se-sync-box');
@@ -2802,7 +2588,6 @@
         $('#se-export').addEventListener('click', () => {
             savePersonas();
             saveStyles();
-            saveMemorySettings();
 
             const obj = {};
 
@@ -3278,8 +3063,7 @@
 
             timer = setTimeout(() => {
                 try {
-                    const sel = GM_getValue(K_CTX_SEL, '');
-                    const lines = collectChatContextFromDOM(80, sel);
+                    const lines = collectChatContextFromDOM(80);
                     rememberCtxLines(lines);
                 } catch (_) {}
             }, 700);
