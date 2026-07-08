@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.1
+// @version      6.12.2
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -510,20 +510,27 @@
         GM_setValue(key, []);
     }
     function collectChatContextFromDOM(maxN, selector) {
-        const inPanel = el => el.closest && el.closest('#se-panel');
-        let nodes = [];
+    const inPanel = el => el.closest && el.closest('#se-panel');
+    let nodes = [];
 
-        // (1) 사용자가 고급 선택자를 직접 지정한 경우 그걸 최우선.
-        if (selector && selector.trim()) {
-            try {
-                nodes = Array.from(document.querySelectorAll(selector.trim()));
-            } catch (_) {
-                nodes = [];
-            }
+    let safeSelector = (selector || '').trim();
 
-            nodes = nodes.filter(el => !inPanel(el) && isVisible(el));
+    // 예전에 저장된 잘못된 선택자는 사용하지 않고 자동 탐색으로 돌린다.
+    if (safeSelector === 'div[data-message-group-id]') {
+        safeSelector = '';
+    }
+
+    // (1) 사용자가 고급 선택자를 직접 지정한 경우 그걸 최우선.
+    if (safeSelector) {
+        try {
+            nodes = Array.from(document.querySelectorAll(safeSelector));
+        } catch (_) {
+            nodes = [];
         }
 
+        nodes = nodes.filter(el => !inPanel(el) && isVisible(el));
+    }
+    
         // (2) 크랙 대화 본문은 div.wrtn-markdown 안에 <p>로 들어있다.
         //     data-message-group-id 는 빈 껍데기라서 최신 대화를 못 잡는다.
         //     그래서 wrtn-markdown 블록을 "한 메시지 = 한 블록"으로 읽는다.
@@ -1044,7 +1051,7 @@
         let recentContext = [];
         try {
             const n = parseInt(GM_getValue(K_CTX_N, 10), 10) || 10;
-            const sel = GM_getValue(K_CTX_SEL, '') || 'div[data-message-group-id]';
+            const sel = GM_getValue(K_CTX_SEL, '');
             recentContext = collectChatContext(Math.min(Math.max(n, 6), 20), sel);
         } catch (_) {
             recentContext = [];
@@ -2244,7 +2251,7 @@
                             <span class="se-ctx-label">개</span>
                         </div>
 
-                        <input id="se-ctx-sel" type="text" placeholder="(고급) 메시지 CSS 선택자 — 추천: div[data-message-group-id]">
+                        <input id="se-ctx-sel" type="text" placeholder="(고급) 메시지 CSS 선택자 — 비워두면 자동 탐색">
 
                         <div class="se-ctx-btns">
                             <button id="se-ctx-test">🔍 맥락 미리보기</button>
