@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.0
+// @version      6.12.1
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -529,7 +529,17 @@
         //     그래서 wrtn-markdown 블록을 "한 메시지 = 한 블록"으로 읽는다.
         if (!nodes.length) {
             nodes = Array.from(document.querySelectorAll('.wrtn-markdown'))
-                .filter(el => !inPanel(el) && isVisible(el));
+                .filter(el => {
+                    if (inPanel(el)) return false;
+
+                    const st = getComputedStyle(el);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+
+                    const t = (el.innerText || '').trim();
+                    if (t.length < 2) return false;
+
+                    return true;
+                });
         }
 
         // (3) 그래도 없으면 data-message-group-id 로 fallback.
@@ -590,7 +600,6 @@
 
         return dropStreamingPrefixes(out).slice(-Math.max(1, maxN || 6));
     }
-
     function collectChatContext(maxN, selector) {
         const n = Math.max(1, maxN || 6);
 
@@ -603,32 +612,20 @@
             domLines = [];
         }
 
-        // 클릭한 "지금" 화면에 보이는 대화가 순서·최신성이 가장 정확하다.
-        // 그래서 화면(domLines)을 기준으로 삼고,
-        // 캐시는 화면에 안 잡힌 "그 이전 과거"를 채우는 용도로만 쓴다.
+        // 화면(domLines)에서 잡힌 대화가 순서·최신성이 가장 정확하다.
+        // wrtn-markdown 은 화면 밖(top 음수)이어도 DOM에 살아있어서
+        // 최근 N개 턴이 통째로 잡힌다. 그러니 화면에서 뭐라도 잡혔으면
+        // 그걸 그대로 신뢰하고, 캐시로 억지로 덮어쓰지 않는다.
         let source;
 
         if (domLines.length) {
-            const cache = getCtxCache();
-            const firstDom = cleanContextLine(domLines[0]);
-
-            // 캐시에서 '지금 화면 첫 줄'이 마지막으로 등장한 위치를 뒤에서부터 찾는다.
-            // 그 앞쪽(더 과거)만 가져오면, 스크롤·재렌더로 옛 줄이 캐시 꼬리에
-            // 다시 붙어도 그걸 최신으로 오인하지 않는다.
-            let cutIdx = -1;
-            for (let i = cache.length - 1; i >= 0; i--) {
-                if (cleanContextLine(cache[i]) === firstDom) { cutIdx = i; break; }
-            }
-
-            const past = cutIdx > 0 ? cache.slice(0, cutIdx) : [];
-            source = past.concat(domLines);
+            source = domLines;
         } else {
-            // 화면에서 아무것도 못 잡았을 때만 캐시 전체를 대체로 쓴다.
+            // 화면에서 아무것도 못 잡았을 때만 캐시를 대체로 쓴다.
             source = getCtxCache();
         }
 
         // 뒤(최신)에서부터 훑어서, 중복은 '가장 최신 위치'만 남긴다.
-        // (예전 코드는 '가장 오래된 위치'를 남겨서 옛 줄이 최신인 척 끼어들었음)
         const picked = [];
         const seen = new Set();
 
@@ -647,7 +644,7 @@
 
         return picked.reverse();
     }
-
+    
     function collectCrackMemoryFromPage() {
         const rootCandidates = Array.from(document.querySelectorAll('[role="dialog"], main, section, article, div'))
             .filter(el => {
