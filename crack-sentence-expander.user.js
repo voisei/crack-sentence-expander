@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.11.0
+// @version      6.12.0
 // @author       me
-// @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
+// @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 요약 메모리 자동 참고, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -419,10 +419,16 @@
         if (/최근 대화 맥락 참고|맥락 미리보기|요약 메모리/.test(line)) return true;
         if (/현재 화면에서 메모리 가져오기|프롬프트에 참고시키기/.test(line)) return true;
         if (/사용 가능한 모델 불러오기|설정 동기화|내보내기|가져오기/.test(line)) return true;
+
+        // ★ 턴 배너 거르기: [ 턴 33 | 4일차 | 2024년 ... ] 같은 제작자 표시줄
+        if (/\[\s*턴\s*\d+\s*[|｜]/.test(line)) return true;
+        if (/\[[^\]]*\d+\s*일차[^\]]*\]/.test(line)) return true;
+
         if (/^[\s\W_]+$/.test(line)) return true;
 
         return false;
     }
+        
 
     function getCurrentChatCacheKey() {
         const path = location.pathname || '';
@@ -503,11 +509,11 @@
 
         GM_setValue(key, []);
     }
-
     function collectChatContextFromDOM(maxN, selector) {
         const inPanel = el => el.closest && el.closest('#se-panel');
         let nodes = [];
 
+        // (1) 사용자가 고급 선택자를 직접 지정한 경우 그걸 최우선.
         if (selector && selector.trim()) {
             try {
                 nodes = Array.from(document.querySelectorAll(selector.trim()));
@@ -518,15 +524,21 @@
             nodes = nodes.filter(el => !inPanel(el) && isVisible(el));
         }
 
-        // 크랙 UI는 채팅 말풍선/메시지 묶음에 data-message-group-id를 붙인다.
-        // 그래서 p/div/span을 막 긁기 전에 이 메시지 묶음을 최우선으로 읽는다.
+        // (2) 크랙 대화 본문은 div.wrtn-markdown 안에 <p>로 들어있다.
+        //     data-message-group-id 는 빈 껍데기라서 최신 대화를 못 잡는다.
+        //     그래서 wrtn-markdown 블록을 "한 메시지 = 한 블록"으로 읽는다.
         if (!nodes.length) {
-            nodes = Array.from(document.querySelectorAll('div[data-message-group-id]'))
-                .slice(-30)
+            nodes = Array.from(document.querySelectorAll('.wrtn-markdown'))
                 .filter(el => !inPanel(el) && isVisible(el));
         }
 
-        // 그래도 못 잡으면 기존 자동 탐색 방식으로 fallback한다.
+        // (3) 그래도 없으면 data-message-group-id 로 fallback.
+        if (!nodes.length) {
+            nodes = Array.from(document.querySelectorAll('div[data-message-group-id]'))
+                .filter(el => !inPanel(el) && isVisible(el));
+        }
+
+        // (4) 최후의 fallback: 기존 자동 탐색.
         if (!nodes.length) {
             const cands = Array.from(document.body.querySelectorAll('p, div, span, li, article'))
                 .filter(el => {
@@ -544,6 +556,8 @@
             nodes = cands.filter(el => !cands.some(o => o !== el && el.contains(o)));
         }
 
+        // ★ 화면상 위쪽(과거)~아래쪽(최신) 순서로 정렬. (DOM 순서가 시각 순서와 다를 수 있어서)
+        //   슬라이스 하기 전에 정렬부터 해야 최신이 잘리지 않는다.
         nodes.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
 
         const out = [];
@@ -553,11 +567,8 @@
             let t = cleanContextLine(el.innerText || '');
 
             if (!t) continue;
-            if (isBadContextLine(t)) continue;
-            if (t.length < 2) continue;
-            if (t.length > 2000) continue;
 
-            // 메시지 묶음 안에 섞일 수 있는 UI 버튼/메뉴 텍스트를 최대한 제거한다.
+            // 메시지 묶음 안에 섞일 수 있는 UI 버튼/메뉴 텍스트 제거.
             t = t
                 .replace(/\b복사\b/g, '')
                 .replace(/\b다시 생성\b/g, '')
@@ -569,6 +580,8 @@
 
             if (!t) continue;
             if (isBadContextLine(t)) continue;
+            if (t.length < 2) continue;
+            if (t.length > 2000) continue;
             if (seen.has(t)) continue;
 
             seen.add(t);
