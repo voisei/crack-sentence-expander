@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.5
+// @version      6.12.6
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -548,15 +548,16 @@
     function collectChatContextFromDOM(maxN) {
         const limit = Math.max(1, maxN || 6);
         const inPanel = el => el.closest && el.closest('#se-panel');
-        const items = [];
 
-        // 현재 크랙 DOM은 data-message-group-id가 최신→과거 순서로 놓여 있지만,
-        // 각 그룹의 실제 화면 top 값은 과거가 더 작고 최신이 더 크다.
-        // 화면 밖(음수 top) 메시지도 DOM에 전부 살아 있으므로 visible 필터나 스크롤은 쓰지 않는다.
+        // 현재 크랙 DOM은 최신 메시지부터 과거 메시지 순서로 배치된다.
+        // 모바일 성능을 위해 필요한 개수만 읽고, innerText/getBoundingClientRect는 사용하지 않는다.
         const groups = Array.from(document.querySelectorAll('[data-message-group-id]'))
-            .filter(el => !inPanel(el));
+            .filter(el => !inPanel(el))
+            .slice(0, limit);
 
-        groups.forEach((group, domIndex) => {
+        const lines = [];
+
+        for (const group of groups) {
             const markdowns = Array.from(group.querySelectorAll('.wrtn-markdown'))
                 .filter(el => !el.querySelector('.wrtn-markdown'));
 
@@ -564,53 +565,38 @@
 
             if (markdowns.length) {
                 raw = markdowns
-                    .map(el => el.innerText || el.textContent || '')
+                    .map(el => el.textContent || '')
                     .filter(Boolean)
-                    .join('\n');
+                    .join('
+');
             } else {
-                raw = group.innerText || group.textContent || '';
+                raw = group.textContent || '';
             }
 
             const text = stripContextNoise(raw);
-            if (!text || text.length < 2 || text.length > 6000) return;
-            if (isBadContextLine(text)) return;
+            if (!text || text.length < 2 || text.length > 6000) continue;
+            if (isBadContextLine(text)) continue;
 
-            const rect = group.getBoundingClientRect();
-
-            items.push({
-                text,
-                top: Number.isFinite(rect.top) ? rect.top : 0,
-                domIndex
-            });
-        });
-
-        // 혹시 사이트 구조가 바뀌어 그룹이 없을 때만 leaf markdown으로 대체한다.
-        if (!items.length) {
-            Array.from(document.querySelectorAll('.wrtn-markdown'))
-                .filter(el => !inPanel(el) && !el.querySelector('.wrtn-markdown'))
-                .forEach((el, domIndex) => {
-                    const text = stripContextNoise(el.innerText || el.textContent || '');
-                    if (!text || text.length < 2 || text.length > 6000) return;
-                    if (isBadContextLine(text)) return;
-
-                    const rect = el.getBoundingClientRect();
-
-                    items.push({
-                        text,
-                        top: Number.isFinite(rect.top) ? rect.top : 0,
-                        domIndex
-                    });
-                });
+            lines.push(text);
         }
 
-        // 과거 → 최신 순서.
-        // top이 다르면 실제 배치 순서를 사용하고, 같으면 현재 사이트의 최신→과거 DOM을 뒤집는다.
-        items.sort((a, b) => {
-            if (Math.abs(a.top - b.top) > 1) return a.top - b.top;
-            return b.domIndex - a.domIndex;
-        });
+        // 사이트 구조 변경으로 메시지 그룹이 없을 때만 마크다운을 직접 읽는다.
+        if (!lines.length) {
+            const markdowns = Array.from(document.querySelectorAll('.wrtn-markdown'))
+                .filter(el => !inPanel(el) && !el.querySelector('.wrtn-markdown'))
+                .slice(0, limit);
 
-        return uniqueContextLines(items.map(item => item.text)).slice(-limit);
+            for (const el of markdowns) {
+                const text = stripContextNoise(el.textContent || '');
+                if (!text || text.length < 2 || text.length > 6000) continue;
+                if (isBadContextLine(text)) continue;
+
+                lines.push(text);
+            }
+        }
+
+        // DOM은 최신→과거이므로 Gemini에 보낼 때는 과거→최신으로 뒤집는다.
+        return uniqueContextLines(lines.reverse()).slice(-limit);
     }
 
     async function hydrateContextCacheFromHistory(targetN, onProgress) {
@@ -618,7 +604,7 @@
 
         // 진단 결과: 과거 메시지까지 이미 DOM에 모두 존재한다.
         // 스크롤로 강제 렌더링하지 않고 바로 읽는 편이 정확하고 빠르다.
-        const now = collectChatContextFromDOM(Math.max(need, 80));
+        const now = collectChatContextFromDOM(need);
         const merged = uniqueContextLines([
             ...getCtxCache(),
             ...now
@@ -638,7 +624,7 @@
         let domLines = [];
 
         try {
-            domLines = collectChatContextFromDOM(Math.max(n, 80));
+            domLines = collectChatContextFromDOM(n);
             rememberCtxLines(domLines);
         } catch (_) {
             domLines = [];
@@ -1989,7 +1975,7 @@
 
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.5</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.6</span>
                 <button id="se-gear" title="설정">⚙️</button>
                 <button id="se-min" title="닫기">✕</button>
             </div>
@@ -3125,7 +3111,7 @@
 
         injectStyle();
         buildUI();
-        startContextCacheObserver();
+        // 모바일 성능: 전체 문서를 상시 감시하지 않고, 미리보기/생성 버튼을 누를 때만 맥락을 읽는다.
     }
 
     if (document.readyState === 'loading') {
