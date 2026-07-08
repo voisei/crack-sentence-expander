@@ -130,7 +130,7 @@
             lines.push('- 유저가 이전에 보낸 문장이나 행동을 다시 반복하거나 계속 늘어뜨리지 마라.');
             lines.push('- 이번 [대사]/[행동]은 직전 크랙 출력에 대한 현재 반응으로 해석하라.');
             lines.push('- 맥락에 있는 상대 캐릭터의 말·행동·상태를 무시하지 마라.');
-            lines.push('- 맥락은 "지금 이 순간"의 상황을 알려주는 가장 신뢰할 근거다. 페르소나나 요약 메모리와 충돌하면 이 맥락을 따른다.');
+            lines.push('- 맥락은 "지금 이 순간"의 상황을 알려주는 가장 신뢰할 근거다. 페르소나나 오래된 설정과 충돌하면 이 맥락을 따른다.');
             lines.push('- 단, 상대 캐릭터/크랙의 다음 대사·행동·감정·생각은 새로 쓰지 마라.');
             lines.push('- 이미 출력된 직전 크랙 내용에 유저 캐릭터가 반응하는 것까지만 허용한다.');
             lines.push('- 오직 유저 캐릭터의 이번 [대사]/[행동]만 확장한다.');
@@ -208,7 +208,7 @@
         lines.push('- 동어 반복이나 같은 행동·감정의 재탕을 하지 마라.');
         lines.push('- 유저가 이전에 보낸 문장을 계속 이어 쓰지 마라. 반드시 직전 크랙/상대 출력에 대한 현재 반응으로 써라.');
         lines.push('- 이미 진행 중인 행동을 시작 전 상황으로 되감지 마라. 예: 밥을 먹고 있는데 밥을 차리거나 먹기 전 망설이는 장면부터 쓰지 마라.');
-        lines.push('- 페르소나·문체 규칙·이름·설정·크랙 요약 메모리를 본문에서 그대로 읊거나 설명하지 마라.');
+        lines.push('- 페르소나·문체 규칙·이름·설정을 본문에서 그대로 읊거나 설명하지 마라.');
         lines.push('- 페르소나의 평소 옷차림·청결 상태·소지품을 최근 상황과 충돌하게 되살리지 마라. 예: 샤워 후 벗고 있는데 메리야스를 입었다고 묘사.');
         lines.push('- 페르소나의 "평소 상태"를 최근 상황과 충돌하게 억지로 끼워 넣지 마라.');
         lines.push('- 입력에 없는 자기소개·배경 설명을 끼워 넣지 마라.');
@@ -401,8 +401,7 @@
         if (bannedExact.has(line)) return true;
         if (/^✨?\s*문장 부풀리기/.test(line)) return true;
         if (/Gemini API|API 키|모델|페르소나|문체 규칙/.test(line)) return true;
-        if (/최근 대화 맥락 참고|맥락 미리보기|요약 메모리/.test(line)) return true;
-        if (/현재 화면에서 메모리 가져오기|프롬프트에 참고시키기/.test(line)) return true;
+        if (/최근 대화 맥락 참고|맥락 미리보기/.test(line)) return true;
         if (/사용 가능한 모델 불러오기|설정 동기화|내보내기|가져오기/.test(line)) return true;
 
         // ★ 턴 배너 거르기: [ 턴 33 | 4일차 | 2024년 ... ] 같은 제작자 표시줄
@@ -502,95 +501,174 @@
             .trim();
     }
 
-    function collectChatContextFromDOM(maxN) {
-        const inPanel = el => el.closest && el.closest('#se-panel');
-        const candidates = [];
-        const pushed = new Set();
-
-        function addElement(el) {
-            if (!el || inPanel(el) || !isVisible(el)) return;
-
-            const text = stripContextNoise(el.innerText || el.textContent || '');
-
-            if (!text || text.length < 2 || text.length > 4000) return;
-            if (isBadContextLine(text)) return;
-            if (pushed.has(text)) return;
-
-            pushed.add(text);
-            candidates.push({ el, text });
-        }
-
-        // 1) 메시지 그룹 내부에서 AI의 markdown 블록과 유저의 일반 말풍선을 따로 수집한다.
-        const groups = Array.from(document.querySelectorAll('[data-message-group-id], [data-message-id], [data-testid*="message"]'))
-            .filter(el => !inPanel(el));
-
-        for (const group of groups) {
-            const markdowns = Array.from(group.querySelectorAll('.wrtn-markdown'))
-                .filter(el => !el.querySelector('.wrtn-markdown'));
-
-            markdowns.forEach(addElement);
-
-            const plain = Array.from(group.querySelectorAll(
-                '[class*="whitespace-pre-wrap"], [class*="break-words"], p'
-            )).filter(el => {
-                if (el.closest('.wrtn-markdown')) return false;
-                if (el.querySelector('textarea, input, button, select')) return false;
-                return !Array.from(el.children || []).some(child => {
-                    const childText = stripContextNoise(child.innerText || child.textContent || '');
-                    return childText && childText === stripContextNoise(el.innerText || el.textContent || '');
-                });
-            });
-
-            plain.forEach(addElement);
-        }
-
-        // 2) 그룹 구조가 바뀐 경우에도 모든 leaf markdown은 반드시 수집한다.
-        Array.from(document.querySelectorAll('.wrtn-markdown'))
-            .filter(el => !el.querySelector('.wrtn-markdown'))
-            .forEach(addElement);
-
-        // 3) 유저 말풍선이 markdown이 아닌 사이트 버전에 대한 보조 탐색.
-        if (candidates.length < 2) {
-            Array.from(document.querySelectorAll(
-                'main [class*="whitespace-pre-wrap"], main [class*="break-words"], main p, article p'
-            )).filter(el => {
-                if (inPanel(el)) return false;
-                if (el.closest('.wrtn-markdown')) return false;
-                if (el.querySelector('textarea, input, button, select')) return false;
-                return true;
-            }).forEach(addElement);
-        }
-
-        // DOM 순서가 실제 대화의 과거→최신 순서에 가장 안정적이다.
-        candidates.sort((a, b) => {
-            if (a.el === b.el) return 0;
-            const pos = a.el.compareDocumentPosition(b.el);
-            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-            if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-            return 0;
-        });
-
+    function uniqueContextLines(lines) {
         const out = [];
         const seen = new Set();
 
-        for (const item of candidates) {
-            const t = item.text;
-            if (!t || seen.has(t)) continue;
-
-            // 큰 부모 텍스트가 이미 수집한 여러 메시지를 통째로 포함한 경우 제외한다.
-            if (out.some(prev => t !== prev && t.includes(prev) && t.length > prev.length * 1.8)) {
-                continue;
-            }
-
+        for (const raw of lines || []) {
+            const t = stripContextNoise(raw);
+            if (!t || t.length < 2 || t.length > 4000) continue;
+            if (isBadContextLine(t) || seen.has(t)) continue;
             seen.add(t);
             out.push(t);
         }
 
-        return dropStreamingPrefixes(out).slice(-Math.max(1, maxN || 6));
+        return dropStreamingPrefixes(out);
     }
+
+    function extractContextLinesFromGroup(group) {
+        if (!group || (group.closest && group.closest('#se-panel'))) return [];
+
+        const lines = [];
+
+        Array.from(group.querySelectorAll('.wrtn-markdown'))
+            .filter(el => !el.querySelector('.wrtn-markdown'))
+            .forEach(el => {
+                const t = stripContextNoise(el.innerText || el.textContent || '');
+                if (t) lines.push(t);
+            });
+
+        Array.from(group.querySelectorAll(
+            '[class*="whitespace-pre-wrap"], [class*="break-words"], [data-testid*="user"], [data-role="user"]'
+        )).filter(el => {
+            if (el.closest('.wrtn-markdown')) return false;
+            if (el.querySelector('textarea, input, button, select')) return false;
+            return true;
+        }).forEach(el => {
+            const t = stripContextNoise(el.innerText || el.textContent || '');
+            if (t) lines.push(t);
+        });
+
+        return uniqueContextLines(lines);
+    }
+
+    function collectChatContextFromDOM(maxN) {
+        const inPanel = el => el.closest && el.closest('#se-panel');
+        const items = [];
+
+        const groups = Array.from(document.querySelectorAll(
+            '[data-message-group-id], [data-message-id], [data-testid*="message"]'
+        )).filter(el => !inPanel(el));
+
+        for (const group of groups) {
+            const lines = extractContextLinesFromGroup(group);
+            if (!lines.length) continue;
+
+            const rect = group.getBoundingClientRect();
+            lines.forEach((text, index) => items.push({ text, top: rect.top, index, el: group }));
+        }
+
+        if (!items.length) {
+            Array.from(document.querySelectorAll('.wrtn-markdown'))
+                .filter(el => !inPanel(el) && !el.querySelector('.wrtn-markdown'))
+                .forEach((el, index) => {
+                    const text = stripContextNoise(el.innerText || el.textContent || '');
+                    if (!text) return;
+                    items.push({ text, top: el.getBoundingClientRect().top, index, el });
+                });
+        }
+
+        items.sort((a, b) => {
+            if (Math.abs(a.top - b.top) > 1) return a.top - b.top;
+            if (a.el !== b.el) {
+                const pos = a.el.compareDocumentPosition(b.el);
+                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+            }
+            return a.index - b.index;
+        });
+
+        return uniqueContextLines(items.map(x => x.text))
+            .slice(-Math.max(1, maxN || 6));
+    }
+
+    function findConversationScrollContainer() {
+        const anchor = document.querySelector('.wrtn-markdown')
+            || document.querySelector('[data-message-group-id]');
+
+        let el = anchor;
+        while (el && el !== document.body) {
+            const st = getComputedStyle(el);
+            const canScroll = /(auto|scroll)/.test(st.overflowY || '')
+                && el.scrollHeight > el.clientHeight + 40;
+            if (canScroll) return el;
+            el = el.parentElement;
+        }
+
+        return Array.from(document.querySelectorAll('main div, main'))
+            .find(x => {
+                const st = getComputedStyle(x);
+                return /(auto|scroll)/.test(st.overflowY || '')
+                    && x.scrollHeight > x.clientHeight + 40;
+            }) || null;
+    }
+
+    function waitMs(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function hydrateContextCacheFromHistory(targetN, onProgress) {
+        const need = Math.max(1, targetN || 6);
+        const groups = Array.from(document.querySelectorAll('[data-message-group-id]'))
+            .filter(el => !(el.closest && el.closest('#se-panel')));
+
+        if (groups.length < 2) {
+            const now = collectChatContextFromDOM(need);
+            rememberCtxLines(now);
+            return getCtxCache();
+        }
+
+        const scroller = findConversationScrollContainer();
+        const savedTop = scroller ? scroller.scrollTop : null;
+        const savedX = window.scrollX;
+        const savedY = window.scrollY;
+        const newestFirst = [];
+        const seen = new Set();
+        const maxGroups = Math.min(groups.length, Math.max(need * 3, 30));
+
+        for (let i = 0; i < maxGroups; i++) {
+            const group = groups[i];
+
+            try {
+                group.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+            } catch (_) {}
+
+            await waitMs(150);
+
+            let lines = extractContextLinesFromGroup(group);
+            if (!lines.length) lines = collectChatContextFromDOM(8);
+
+            for (const line of lines.slice().reverse()) {
+                if (!line || seen.has(line)) continue;
+                seen.add(line);
+                newestFirst.push(line);
+            }
+
+            if (typeof onProgress === 'function') {
+                onProgress(Math.min(seen.size, need), need);
+            }
+
+            if (seen.size >= need) break;
+        }
+
+        if (scroller && savedTop !== null) scroller.scrollTop = savedTop;
+        window.scrollTo(savedX, savedY);
+        await waitMs(120);
+
+        const chronological = newestFirst.slice().reverse();
+        const current = collectChatContextFromDOM(need);
+        const merged = uniqueContextLines([
+            ...chronological,
+            ...getCtxCache(),
+            ...current
+        ]);
+
+        saveCtxCache(merged);
+        return merged;
+    }
+
     function collectChatContext(maxN) {
         const n = Math.max(1, maxN || 6);
-
         let domLines = [];
 
         try {
@@ -600,33 +678,20 @@
             domLines = [];
         }
 
-        // 화면(domLines)에서 잡힌 대화가 순서·최신성이 가장 정확하다.
-        // wrtn-markdown 은 화면 밖(top 음수)이어도 DOM에 살아있어서
-        // 최근 N개 턴이 통째로 잡힌다. 그러니 화면에서 뭐라도 잡혔으면
-        // 그걸 그대로 신뢰하고, 캐시로 억지로 덮어쓰지 않는다.
-        let source;
+        const source = uniqueContextLines([
+            ...getCtxCache(),
+            ...domLines
+        ]);
 
-        if (domLines.length) {
-            source = domLines;
-        } else {
-            // 화면에서 아무것도 못 잡았을 때만 캐시를 대체로 쓴다.
-            source = getCtxCache();
-        }
-
-        // 뒤(최신)에서부터 훑어서, 중복은 '가장 최신 위치'만 남긴다.
         const picked = [];
         const seen = new Set();
 
         for (let i = source.length - 1; i >= 0; i--) {
-            const line = cleanContextLine(source[i]);
-
-            if (!line) continue;
-            if (isBadContextLine(line)) continue;
-            if (seen.has(line)) continue;
+            const line = stripContextNoise(source[i]);
+            if (!line || isBadContextLine(line) || seen.has(line)) continue;
 
             seen.add(line);
             picked.push(line);
-
             if (picked.length >= n) break;
         }
 
@@ -2142,7 +2207,7 @@
                             A 채팅방에서 저장된 맥락은 B 채팅방에 섞이지 않아요.
                             단, 크랙이 여러 채팅방을 같은 주소로 표시하면 완벽히 분리되지 않을 수 있어요.
                             캐시는 화면에 한 번이라도 표시된 채팅을 최대 300개까지 저장해요.
-                            가져온 메모리와 최근 대화 맥락은 Gemini API로 같이 전송돼요. 개인정보/API 키/비밀번호는 넣지 마세요.
+                            최근 대화 맥락은 Gemini API로 같이 전송돼요. 개인정보/API 키/비밀번호는 넣지 마세요.
                         </div>
                     </div>
                 </details>
@@ -2387,32 +2452,38 @@
             GM_setValue(K_CTX_ON, ctxChk.checked);
         });
 
-        $('#se-ctx-test').addEventListener('click', () => {
+        $('#se-ctx-test').addEventListener('click', async () => {
             const n = parseInt(ctxN.value, 10) || 6;
+            const btn = $('#se-ctx-test');
             let arr = [];
 
             GM_setValue(K_CTX_N, n);
+            btn.disabled = true;
+            ctxStat.textContent = '이전 대화를 불러오는 중이에요… 화면이 잠깐 움직일 수 있어요.';
+
             try {
+                await hydrateContextCacheFromHistory(n, (got, need) => {
+                    ctxStat.textContent = '이전 대화 수집 중… ' + got + ' / ' + need;
+                });
                 arr = collectChatContext(n);
             } catch (_) {
-                arr = [];
+                arr = collectChatContext(n);
+            } finally {
+                btn.disabled = false;
             }
 
             const cacheCount = getCtxCache().length;
-            const roomKey = getCurrentChatCacheKey().replace(K_CTX_CACHE_BASE + '::', '');
 
             if (!arr.length) {
                 ctxStat.textContent =
-                    '못 잡았어요 😅 채팅 화면을 위로 조금 스크롤한 뒤 다시 눌러보세요.\n'
-                    + '현재 채팅방 캐시: ' + cacheCount + '개\n'
-                    + '캐시 기준: ' + roomKey;
+                    '대화를 못 잡았어요 😅 채팅을 위로 한 번 스크롤한 뒤 다시 눌러보세요.\n'
+                    + '현재 채팅방 캐시: ' + cacheCount + '개';
                 return;
             }
 
             ctxStat.textContent =
                 arr.length + '개 참고 예정 / 현재 채팅방 캐시 ' + cacheCount + '개\n'
-                + '캐시 기준: ' + roomKey + '\n'
-                + arr.map((m, i) => (i + 1) + '. ' + (m.length > 80 ? m.slice(0, 80) + '…' : m)).join('\n');
+                + arr.map((m, i) => (i + 1) + '. ' + (m.length > 120 ? m.slice(0, 120) + '…' : m)).join('\n');
         });
 
         $('#se-ctx-clear').addEventListener('click', () => {
