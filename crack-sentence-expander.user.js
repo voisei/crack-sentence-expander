@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.3
+// @version      6.12.4
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -11,8 +11,6 @@
 // @connect      generativelanguage.googleapis.com
 // @homepageURL  https://github.com/voisei/crack-sentence-expander
 // @supportURL   https://github.com/voisei/crack-sentence-expander/issues
-// @updateURL    https://raw.githubusercontent.com/voisei/crack-sentence-expander/refs/heads/main/crack-sentence-expander.user.js
-// @downloadURL  https://raw.githubusercontent.com/voisei/crack-sentence-expander/refs/heads/main/crack-sentence-expander.user.js
 // @license      MIT
 // @run-at       document-idle
 // ==/UserScript==
