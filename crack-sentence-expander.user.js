@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.4
+// @version      6.12.5
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -402,9 +402,10 @@
         if (/최근 대화 맥락 참고|맥락 미리보기/.test(line)) return true;
         if (/사용 가능한 모델 불러오기|설정 동기화|내보내기|가져오기/.test(line)) return true;
 
-        // ★ 턴 배너 거르기: [ 턴 33 | 4일차 | 2024년 ... ] 같은 제작자 표시줄
-        if (/\[\s*턴\s*\d+\s*[|｜]/.test(line)) return true;
-        if (/\[[^\]]*\d+\s*일차[^\]]*\]/.test(line)) return true;
+        // 턴 배너만 단독으로 남은 경우에만 제외한다.
+        // 메시지 본문 앞에 턴 배너가 붙어 있으면 stripContextNoise()에서 배너만 제거한다.
+        if (/^\s*\[\s*턴\s*\d+\s*[|｜][^\]]*\]\s*$/.test(line)) return true;
+        if (/^\s*\[[^\]]*\d+\s*일차[^\]]*\]\s*$/.test(line)) return true;
 
         if (/^[\s\W_]+$/.test(line)) return true;
 
@@ -462,12 +463,12 @@
         let merged = old.slice();
 
         for (const raw of lines || []) {
-            const t = cleanContextLine(raw);
+            const t = stripContextNoise(raw);
 
             if (!t) continue;
             if (isBadContextLine(t)) continue;
             if (t.length < 2) continue;
-            if (t.length > 1200) continue;
+            if (t.length > 6000) continue;
 
             const last = merged[merged.length - 1];
 
@@ -493,7 +494,11 @@
     }
     function stripContextNoise(text) {
         return cleanContextLine(text || '')
+            // 주소가 메시지 앞에 섞인 경우 제거
             .replace(/\/stories\/[^\s]+\/episodes\/[^\s]+/g, ' ')
+            // [ 턴 33 | 4일차 | ... ] 배너는 본문 전체를 버리지 말고 배너만 제거
+            .replace(/^\s*\[\s*턴\s*\d+\s*[|｜][^\]]*\]\s*/i, ' ')
+            .replace(/^\s*\[[^\]]*\d+\s*일차[^\]]*\]\s*/i, ' ')
             .replace(/\b(?:복사|다시 생성|삭제|수정|공유)\b/g, ' ')
             .replace(/\s+/g, ' ')
             .trim();
@@ -541,127 +546,90 @@
     }
 
     function collectChatContextFromDOM(maxN) {
+        const limit = Math.max(1, maxN || 6);
         const inPanel = el => el.closest && el.closest('#se-panel');
         const items = [];
 
-        const groups = Array.from(document.querySelectorAll(
-            '[data-message-group-id], [data-message-id], [data-testid*="message"]'
-        )).filter(el => !inPanel(el));
+        // 현재 크랙 DOM은 data-message-group-id가 최신→과거 순서로 놓여 있지만,
+        // 각 그룹의 실제 화면 top 값은 과거가 더 작고 최신이 더 크다.
+        // 화면 밖(음수 top) 메시지도 DOM에 전부 살아 있으므로 visible 필터나 스크롤은 쓰지 않는다.
+        const groups = Array.from(document.querySelectorAll('[data-message-group-id]'))
+            .filter(el => !inPanel(el));
 
-        for (const group of groups) {
-            const lines = extractContextLinesFromGroup(group);
-            if (!lines.length) continue;
+        groups.forEach((group, domIndex) => {
+            const markdowns = Array.from(group.querySelectorAll('.wrtn-markdown'))
+                .filter(el => !el.querySelector('.wrtn-markdown'));
+
+            let raw = '';
+
+            if (markdowns.length) {
+                raw = markdowns
+                    .map(el => el.innerText || el.textContent || '')
+                    .filter(Boolean)
+                    .join('\n');
+            } else {
+                raw = group.innerText || group.textContent || '';
+            }
+
+            const text = stripContextNoise(raw);
+            if (!text || text.length < 2 || text.length > 6000) return;
+            if (isBadContextLine(text)) return;
 
             const rect = group.getBoundingClientRect();
-            lines.forEach((text, index) => items.push({ text, top: rect.top, index, el: group }));
-        }
 
+            items.push({
+                text,
+                top: Number.isFinite(rect.top) ? rect.top : 0,
+                domIndex
+            });
+        });
+
+        // 혹시 사이트 구조가 바뀌어 그룹이 없을 때만 leaf markdown으로 대체한다.
         if (!items.length) {
             Array.from(document.querySelectorAll('.wrtn-markdown'))
                 .filter(el => !inPanel(el) && !el.querySelector('.wrtn-markdown'))
-                .forEach((el, index) => {
+                .forEach((el, domIndex) => {
                     const text = stripContextNoise(el.innerText || el.textContent || '');
-                    if (!text) return;
-                    items.push({ text, top: el.getBoundingClientRect().top, index, el });
+                    if (!text || text.length < 2 || text.length > 6000) return;
+                    if (isBadContextLine(text)) return;
+
+                    const rect = el.getBoundingClientRect();
+
+                    items.push({
+                        text,
+                        top: Number.isFinite(rect.top) ? rect.top : 0,
+                        domIndex
+                    });
                 });
         }
 
+        // 과거 → 최신 순서.
+        // top이 다르면 실제 배치 순서를 사용하고, 같으면 현재 사이트의 최신→과거 DOM을 뒤집는다.
         items.sort((a, b) => {
             if (Math.abs(a.top - b.top) > 1) return a.top - b.top;
-            if (a.el !== b.el) {
-                const pos = a.el.compareDocumentPosition(b.el);
-                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-                if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-            }
-            return a.index - b.index;
+            return b.domIndex - a.domIndex;
         });
 
-        return uniqueContextLines(items.map(x => x.text))
-            .slice(-Math.max(1, maxN || 6));
-    }
-
-    function findConversationScrollContainer() {
-        const anchor = document.querySelector('.wrtn-markdown')
-            || document.querySelector('[data-message-group-id]');
-
-        let el = anchor;
-        while (el && el !== document.body) {
-            const st = getComputedStyle(el);
-            const canScroll = /(auto|scroll)/.test(st.overflowY || '')
-                && el.scrollHeight > el.clientHeight + 40;
-            if (canScroll) return el;
-            el = el.parentElement;
-        }
-
-        return Array.from(document.querySelectorAll('main div, main'))
-            .find(x => {
-                const st = getComputedStyle(x);
-                return /(auto|scroll)/.test(st.overflowY || '')
-                    && x.scrollHeight > x.clientHeight + 40;
-            }) || null;
-    }
-
-    function waitMs(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+        return uniqueContextLines(items.map(item => item.text)).slice(-limit);
     }
 
     async function hydrateContextCacheFromHistory(targetN, onProgress) {
         const need = Math.max(1, targetN || 6);
-        const groups = Array.from(document.querySelectorAll('[data-message-group-id]'))
-            .filter(el => !(el.closest && el.closest('#se-panel')));
 
-        if (groups.length < 2) {
-            const now = collectChatContextFromDOM(need);
-            rememberCtxLines(now);
-            return getCtxCache();
-        }
-
-        const scroller = findConversationScrollContainer();
-        const savedTop = scroller ? scroller.scrollTop : null;
-        const savedX = window.scrollX;
-        const savedY = window.scrollY;
-        const newestFirst = [];
-        const seen = new Set();
-        const maxGroups = Math.min(groups.length, Math.max(need * 3, 30));
-
-        for (let i = 0; i < maxGroups; i++) {
-            const group = groups[i];
-
-            try {
-                group.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
-            } catch (_) {}
-
-            await waitMs(150);
-
-            let lines = extractContextLinesFromGroup(group);
-            if (!lines.length) lines = collectChatContextFromDOM(8);
-
-            for (const line of lines.slice().reverse()) {
-                if (!line || seen.has(line)) continue;
-                seen.add(line);
-                newestFirst.push(line);
-            }
-
-            if (typeof onProgress === 'function') {
-                onProgress(Math.min(seen.size, need), need);
-            }
-
-            if (seen.size >= need) break;
-        }
-
-        if (scroller && savedTop !== null) scroller.scrollTop = savedTop;
-        window.scrollTo(savedX, savedY);
-        await waitMs(120);
-
-        const chronological = newestFirst.slice().reverse();
-        const current = collectChatContextFromDOM(need);
+        // 진단 결과: 과거 메시지까지 이미 DOM에 모두 존재한다.
+        // 스크롤로 강제 렌더링하지 않고 바로 읽는 편이 정확하고 빠르다.
+        const now = collectChatContextFromDOM(Math.max(need, 80));
         const merged = uniqueContextLines([
-            ...chronological,
             ...getCtxCache(),
-            ...current
+            ...now
         ]);
 
         saveCtxCache(merged);
+
+        if (typeof onProgress === 'function') {
+            onProgress(Math.min(now.length, need), need);
+        }
+
         return merged;
     }
 
@@ -2021,7 +1989,7 @@
 
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.5</span>
                 <button id="se-gear" title="설정">⚙️</button>
                 <button id="se-min" title="닫기">✕</button>
             </div>
@@ -2479,8 +2447,11 @@
                 return;
             }
 
+            const detectedCount = document.querySelectorAll('[data-message-group-id] .wrtn-markdown').length;
+
             ctxStat.textContent =
-                arr.length + '개 참고 예정 / 현재 채팅방 캐시 ' + cacheCount + '개\n'
+                arr.length + '개 참고 예정 / 현재 채팅방 캐시 ' + cacheCount + '개'
+                + ' / DOM 메시지 ' + detectedCount + '개 감지\n'
                 + arr.map((m, i) => (i + 1) + '. ' + (m.length > 120 ? m.slice(0, 120) + '…' : m)).join('\n');
         });
 
