@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.11
+// @version      6.12.12
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -588,15 +588,58 @@
         return uniqueContextLines(lines.reverse()).slice(-limit);
     }
 
+    function waitMs(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
     async function hydrateContextCacheFromHistory(targetN, onProgress) {
-        const need = Math.max(1, targetN || 6);
-        const lines = collectChatContextFromDOM(need);
+        const need = Math.max(1, Math.min(30, targetN || 6));
+        let best = collectChatContextFromDOM(need);
 
         if (typeof onProgress === 'function') {
-            onProgress(lines.length, need);
+            onProgress(best.length, need);
         }
 
-        return lines;
+        // 현재 DOM에 요청 개수보다 적게 올라온 경우에만 과거 구간을 잠깐 불러온다.
+        // 크랙은 문서(window) 스크롤을 위로 올릴 때 오래된 메시지를 추가로 렌더링한다.
+        if (best.length >= need) return best;
+
+        const scroller = document.scrollingElement || document.documentElement;
+        const savedX = window.scrollX || 0;
+        const savedY = window.scrollY || scroller.scrollTop || 0;
+        let stableRounds = 0;
+
+        try {
+            for (let round = 0; round < 8 && best.length < need; round++) {
+                window.scrollTo(0, 0);
+                scroller.scrollTop = 0;
+                window.dispatchEvent(new Event('scroll'));
+
+                // 모바일에서 과거 메시지가 붙는 시간을 조금 기다린다.
+                await waitMs(450);
+
+                const current = collectChatContextFromDOM(need);
+
+                if (current.length > best.length) {
+                    best = current;
+                    stableRounds = 0;
+                } else {
+                    stableRounds += 1;
+                }
+
+                if (typeof onProgress === 'function') {
+                    onProgress(best.length, need);
+                }
+
+                // 두 번 연속 늘어나지 않으면 현재 채팅에서 더 불러올 내용이 없는 것으로 본다.
+                if (stableRounds >= 2) break;
+            }
+        } finally {
+            window.scrollTo(savedX, savedY);
+            scroller.scrollTop = savedY;
+        }
+
+        return best.slice(-need);
     }
 
     function collectChatContext(maxN) {
@@ -1011,7 +1054,7 @@
         });
     }
 
-    function callGemini(dialogue, action, onDone, onErr) {
+    async function callGemini(dialogue, action, onDone, onErr) {
         const apiKey = GM_getValue(K_APIKEY, '');
         const model = GM_getValue(K_MODEL, DEFAULT_MODELS[0].id);
         const lengthKey = GM_getValue(K_LENGTH, 'medium');
@@ -1023,11 +1066,11 @@
         let context = [];
 
         if (GM_getValue(K_CTX_ON, false)) {
-            const n = parseInt(GM_getValue(K_CTX_N, 6), 10) || 6;
+            const n = Math.max(1, Math.min(30, parseInt(GM_getValue(K_CTX_N, 6), 10) || 6));
             try {
-                context = collectChatContext(n);
+                context = await hydrateContextCacheFromHistory(n);
             } catch (_) {
-                context = [];
+                context = collectChatContext(n);
             }
         }
 
@@ -1990,7 +2033,7 @@
 
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.11</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.12</span>
                 <button id="se-gear" title="설정">⚙️</button>
                 <button id="se-min" title="닫기">✕</button>
             </div>
@@ -2436,7 +2479,11 @@
             ctxStat.textContent = '최근 대화를 읽는 중이에요…';
 
             try {
-                arr = await hydrateContextCacheFromHistory(n);
+                arr = await hydrateContextCacheFromHistory(n, (got, want) => {
+                    ctxStat.textContent = got < want
+                        ? '과거 대화를 불러오는 중… ' + got + '/' + want
+                        : '맥락을 정리하는 중이에요…';
+                });
             } catch (_) {
                 arr = collectChatContext(n);
             } finally {
