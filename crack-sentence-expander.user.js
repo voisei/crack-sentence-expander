@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.12
+// @version      6.12.13
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -546,46 +546,51 @@
     }
 
     function collectChatContextFromDOM(maxN) {
-        const limit = Math.max(1, maxN || 6);
+        const limit = Math.max(1, Math.min(30, maxN || 6));
         const panel = document.getElementById('se-panel');
-
-        // 크랙 DOM은 최신 메시지부터 과거 메시지 순서로 배치된다.
-        // 필요한 개수만 textContent로 읽어 모바일의 레이아웃 재계산을 피한다.
-        const groups = Array.from(document.querySelectorAll('[data-message-group-id]'))
-            .filter(el => !panel || !panel.contains(el))
-            .slice(0, limit);
-
         const lines = [];
 
-        for (const group of groups) {
-            const markdowns = Array.from(group.querySelectorAll('.wrtn-markdown'))
-                .filter(el => !el.querySelector('.wrtn-markdown'));
+        // 크랙은 하나의 data-message-group-id 안에 wrtn-markdown이 여러 개 들어갈 수 있다.
+        // 이전 버전은 그룹을 1개 메시지로 합쳐서 DOM에 본문이 19개 있어도 10개만 잡혔다.
+        // 이제 실제 말풍선 본문인 '가장 안쪽 wrtn-markdown'을 각각 한 메시지로 읽는다.
+        const markdowns = Array.from(document.querySelectorAll('.wrtn-markdown'))
+            .filter(el => {
+                if (panel && panel.contains(el)) return false;
+                // 바깥 래퍼와 안쪽 본문이 동시에 잡히는 중복 방지
+                if (el.querySelector('.wrtn-markdown')) return false;
+                return true;
+            });
 
-            const raw = markdowns.length
-                ? markdowns.map(el => el.textContent || '').filter(Boolean).join('\n')
-                : (group.textContent || '');
-
-            const value = stripContextNoise(raw);
+        for (const el of markdowns) {
+            const value = stripContextNoise(el.textContent || '');
             if (!value || value.length < 2 || value.length > 6000) continue;
             if (isBadContextLine(value)) continue;
 
             lines.push(value);
+            if (lines.length >= limit) break;
         }
 
+        // 사이트 구조가 바뀌어 wrtn-markdown이 없을 때만 메시지 그룹을 비상용으로 읽는다.
         if (!lines.length) {
-            const markdowns = Array.from(document.querySelectorAll('.wrtn-markdown'))
-                .filter(el => (!panel || !panel.contains(el)) && !el.querySelector('.wrtn-markdown'))
-                .slice(0, limit);
+            const groups = Array.from(document.querySelectorAll('[data-message-group-id]'))
+                .filter(el => !panel || !panel.contains(el));
 
-            for (const el of markdowns) {
-                const value = stripContextNoise(el.textContent || '');
-                if (!value || value.length < 2 || value.length > 6000) continue;
-                if (isBadContextLine(value)) continue;
-                lines.push(value);
+            for (const group of groups) {
+                const values = extractContextLinesFromGroup(group);
+
+                for (const value of values) {
+                    if (!value || value.length < 2 || value.length > 6000) continue;
+                    if (isBadContextLine(value)) continue;
+                    lines.push(value);
+                    if (lines.length >= limit) break;
+                }
+
+                if (lines.length >= limit) break;
             }
         }
 
-        return uniqueContextLines(lines.reverse()).slice(-limit);
+        // 현재 크랙 DOM은 최신→과거 순서이므로 Gemini에는 과거→최신 순서로 전달한다.
+        return uniqueContextLines(lines).slice(0, limit).reverse();
     }
 
     function waitMs(ms) {
@@ -594,64 +599,38 @@
 
     async function hydrateContextCacheFromHistory(targetN, onProgress) {
         const need = Math.max(1, Math.min(30, targetN || 6));
-        let best = collectChatContextFromDOM(need);
+        const domLines = collectChatContextFromDOM(need);
+
+        // 현재 DOM에서 읽은 내용을 채팅방별 캐시에 누적한다.
+        // 이후 DOM에 오래된 말풍선이 빠져도 예전에 읽은 맥락을 다시 활용할 수 있다.
+        rememberCtxLines(domLines);
+
+        const merged = uniqueContextLines([
+            ...getCtxCache(),
+            ...domLines,
+        ]).slice(-need);
 
         if (typeof onProgress === 'function') {
-            onProgress(best.length, need);
+            onProgress(merged.length, need);
         }
 
-        // 현재 DOM에 요청 개수보다 적게 올라온 경우에만 과거 구간을 잠깐 불러온다.
-        // 크랙은 문서(window) 스크롤을 위로 올릴 때 오래된 메시지를 추가로 렌더링한다.
-        if (best.length >= need) return best;
-
-        const scroller = document.scrollingElement || document.documentElement;
-        const savedX = window.scrollX || 0;
-        const savedY = window.scrollY || scroller.scrollTop || 0;
-        let stableRounds = 0;
-
-        try {
-            for (let round = 0; round < 8 && best.length < need; round++) {
-                window.scrollTo(0, 0);
-                scroller.scrollTop = 0;
-                window.dispatchEvent(new Event('scroll'));
-
-                // 모바일에서 과거 메시지가 붙는 시간을 조금 기다린다.
-                await waitMs(450);
-
-                const current = collectChatContextFromDOM(need);
-
-                if (current.length > best.length) {
-                    best = current;
-                    stableRounds = 0;
-                } else {
-                    stableRounds += 1;
-                }
-
-                if (typeof onProgress === 'function') {
-                    onProgress(best.length, need);
-                }
-
-                // 두 번 연속 늘어나지 않으면 현재 채팅에서 더 불러올 내용이 없는 것으로 본다.
-                if (stableRounds >= 2) break;
-            }
-        } finally {
-            window.scrollTo(savedX, savedY);
-            scroller.scrollTop = savedY;
-        }
-
-        return best.slice(-need);
+        return merged;
     }
 
     function collectChatContext(maxN) {
-        const n = Math.max(1, maxN || 6);
+        const n = Math.max(1, Math.min(30, maxN || 6));
 
         try {
             const domLines = collectChatContextFromDOM(n);
-            if (domLines.length) return domLines;
-        } catch (_) {}
+            rememberCtxLines(domLines);
 
-        // 사이트 구조가 바뀌어 DOM을 못 읽는 경우에만 예전 캐시를 비상용으로 사용한다.
-        return uniqueContextLines(getCtxCache()).slice(-n);
+            return uniqueContextLines([
+                ...getCtxCache(),
+                ...domLines,
+            ]).slice(-n);
+        } catch (_) {
+            return uniqueContextLines(getCtxCache()).slice(-n);
+        }
     }
     
     function getModelCostRates(modelId, inputTokens) {
@@ -2033,7 +2012,7 @@
 
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.12</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.13</span>
                 <button id="se-gear" title="설정">⚙️</button>
                 <button id="se-min" title="닫기">✕</button>
             </div>
@@ -2495,10 +2474,15 @@
                 return;
             }
 
-            const detectedCount = document.querySelectorAll('[data-message-group-id] .wrtn-markdown').length;
+            const panel = document.getElementById('se-panel');
+            const detectedCount = Array.from(document.querySelectorAll('.wrtn-markdown'))
+                .filter(el => (!panel || !panel.contains(el)) && !el.querySelector('.wrtn-markdown'))
+                .length;
+            const cacheCount = getCtxCache().length;
 
             ctxStat.textContent =
-                arr.length + '개 참고 예정 / DOM 메시지 ' + detectedCount + '개 감지\n'
+                arr.length + '개 참고 예정 (요청 ' + n + '개) / DOM 본문 ' + detectedCount
+                + '개 / 누적 캐시 ' + cacheCount + '개\n'
                 + arr.map((m, i) => (i + 1) + '. ' + (m.length > 120 ? m.slice(0, 120) + '…' : m)).join('\n');
         });
 
