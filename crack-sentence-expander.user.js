@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.8
+// @version      6.12.9
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -1745,15 +1745,15 @@
         height: 52px;
         border-radius: 50%;
         touch-action: none;
-        background: linear-gradient(135deg,#6c7bff,#8a5cff);
+        background: #ff4fa3;
         color: #fff;
-        border: none;
+        border: 3px solid #fff;
         cursor: pointer;
         font-size: 22px;
         display: flex;
         align-items: center;
         justify-content: center;
-        box-shadow: 0 8px 24px rgba(108,123,255,.5);
+        box-shadow: 0 5px 16px rgba(0,0,0,.38), 0 0 0 2px rgba(255,79,163,.35);
     }
     #se-fab.show {
         display: flex !important;
@@ -1940,13 +1940,16 @@
             box-shadow: none !important;
         }
         #se-fab {
-            left: auto !important;
-            top: auto !important;
-            right: 14px !important;
-            bottom: calc(14px + env(safe-area-inset-bottom, 0px)) !important;
-            width: 50px !important;
-            height: 50px !important;
+            width: 54px !important;
+            height: 54px !important;
             z-index: 2147483647 !important;
+            background: #ff4fa3 !important;
+            color: #ffffff !important;
+            border: 3px solid #ffffff !important;
+            box-shadow: 0 5px 16px rgba(0,0,0,.42), 0 0 0 2px rgba(255,79,163,.35) !important;
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+            -webkit-user-select: none;
         }
         #se-panel *, #se-fab {
             transition: none !important;
@@ -1974,7 +1977,7 @@
 
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.8</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.9</span>
                 <button id="se-gear" title="설정">⚙️</button>
                 <button id="se-min" title="닫기">✕</button>
             </div>
@@ -2212,24 +2215,20 @@
 
         fab.classList.add('show');
 
-        if (window.matchMedia && window.matchMedia('(pointer: coarse), (max-width: 700px)').matches) {
-            GM_setValue(K_FABPOS, null);
-        }
-
         const isMobilePointer = window.matchMedia && window.matchMedia('(pointer: coarse), (max-width: 700px)').matches;
         const fpos = GM_getValue(K_FABPOS, null);
 
-        // 모바일에서는 예전에 저장된 좌표가 화면 밖으로 밀릴 수 있으므로 항상 우하단에 고정한다.
-        if (isMobilePointer) {
-            fab.style.left = 'auto';
-            fab.style.top = 'auto';
-            fab.style.right = '14px';
-            fab.style.bottom = 'calc(14px + env(safe-area-inset-bottom, 0px))';
-        } else if (fpos && typeof fpos.left === 'number') {
+        // PC와 모바일 모두 저장된 위치를 사용한다. 처음 설치했을 때만 우하단에서 시작한다.
+        if (fpos && typeof fpos.left === 'number' && typeof fpos.top === 'number') {
             fab.style.left = fpos.left + 'px';
             fab.style.top = fpos.top + 'px';
             fab.style.right = 'auto';
             fab.style.bottom = 'auto';
+        } else {
+            fab.style.left = 'auto';
+            fab.style.top = 'auto';
+            fab.style.right = '14px';
+            fab.style.bottom = 'calc(14px + env(safe-area-inset-bottom, 0px))';
         }
 
         const savedPov = GM_getValue(K_POV, 'first');
@@ -2779,10 +2778,10 @@
         });
 
         fab.addEventListener('pointermove', e => {
-            if (isMobilePointer) return;
             if (!fabDrag || e.pointerId !== fabId) return;
 
-            if (Math.abs(e.clientX - fabSX) + Math.abs(e.clientY - fabSY) > 6) {
+            const dragThreshold = isMobilePointer ? 10 : 6;
+            if (Math.abs(e.clientX - fabSX) + Math.abs(e.clientY - fabSY) > dragThreshold) {
                 fabMoved = true;
             }
 
@@ -2836,7 +2835,7 @@
         fab.addEventListener('pointercancel', fabEnd);
 
         window.addEventListener('resize', () => {
-            if (!isMobilePointer) clampFab(true);
+            clampFab(false);
         });
 
         let statusTimer = null;
