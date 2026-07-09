@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.6
+// @version      6.12.8
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -547,12 +547,12 @@
 
     function collectChatContextFromDOM(maxN) {
         const limit = Math.max(1, maxN || 6);
-        const inPanel = el => el.closest && el.closest('#se-panel');
+        const panel = document.getElementById('se-panel');
 
-        // 현재 크랙 DOM은 최신 메시지부터 과거 메시지 순서로 배치된다.
-        // 모바일 성능을 위해 필요한 개수만 읽고, innerText/getBoundingClientRect는 사용하지 않는다.
+        // 크랙 DOM은 최신 메시지부터 과거 메시지 순서로 배치된다.
+        // 필요한 개수만 textContent로 읽어 모바일의 레이아웃 재계산을 피한다.
         const groups = Array.from(document.querySelectorAll('[data-message-group-id]'))
-            .filter(el => !inPanel(el))
+            .filter(el => !panel || !panel.contains(el))
             .slice(0, limit);
 
         const lines = [];
@@ -561,93 +561,54 @@
             const markdowns = Array.from(group.querySelectorAll('.wrtn-markdown'))
                 .filter(el => !el.querySelector('.wrtn-markdown'));
 
-            let raw = '';
+            const raw = markdowns.length
+                ? markdowns.map(el => el.textContent || '').filter(Boolean).join('\n')
+                : (group.textContent || '');
 
-            if (markdowns.length) {
-                raw = markdowns
-                    .map(el => el.textContent || '')
-                    .filter(Boolean)
-                    .join('
-');
-            } else {
-                raw = group.textContent || '';
-            }
+            const value = stripContextNoise(raw);
+            if (!value || value.length < 2 || value.length > 6000) continue;
+            if (isBadContextLine(value)) continue;
 
-            const text = stripContextNoise(raw);
-            if (!text || text.length < 2 || text.length > 6000) continue;
-            if (isBadContextLine(text)) continue;
-
-            lines.push(text);
+            lines.push(value);
         }
 
-        // 사이트 구조 변경으로 메시지 그룹이 없을 때만 마크다운을 직접 읽는다.
         if (!lines.length) {
             const markdowns = Array.from(document.querySelectorAll('.wrtn-markdown'))
-                .filter(el => !inPanel(el) && !el.querySelector('.wrtn-markdown'))
+                .filter(el => (!panel || !panel.contains(el)) && !el.querySelector('.wrtn-markdown'))
                 .slice(0, limit);
 
             for (const el of markdowns) {
-                const text = stripContextNoise(el.textContent || '');
-                if (!text || text.length < 2 || text.length > 6000) continue;
-                if (isBadContextLine(text)) continue;
-
-                lines.push(text);
+                const value = stripContextNoise(el.textContent || '');
+                if (!value || value.length < 2 || value.length > 6000) continue;
+                if (isBadContextLine(value)) continue;
+                lines.push(value);
             }
         }
 
-        // DOM은 최신→과거이므로 Gemini에 보낼 때는 과거→최신으로 뒤집는다.
         return uniqueContextLines(lines.reverse()).slice(-limit);
     }
 
     async function hydrateContextCacheFromHistory(targetN, onProgress) {
         const need = Math.max(1, targetN || 6);
-
-        // 진단 결과: 과거 메시지까지 이미 DOM에 모두 존재한다.
-        // 스크롤로 강제 렌더링하지 않고 바로 읽는 편이 정확하고 빠르다.
-        const now = collectChatContextFromDOM(need);
-        const merged = uniqueContextLines([
-            ...getCtxCache(),
-            ...now
-        ]);
-
-        saveCtxCache(merged);
+        const lines = collectChatContextFromDOM(need);
 
         if (typeof onProgress === 'function') {
-            onProgress(Math.min(now.length, need), need);
+            onProgress(lines.length, need);
         }
 
-        return merged;
+        return lines;
     }
 
     function collectChatContext(maxN) {
         const n = Math.max(1, maxN || 6);
-        let domLines = [];
 
         try {
-            domLines = collectChatContextFromDOM(n);
-            rememberCtxLines(domLines);
-        } catch (_) {
-            domLines = [];
-        }
+            const domLines = collectChatContextFromDOM(n);
+            if (domLines.length) return domLines;
+        } catch (_) {}
 
-        const source = uniqueContextLines([
-            ...getCtxCache(),
-            ...domLines
-        ]);
-
-        const picked = [];
-        const seen = new Set();
-
-        for (let i = source.length - 1; i >= 0; i--) {
-            const line = stripContextNoise(source[i]);
-            if (!line || isBadContextLine(line) || seen.has(line)) continue;
-
-            seen.add(line);
-            picked.push(line);
-            if (picked.length >= n) break;
-        }
-
-        return picked.reverse();
+        // 사이트 구조가 바뀌어 DOM을 못 읽는 경우에만 예전 캐시를 비상용으로 사용한다.
+        return uniqueContextLines(getCtxCache()).slice(-n);
     }
     
     function getModelCostRates(modelId, inputTokens) {
@@ -1776,6 +1737,7 @@
     }
 
     #se-fab {
+        position: fixed !important;
         right: 18px;
         bottom: 18px;
         bottom: calc(18px + env(safe-area-inset-bottom, 0px));
@@ -1794,7 +1756,10 @@
         box-shadow: 0 8px 24px rgba(108,123,255,.5);
     }
     #se-fab.show {
-        display: flex;
+        display: flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        pointer-events: auto !important;
     }
     .se-ctx-row {
         display: flex;
@@ -1961,6 +1926,40 @@
         }
     }
 
+    @media (pointer: coarse), (max-width: 700px) {
+        #se-panel {
+            box-shadow: none !important;
+            border-radius: 10px !important;
+            contain: layout paint style;
+        }
+        #se-head,
+        #se-go,
+        #se-insert,
+        #se-fab {
+            background-image: none !important;
+            box-shadow: none !important;
+        }
+        #se-fab {
+            left: auto !important;
+            top: auto !important;
+            right: 14px !important;
+            bottom: calc(14px + env(safe-area-inset-bottom, 0px)) !important;
+            width: 50px !important;
+            height: 50px !important;
+            z-index: 2147483647 !important;
+        }
+        #se-panel *, #se-fab {
+            transition: none !important;
+            animation: none !important;
+        }
+        #se-head button:hover,
+        #se-go:hover,
+        #se-insert:hover,
+        #se-outbtns button:hover {
+            filter: none !important;
+        }
+    }
+
     `;
 
     function injectStyle() {
@@ -1975,7 +1974,7 @@
 
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.6</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.8</span>
                 <button id="se-gear" title="설정">⚙️</button>
                 <button id="se-min" title="닫기">✕</button>
             </div>
@@ -2117,7 +2116,6 @@
 
                         <div class="se-ctx-btns">
                             <button id="se-ctx-test">🔍 맥락 미리보기</button>
-                            <button id="se-ctx-clear">🧹 이 채팅방 캐시 비우기</button>
                         </div>
 
                         <div id="se-ctx-status"></div>
@@ -2214,8 +2212,20 @@
 
         fab.classList.add('show');
 
+        if (window.matchMedia && window.matchMedia('(pointer: coarse), (max-width: 700px)').matches) {
+            GM_setValue(K_FABPOS, null);
+        }
+
+        const isMobilePointer = window.matchMedia && window.matchMedia('(pointer: coarse), (max-width: 700px)').matches;
         const fpos = GM_getValue(K_FABPOS, null);
-        if (fpos && typeof fpos.left === 'number') {
+
+        // 모바일에서는 예전에 저장된 좌표가 화면 밖으로 밀릴 수 있으므로 항상 우하단에 고정한다.
+        if (isMobilePointer) {
+            fab.style.left = 'auto';
+            fab.style.top = 'auto';
+            fab.style.right = '14px';
+            fab.style.bottom = 'calc(14px + env(safe-area-inset-bottom, 0px))';
+        } else if (fpos && typeof fpos.left === 'number') {
             fab.style.left = fpos.left + 'px';
             fab.style.top = fpos.top + 'px';
             fab.style.right = 'auto';
@@ -2411,39 +2421,26 @@
 
             GM_setValue(K_CTX_N, n);
             btn.disabled = true;
-            ctxStat.textContent = '이전 대화를 불러오는 중이에요… 화면이 잠깐 움직일 수 있어요.';
+            ctxStat.textContent = '최근 대화를 읽는 중이에요…';
 
             try {
-                await hydrateContextCacheFromHistory(n, (got, need) => {
-                    ctxStat.textContent = '이전 대화 수집 중… ' + got + ' / ' + need;
-                });
-                arr = collectChatContext(n);
+                arr = await hydrateContextCacheFromHistory(n);
             } catch (_) {
                 arr = collectChatContext(n);
             } finally {
                 btn.disabled = false;
             }
 
-            const cacheCount = getCtxCache().length;
-
             if (!arr.length) {
-                ctxStat.textContent =
-                    '대화를 못 잡았어요 😅 채팅을 위로 한 번 스크롤한 뒤 다시 눌러보세요.\n'
-                    + '현재 채팅방 캐시: ' + cacheCount + '개';
+                ctxStat.textContent = '대화를 못 잡았어요 😅 페이지를 새로고침한 뒤 다시 눌러보세요.';
                 return;
             }
 
             const detectedCount = document.querySelectorAll('[data-message-group-id] .wrtn-markdown').length;
 
             ctxStat.textContent =
-                arr.length + '개 참고 예정 / 현재 채팅방 캐시 ' + cacheCount + '개'
-                + ' / DOM 메시지 ' + detectedCount + '개 감지\n'
+                arr.length + '개 참고 예정 / DOM 메시지 ' + detectedCount + '개 감지\n'
                 + arr.map((m, i) => (i + 1) + '. ' + (m.length > 120 ? m.slice(0, 120) + '…' : m)).join('\n');
-        });
-
-        $('#se-ctx-clear').addEventListener('click', () => {
-            clearCtxCache();
-            ctxStat.textContent = '현재 채팅방의 최근 대화 맥락 캐시를 비웠어요 🧹';
         });
 
         function populateModels(list, selected) {
@@ -2782,6 +2779,7 @@
         });
 
         fab.addEventListener('pointermove', e => {
+            if (isMobilePointer) return;
             if (!fabDrag || e.pointerId !== fabId) return;
 
             if (Math.abs(e.clientX - fabSX) + Math.abs(e.clientY - fabSY) > 6) {
@@ -2838,7 +2836,7 @@
         fab.addEventListener('pointercancel', fabEnd);
 
         window.addEventListener('resize', () => {
-            clampFab(true);
+            if (!isMobilePointer) clampFab(true);
         });
 
         let statusTimer = null;
@@ -3111,7 +3109,7 @@
 
         injectStyle();
         buildUI();
-        // 모바일 성능: 전체 문서를 상시 감시하지 않고, 미리보기/생성 버튼을 누를 때만 맥락을 읽는다.
+        // 초경량 모드: 전체 문서 상시 감시를 사용하지 않는다.
     }
 
     if (document.readyState === 'loading') {
