@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini)
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.9
+// @version      6.12.10
 // @author       me
 // @description  대사칸/행동칸 분리, 페르소나/문체 다중 저장, 1인칭/3인칭 전환, 최근 대화 맥락 참고(wrtn-markdown 기준 최신 턴 정확 인식), 턴 배너 자동 제외, 채팅방별 최근 대화 캐시, 크랙 채팅창 직접 입력.
 // @match        https://crack.wrtn.ai/*
@@ -1932,12 +1932,25 @@
             border-radius: 10px !important;
             contain: layout paint style;
         }
-        #se-head,
-        #se-go,
-        #se-insert,
-        #se-fab {
-            background-image: none !important;
-            box-shadow: none !important;
+        /* 버튼의 그라데이션은 유지한다.
+           기존 초경량화 코드가 background-image를 지우면서
+           배경이 투명해져 버튼이 검게/이상하게 보이던 문제를 수정. */
+        #se-head {
+            background: linear-gradient(135deg,#2a2d3a,#23262f) !important;
+        }
+        #se-go {
+            background: linear-gradient(135deg,#6c7bff,#8a5cff) !important;
+            color: #fff !important;
+            min-height: 44px;
+        }
+        #se-go:disabled {
+            background: #44485a !important;
+            color: #c8cad4 !important;
+        }
+        #se-insert {
+            background: linear-gradient(135deg,#3ecf8e,#2fb3c0) !important;
+            color: #07241c !important;
+            min-height: 44px;
         }
         #se-fab {
             width: 54px !important;
@@ -1977,7 +1990,7 @@
 
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.9</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.10</span>
                 <button id="se-gear" title="설정">⚙️</button>
                 <button id="se-min" title="닫기">✕</button>
             </div>
