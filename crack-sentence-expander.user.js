@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 시작채팅/캐시 핫픽스
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.15
+// @version      6.12.16
 // @author       me
-// @description  v6.12.13 전체 기능 + 특수 시작채팅 감지 + 맥락 미리보기 교체 + 채팅방별 캐시 지우기
+// @description  v6.12.13 전체 기능 + 시작 상황 카드 전체 감지 + 맥락 미리보기 교체 + 채팅방별 캐시 지우기
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -20,7 +20,7 @@
     'use strict';
 
     /*
-     * v6.12.15 핫픽스
+     * v6.12.16 핫픽스
      *
      * 원본 v6.12.13의 모든 기능은 @require로 그대로 실행한다.
      * 이 아래 코드는 원본 내부 함수를 건드리지 않고 다음만 보강한다.
@@ -29,9 +29,10 @@
      * 2) SPA 방식으로 채팅방을 이동해도 새 방의 시작 메시지를 다시 저장
      * 3) 스트리밍 중간 조각이 캐시에 쌓이지 않도록 정리
      * 4) 일반 말풍선 구조가 아닌 첫 시작 화면의 텍스트도 수집
-     * 5) 원본 맥락 미리보기 버튼을 새 수집기로 교체
-     * 6) 설정의 "이 채팅방 캐시 지우기" 버튼 복구
-     * 7) document.body 전체를 상시 감시하지 않고 채팅 영역만 감시
+     * 5) 입력창 위의 큰 '시작 상황/프롤로그 카드'를 한 덩어리로 수집
+     * 6) 원본 맥락 미리보기 버튼을 새 수집기로 교체
+     * 7) 설정의 "이 채팅방 캐시 지우기" 버튼 복구
+     * 8) document.body 전체를 상시 감시하지 않고 채팅 영역만 감시
      */
 
     const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room';
@@ -400,7 +401,176 @@
             }
         }
 
+        /*
+         * 노란색/갈색 배경으로 표시되는 '시작 상황 카드'는
+         * 메시지 그룹도 wrtn-markdown도 아닐 수 있다.
+         * 입력창 바로 위의 큰 본문 카드를 찾아 전체를 한 문맥으로 저장한다.
+         */
+        const scenarioCards = collectScenarioCards();
+
+        for (const cardText of scenarioCards) {
+            collected.push(cardText);
+        }
+
         return uniqueLines(collected);
+    }
+
+    function collectScenarioCards() {
+        const panel = document.getElementById('se-panel');
+        const input = findPageChatInput();
+
+        if (!input) return [];
+
+        const root =
+            findConversationRootFromInput(input) ||
+            document.querySelector('main') ||
+            document.body;
+
+        if (!root) return [];
+
+        const inputRect = input.getBoundingClientRect();
+        const inputTop = inputRect.top;
+        const candidates = [];
+
+        const elements = Array.from(root.querySelectorAll(
+            'article, section, [role="article"], div'
+        ));
+
+        for (const el of elements) {
+            if (!el || el === root) continue;
+            if (panel && panel.contains(el)) continue;
+
+            if (el.closest(
+                '#se-panel, nav, header, footer, aside, button,' +
+                'textarea, input, select, script, style'
+            )) {
+                continue;
+            }
+
+            if (el.contains(input)) continue;
+            if (!isElementVisible(el)) continue;
+
+            const rect = el.getBoundingClientRect();
+
+            // 시작 상황 카드는 입력창 위에 있어야 한다.
+            if (rect.top >= inputTop) continue;
+            if (rect.bottom > inputTop + 30) continue;
+
+            // 버튼 한 줄이나 작은 UI 조각 제외
+            if (rect.width < Math.min(220, window.innerWidth * 0.48)) continue;
+            if (rect.height < 90) continue;
+
+            let text = cleanContextLine(
+                el.innerText || el.textContent || ''
+            );
+
+            if (text.length < 120 || text.length > 14000) continue;
+
+            // 상단 메뉴나 페이지 전체 래퍼가 섞인 후보 제외
+            const uiNoise = [
+                '앱에서 더 편하게',
+                '다운로드',
+                'AI 요약',
+                '프로챗',
+                '메시지 보내기',
+                '문장 부풀리기',
+                'API 비용 추정',
+                '유저 페르소나',
+                '기본 설정',
+                '설정 동기화'
+            ];
+
+            const noiseCount = uiNoise.reduce((count, word) => {
+                return count + (text.includes(word) ? 1 : 0);
+            }, 0);
+
+            if (noiseCount >= 2) continue;
+
+            /*
+             * 페이지 전체를 감싼 거대한 컨테이너는 제외한다.
+             * 다만 긴 시작 상황 카드는 허용한다.
+             */
+            if (
+                rect.width > window.innerWidth * 0.98 &&
+                rect.height > window.innerHeight * 0.92
+            ) {
+                continue;
+            }
+
+            const childCandidates = Array.from(el.children || [])
+                .filter(child => {
+                    if (!isElementVisible(child)) return false;
+
+                    const childText = cleanContextLine(
+                        child.innerText || child.textContent || ''
+                    );
+
+                    return childText.length >= Math.max(100, text.length * 0.72);
+                });
+
+            /*
+             * 거의 같은 본문을 가진 더 안쪽 자식이 있으면
+             * 바깥 래퍼는 후보에서 제외한다.
+             */
+            if (childCandidates.length) continue;
+
+            const distance = Math.max(0, inputTop - rect.bottom);
+            const depth = getElementDepth(el);
+
+            const score =
+                Math.min(text.length, 6000) / 12
+                + Math.min(rect.height, 1200) / 8
+                + depth * 4
+                - distance / 8
+                - noiseCount * 200;
+
+            candidates.push({
+                el,
+                text,
+                rect,
+                score
+            });
+        }
+
+        candidates.sort((a, b) => b.score - a.score);
+
+        const chosen = [];
+
+        for (const candidate of candidates) {
+            if (chosen.length >= 2) break;
+
+            const overlaps = chosen.some(selected => {
+                const a = candidate.rect;
+                const b = selected.rect;
+
+                const horizontal =
+                    Math.min(a.right, b.right) - Math.max(a.left, b.left);
+                const vertical =
+                    Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+
+                return horizontal > 0 && vertical > 0;
+            });
+
+            if (overlaps) continue;
+
+            chosen.push(candidate);
+        }
+
+        return chosen
+            .sort((a, b) => a.rect.top - b.rect.top)
+            .map(item => item.text);
+    }
+
+    function getElementDepth(el) {
+        let depth = 0;
+        let current = el;
+
+        while (current && current !== document.body) {
+            depth += 1;
+            current = current.parentElement;
+        }
+
+        return depth;
     }
 
     function isElementVisible(el) {
@@ -605,7 +775,7 @@
         const title = panel.querySelector('#se-title');
         if (title) {
             title.textContent = (title.textContent || '')
-                .replace(/v6\.12\.(?:13|14)/g, 'v6.12.15');
+                .replace(/v6\.12\.(?:13|14|15)/g, 'v6.12.16');
         }
 
         let previewButton = panel.querySelector('#se-ctx-test');
@@ -630,7 +800,7 @@
 
                 GM_setValue('se_ctx_n', n);
                 previewButton.disabled = true;
-                setContextStatus('첫 시작채팅까지 다시 찾는 중이에요…', false);
+                setContextStatus('시작 상황 카드와 최근 채팅을 같이 읽는 중이에요…', false);
 
                 setTimeout(() => {
                     try {
@@ -644,8 +814,8 @@
 
                         if (!arr.length) {
                             setContextStatus(
-                                '아직 대화를 못 잡았어요 😢\n' +
-                                '현재 화면에서 시작문구가 보이게 둔 뒤 한 번 더 눌러보세요.',
+                                '아직 시작 상황을 못 잡았어요 😢\n' +
+                                '노란 상황 카드와 메시지 입력창이 함께 보이게 둔 뒤 다시 눌러보세요.',
                                 true
                             );
                             return;
@@ -653,7 +823,7 @@
 
                         setContextStatus(
                             arr.length + '개 참고 예정 (요청 ' + n + '개)' +
-                            ' / 현재 화면 후보 ' + visible.length +
+                            ' / 화면 문맥 후보 ' + visible.length +
                             '개 / 누적 캐시 ' + getCtxCache().length + '개\n' +
                             arr.map((text, index) => {
                                 const short = text.length > 150
