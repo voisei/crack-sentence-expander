@@ -1,64 +1,594 @@
 // ==UserScript==
-// @name         크랙 문장 부풀리기 (Gemini) · 단독 실행판
+// @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.20
+// @version      6.12.21
 // @author       me
-// @description  Gemini 문장 부풀리기 단독 본체. 대사/행동, 길이, 시점, 복사, 채팅창 삽입, 모바일 토글 포함.
+// @description  대사/행동 분리, 페르소나 자동추천·3칸, 문체 3칸, 모델 드롭다운, 최근 대화 맥락·캐시, 비용 추적, 설정 동기화, 모바일 토글/패널 위치 제한.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @connect      generativelanguage.googleapis.com
+// @homepageURL  https://github.com/voisei/crack-sentence-expander
+// @supportURL   https://github.com/voisei/crack-sentence-expander/issues
+// @license      MIT
 // @run-at       document-idle
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    const K_KEY = 'se_standalone_api_key';
-    const K_MODEL = 'se_standalone_model';
-    const K_POV = 'se_standalone_pov';
-    const K_LENGTH = 'se_standalone_length';
-    const K_OPEN = 'se_standalone_open';
-    const K_PANEL_POS = 'se_standalone_panel_pos';
-    const K_FAB_POS = 'se_standalone_fab_pos';
+    /* =========================
+     * 저장 키
+     * ========================= */
+    const K_APIKEY = 'se_gemini_key';
+    const K_MODEL = 'se_gemini_model';
+    const K_MODELLIST = 'se_model_list';
 
-    const PANEL_ID = 'se-standalone-panel';
-    const FAB_ID = 'se-standalone-fab';
+    const K_PERSONAS = 'se_personas';
+    const K_PERSONA_HINT = 'se_persona_hint';
+    const K_STYLES = 'se_styles';
+
+    const K_NAME = 'se_name';
+    const K_POV = 'se_pov';
+    const K_LENGTH = 'se_length';
+
+    const K_POS = 'se_panel_pos';
+    const K_FABPOS = 'se_fab_pos2';
+    const K_OPEN = 'se_panel_open';
+
+    const K_CTX_ON = 'se_ctx_on';
+    const K_CTX_N = 'se_ctx_n';
+    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room';
+
+    const K_COST_ON = 'se_cost_on';
+    const K_COST_USDKRW = 'se_cost_usdkrw';
+    const K_COST_TOTAL_USD = 'se_cost_total_usd';
+    const K_COST_TOTAL_IN = 'se_cost_total_input_tokens';
+    const K_COST_TOTAL_OUT = 'se_cost_total_output_tokens';
+    const K_COST_REQ_COUNT = 'se_cost_request_count';
+    const K_COST_LOG = 'se_cost_log';
+
+    const PANEL_ID = 'se-panel';
+    const FAB_ID = 'se-fab';
     const EDGE = 12;
+    const PERSONA_SLOTS = 3;
+    const STYLE_SLOTS = 3;
+    const CTX_CACHE_LIMIT = 300;
 
-    const LENGTH_GUIDES = {
-        three: '대사와 서술을 합쳐 3문장 안팎으로 짧고 압축적으로.',
-        short: '간결하게 핵심만 자연스럽게 살을 붙여서.',
-        medium: '감각 묘사와 감정을 적당히 풀어 자연스러운 분량으로.',
-        long: '풍부한 문학적 묘사와 내면 묘사를 충분히 펼쳐 길게.'
+    const DEFAULT_MODELS = [
+        { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
+        { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
+        { id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash-Lite' }
+    ];
+
+    const LENGTHS = {
+        three: {
+            label: '세줄',
+            guide: '대사와 서술을 합쳐 3문장 안팎으로 짧고 압축적으로.'
+        },
+        short: {
+            label: '짧게',
+            guide: '간결하게 핵심만 자연스럽게 살을 붙여서.'
+        },
+        medium: {
+            label: '중간',
+            guide: '감각 묘사와 감정을 적당히 풀어 자연스러운 분량으로.'
+        },
+        long: {
+            label: '길게',
+            guide: '풍부한 문학적 묘사와 내면 묘사를 충분히 펼쳐 길게.'
+        }
     };
 
-    function buildPrompt(dialogue, action, pov, length) {
-        const firstPerson = pov !== 'third';
+    let contextObserver = null;
+    let contextScanTimer = null;
+    let routeTimer = null;
+    let lastUrl = location.href;
 
-        const system = [
-            '너는 롤플레이 캐릭터 채팅에서 유저 캐릭터의 대사와 행동을 문학적으로 확장하는 글쓰기 보조다.',
-            '직전 상대 캐릭터의 반응을 새로 창작하지 말고 오직 유저 캐릭터의 대사, 행동, 감정, 감각만 쓴다.',
-            '새 사건이나 설정을 멋대로 추가하지 않는다.',
-            '행동이 이미 진행 중인 표현이면 시작 전으로 되감지 말고 현재 진행 중인 순간부터 묘사한다.',
-            '',
-            '[시점]',
-            firstPerson
-                ? '- 1인칭으로 쓴다. 나/내가를 사용한다.'
-                : '- 3인칭으로 쓴다. 그/그녀 또는 자연스러운 3인칭 표현을 사용한다.',
-            '',
-            '[형식]',
-            '- 실제로 말하는 내용은 큰따옴표 "..."로 감싼다.',
-            '- 행동, 감정, 감각, 서술은 *별표*로 감싼다.',
-            '- 서술 묶음과 대사 묶음 사이에는 빈 줄을 넣는다.',
-            '- 상대 캐릭터의 대사, 행동, 감정, 반응, 속마음은 쓰지 않는다.',
-            '- 같은 표현과 행동을 반복하지 않는다.',
-            '- 설명, 머리말, 코드블록 없이 완성된 본문만 출력한다.',
-            '',
-            '[길이]',
-            LENGTH_GUIDES[length] || LENGTH_GUIDES.medium
-        ].join('\n');
+    /* =========================
+     * 공통 유틸
+     * ========================= */
+    function isVisible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+
+        return (
+            rect.width > 2 &&
+            rect.height > 2 &&
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            style.opacity !== '0'
+        );
+    }
+
+    function getViewport() {
+        const vv = window.visualViewport;
+
+        return {
+            left: vv ? vv.offsetLeft : 0,
+            top: vv ? vv.offsetTop : 0,
+            width: vv ? vv.width : window.innerWidth,
+            height: vv ? vv.height : window.innerHeight
+        };
+    }
+
+    function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    function copyToClipboard(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            return navigator.clipboard.writeText(text);
+        }
+
+        return new Promise((resolve, reject) => {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+
+            try {
+                document.execCommand('copy');
+                resolve();
+            } catch (error) {
+                reject(error);
+            } finally {
+                ta.remove();
+            }
+        });
+    }
+
+    function b64encUtf8(value) {
+        return btoa(unescape(encodeURIComponent(value)));
+    }
+
+    function b64decUtf8(value) {
+        return decodeURIComponent(escape(atob(value)));
+    }
+
+    /* =========================
+     * 페르소나 / 문체 슬롯
+     * ========================= */
+    function normalizeSlots(raw, count, prefix) {
+        const result = [];
+
+        for (let i = 0; i < count; i++) {
+            const item = Array.isArray(raw) ? raw[i] : null;
+
+            result.push({
+                on: !!(item && item.on),
+                name: item && item.name ? String(item.name) : prefix + ' ' + (i + 1),
+                text: item && item.text ? String(item.text) : ''
+            });
+        }
+
+        return result;
+    }
+
+    function getPersonaSlots() {
+        return normalizeSlots(
+            GM_getValue(K_PERSONAS, []),
+            PERSONA_SLOTS,
+            '페르소나'
+        );
+    }
+
+    function getStyleSlots() {
+        return normalizeSlots(
+            GM_getValue(K_STYLES, []),
+            STYLE_SLOTS,
+            '문체'
+        );
+    }
+
+    function getActivePersona() {
+        return getPersonaSlots()
+            .filter(item => item.on && item.text.trim())
+            .map(item => {
+                const name = item.name.trim();
+                return (name ? '【' + name + '】\n' : '') + item.text.trim();
+            })
+            .join('\n\n');
+    }
+
+    function getActiveStyle() {
+        return getStyleSlots()
+            .filter(item => item.on && item.text.trim())
+            .map(item => {
+                const name = item.name.trim();
+                return (name ? '【' + name + '】\n' : '') + item.text.trim();
+            })
+            .join('\n\n');
+    }
+
+    /* =========================
+     * 맥락 수집 / 캐시
+     * ========================= */
+    function getCurrentChatCacheKey() {
+        return K_CTX_CACHE_BASE + '::' +
+            (location.pathname || '') +
+            (location.search || '') +
+            (location.hash || '');
+    }
+
+    function getCtxCache() {
+        const value = GM_getValue(getCurrentChatCacheKey(), []);
+        return Array.isArray(value) ? value : [];
+    }
+
+    function saveCtxCache(lines) {
+        const value = Array.isArray(lines) ? lines.slice(-CTX_CACHE_LIMIT) : [];
+        GM_setValue(getCurrentChatCacheKey(), value);
+    }
+
+    function clearCtxCache() {
+        saveCtxCache([]);
+    }
+
+    function cleanContextLine(text) {
+        return String(text || '')
+            .replace(/\/stories\/[^\s]+\/episodes\/[^\s]+/g, ' ')
+            .replace(/^\s*\[\s*턴\s*\d+\s*[|｜][^\]]*\]\s*/i, ' ')
+            .replace(/^\s*\[[^\]]*\d+\s*일차[^\]]*\]\s*/i, ' ')
+            .replace(/\b(?:복사|다시 생성|삭제|수정|공유)\b/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function isBadContextLine(line) {
+        if (!line || line.length < 2 || line.length > 6000) return true;
+
+        const exact = new Set([
+            '문장 부풀리기',
+            '대사',
+            '행동',
+            '1인칭',
+            '3인칭',
+            '세줄',
+            '짧게',
+            '중간',
+            '길게',
+            '문학적으로 늘리기',
+            '채팅창에 바로 넣기',
+            '복사',
+            '다시 뽑기',
+            '설정',
+            '저장',
+            '닫기',
+            '확인',
+            '취소',
+            '삭제',
+            '수정',
+            '뒤로',
+            '추가',
+            '최신순',
+            '오래된순',
+            '이 채팅방 캐시 지우기'
+        ]);
+
+        if (exact.has(line)) return true;
+        if (/^✨?\s*문장 부풀리기/.test(line)) return true;
+        if (/Gemini API|API 키|사용 가능한 모델|페르소나 자동추천/.test(line)) return true;
+        if (/최근 대화 맥락 참고|맥락 미리보기/.test(line)) return true;
+        if (/설정 동기화|내보내기|가져오기/.test(line)) return true;
+        if (/^\s*\[\s*턴\s*\d+\s*[|｜][^\]]*\]\s*$/.test(line)) return true;
+        if (/^\s*\[[^\]]*\d+\s*일차[^\]]*\]\s*$/.test(line)) return true;
+        if (/^[\s\W_]+$/.test(line)) return true;
+
+        return false;
+    }
+
+    function dropStreamingPrefixes(lines) {
+        const output = [];
+
+        for (const current of lines || []) {
+            while (output.length) {
+                const previous = output[output.length - 1];
+
+                if (
+                    current.length > previous.length &&
+                    current.startsWith(previous)
+                ) {
+                    output.pop();
+                    continue;
+                }
+
+                break;
+            }
+
+            output.push(current);
+        }
+
+        return output;
+    }
+
+    function uniqueContextLines(lines) {
+        const output = [];
+        const seen = new Set();
+
+        for (const raw of lines || []) {
+            const line = cleanContextLine(raw);
+
+            if (isBadContextLine(line) || seen.has(line)) continue;
+
+            seen.add(line);
+            output.push(line);
+        }
+
+        return dropStreamingPrefixes(output);
+    }
+
+    function rememberCtxLines(lines) {
+        const old = getCtxCache();
+        const merged = old.slice();
+        const recentSeen = new Set(old.slice(-80));
+
+        for (const line of uniqueContextLines(lines)) {
+            const last = merged[merged.length - 1];
+
+            if (last === line || recentSeen.has(line)) continue;
+
+            recentSeen.add(line);
+            merged.push(line);
+        }
+
+        saveCtxCache(dropStreamingPrefixes(merged));
+    }
+
+    function collectScenarioCards() {
+        const panel = document.getElementById(PANEL_ID);
+        const input = findChatInput();
+
+        if (!input) return [];
+
+        const root = document.querySelector('main') || document.body;
+        const inputTop = input.getBoundingClientRect().top;
+        const candidates = [];
+
+        for (const el of root.querySelectorAll('article, section, [role="article"], div')) {
+            if (!el || el === root) continue;
+            if (panel && panel.contains(el)) continue;
+            if (el.contains(input)) continue;
+            if (el.closest('nav, header, footer, aside, button, textarea, input, select, script, style')) continue;
+            if (!isVisible(el)) continue;
+
+            const rect = el.getBoundingClientRect();
+
+            if (rect.top >= inputTop || rect.bottom > inputTop + 30) continue;
+            if (rect.width < Math.min(220, window.innerWidth * 0.48)) continue;
+            if (rect.height < 90) continue;
+
+            const text = cleanContextLine(el.innerText || el.textContent || '');
+
+            if (text.length < 120 || text.length > 14000) continue;
+
+            const noisy = [
+                '앱에서 더 편하게',
+                '다운로드',
+                'AI 요약',
+                '프로챗',
+                '문장 부풀리기',
+                'API 비용 추정',
+                '기본 설정'
+            ].filter(word => text.includes(word)).length;
+
+            if (noisy >= 2) continue;
+
+            const innerEquivalent = Array.from(el.children || []).some(child => {
+                const childText = cleanContextLine(
+                    child.innerText || child.textContent || ''
+                );
+
+                return childText.length >= Math.max(100, text.length * 0.72);
+            });
+
+            if (innerEquivalent) continue;
+
+            candidates.push({
+                text,
+                top: rect.top,
+                score:
+                    Math.min(text.length, 6000) / 10 +
+                    Math.min(rect.height, 1200) / 8 -
+                    Math.max(0, inputTop - rect.bottom) / 8
+            });
+        }
+
+        return candidates
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 2)
+            .sort((a, b) => a.top - b.top)
+            .map(item => item.text);
+    }
+
+    function collectVisibleChatLines() {
+        const panel = document.getElementById(PANEL_ID);
+        const lines = [];
+
+        const markdowns = Array.from(
+            document.querySelectorAll('.wrtn-markdown')
+        ).filter(el => {
+            if (panel && panel.contains(el)) return false;
+            if (el.querySelector('.wrtn-markdown')) return false;
+            return true;
+        });
+
+        for (const el of markdowns) {
+            const line = cleanContextLine(el.innerText || el.textContent || '');
+            if (!isBadContextLine(line)) lines.push(line);
+        }
+
+        if (!lines.length) {
+            const groups = Array.from(
+                document.querySelectorAll('[data-message-group-id]')
+            ).filter(el => !panel || !panel.contains(el));
+
+            for (const group of groups) {
+                const textNodes = group.querySelectorAll(
+                    '.wrtn-markdown,' +
+                    '[class*="whitespace-pre-wrap"],' +
+                    '[class*="break-words"],' +
+                    '[data-testid*="message"],' +
+                    '[data-role*="message"]'
+                );
+
+                for (const el of textNodes) {
+                    if (el.querySelector('.wrtn-markdown')) continue;
+                    if (el.querySelector('textarea, input, button, select')) continue;
+
+                    const line = cleanContextLine(
+                        el.innerText || el.textContent || ''
+                    );
+
+                    if (!isBadContextLine(line)) lines.push(line);
+                }
+            }
+        }
+
+        lines.push(...collectScenarioCards());
+
+        return uniqueContextLines(lines);
+    }
+
+    function collectChatContext(maxN) {
+        const n = clamp(parseInt(maxN, 10) || 6, 1, 30);
+        const visible = collectVisibleChatLines();
+
+        rememberCtxLines(visible);
+
+        return uniqueContextLines([
+            ...getCtxCache(),
+            ...visible
+        ]).slice(-n);
+    }
+
+    function findChatRoot() {
+        const firstGroup = document.querySelector('[data-message-group-id]');
+
+        if (firstGroup) {
+            let root = firstGroup.parentElement;
+
+            for (let i = 0; root && root !== document.body && i < 8; i++) {
+                if (root.querySelectorAll('[data-message-group-id]').length >= 2) {
+                    return root;
+                }
+
+                root = root.parentElement;
+            }
+
+            return firstGroup.parentElement;
+        }
+
+        const markdown = Array.from(
+            document.querySelectorAll('.wrtn-markdown')
+        ).find(el => !el.closest('#' + PANEL_ID));
+
+        if (markdown) return markdown.parentElement;
+
+        return document.querySelector('main');
+    }
+
+    function attachContextObserver() {
+        if (contextObserver) {
+            contextObserver.disconnect();
+            contextObserver = null;
+        }
+
+        const root = findChatRoot();
+        if (!root) return;
+
+        contextObserver = new MutationObserver(() => {
+            if (contextScanTimer) clearTimeout(contextScanTimer);
+
+            contextScanTimer = setTimeout(() => {
+                rememberCtxLines(collectVisibleChatLines());
+            }, 1000);
+        });
+
+        contextObserver.observe(root, {
+            childList: true,
+            subtree: true,
+            characterData: true
+        });
+
+        rememberCtxLines(collectVisibleChatLines());
+    }
+
+    /* =========================
+     * 프롬프트
+     * ========================= */
+    function buildPrompt(dialogue, action, context) {
+        const pov = GM_getValue(K_POV, 'first');
+        const name = String(GM_getValue(K_NAME, '') || '').trim();
+        const length = GM_getValue(K_LENGTH, 'medium');
+        const persona = getActivePersona();
+        const style = getActiveStyle();
+
+        const lines = [
+            '너는 롤플레이 캐릭터 채팅에서 유저 캐릭터의 이번 대사와 행동을 문학적으로 확장하는 글쓰기 보조다.',
+            '직전 상대 캐릭터 출력에 이어지는 유저 캐릭터의 현재 반응을 작성한다.',
+            '이미 진행 중인 행동을 시작 전으로 되감지 않는다.',
+            '상대 캐릭터의 다음 대사, 행동, 속마음, 감정, 반응을 새로 쓰지 않는다.',
+            '새 사건과 설정을 입력 범위 밖으로 크게 만들지 않는다.'
+        ];
+
+        if (persona) {
+            lines.push('');
+            lines.push('[유저 캐릭터 페르소나]');
+            lines.push(persona);
+            lines.push('- 기본 성격과 말투에 활용하되 최근 맥락과 충돌하면 최근 맥락을 우선한다.');
+            lines.push('- 평소 옷차림이나 상태를 현재 사실처럼 억지로 되살리지 않는다.');
+        }
+
+        if (style) {
+            lines.push('');
+            lines.push('[문체 규칙]');
+            lines.push(style);
+            lines.push('- 위 문체 규칙을 적극 반영한다.');
+        }
+
+        if (context && context.length) {
+            lines.push('');
+            lines.push('[최근 채팅 맥락: 위가 과거, 아래가 최신]');
+            context.forEach((item, index) => {
+                lines.push(
+                    (index === context.length - 1 ? '· [가장 최신] ' : '· ') +
+                    item
+                );
+            });
+            lines.push('- 가장 최신 상대 출력의 질문, 행동, 표정, 분위기에 우선 반응한다.');
+            lines.push('- 이미 벌어진 상태 변화를 유지한다.');
+        }
+
+        lines.push('');
+        lines.push('[시점]');
+
+        if (pov === 'third') {
+            lines.push('- 3인칭 시점으로 쓴다.');
+            lines.push(
+                name
+                    ? '- 유저 캐릭터를 "' + name + '" 또는 자연스러운 3인칭 표현으로 지칭한다.'
+                    : '- 유저 캐릭터를 그/그녀 등 자연스러운 3인칭 표현으로 지칭한다.'
+            );
+            lines.push('- 나/내가로 쓰지 않는다.');
+        } else {
+            lines.push('- 1인칭 시점으로 쓰며 나/내가를 사용한다.');
+        }
+
+        lines.push('');
+        lines.push('[대사와 행동 처리]');
+        lines.push('- 대사 입력은 의미를 유지하며 자연스럽게 다듬어 큰따옴표 "..."로 감싼다.');
+        lines.push('- 행동 입력은 유저 캐릭터가 실제로 수행하는 장면으로 *별표* 안에 묘사한다.');
+        lines.push('- 진행형/상태형 행동은 이미 진행 중인 현재 순간부터 이어 쓴다.');
+        lines.push('- 대사와 서술 묶음은 서로 다른 줄에 쓰고 사이에 빈 줄을 넣는다.');
+        lines.push('- 같은 표현, 같은 감정, 같은 행동을 반복하지 않는다.');
+        lines.push('- 설명, 머리말, 코드블록 없이 완성된 본문만 출력한다.');
+        lines.push('- 길이: ' + (LENGTHS[length] || LENGTHS.medium).guide);
 
         const user = [
             '[대사]',
@@ -67,46 +597,166 @@
             '[행동]',
             action.trim() || '(없음)',
             '',
-            '위 규칙에 맞춰 유저 캐릭터의 본문만 출력해줘.'
+            '위 규칙대로 유저 캐릭터의 이번 반응 본문만 출력해줘.'
+        ].join('\n');
+
+        return {
+            system: lines.join('\n'),
+            user
+        };
+    }
+
+    function collectStoryDetail() {
+        const texts = [];
+        const seen = new Set();
+
+        const roots = Array.from(document.querySelectorAll(
+            '#story-detail-scroll .wrtn-markdown,' +
+            '#story-detail-scroll,' +
+            '[data-testid*="story-detail"],' +
+            '[class*="story-detail"]'
+        )).filter(isVisible);
+
+        for (const el of roots) {
+            let text = cleanContextLine(el.innerText || el.textContent || '');
+
+            if (!text || text.length < 10 || seen.has(text)) continue;
+            if (text.length > 12000) text = text.slice(0, 12000) + '…';
+
+            seen.add(text);
+            texts.push(text);
+        }
+
+        return texts.join('\n\n---\n\n');
+    }
+
+    function buildPersonaPrompt(keywords, storyDetail, recentContext) {
+        const system = [
+            '너는 롤플레이 캐릭터 채팅용 유저 캐릭터 페르소나를 만드는 설정 보조다.',
+            '제작자 설정, 상세 설명, 프롤로그와 최근 상황을 읽고 세계관에 자연스럽게 맞는 유저 캐릭터를 만든다.',
+            '상대 캐릭터나 NPC의 설정과 반응을 대신 확정하지 않는다.',
+            '한국어로 작성한다.',
+            '',
+            '[출력 형식]',
+            '# 캐릭터 이름 또는 한 줄 제목',
+            '## 기본 정보',
+            '## 성격',
+            '## 말투',
+            '## 배경',
+            '## 관계 · 목표',
+            '## 주의',
+            '- 각 항목은 문장 또는 - 불릿으로 작성한다.',
+            '- 코드블록, 표, 머리말, 설명은 쓰지 않는다.',
+            '- 현재 장면에서 바뀔 수 있는 옷차림·청결·자세·소지품은 고정 사실로 과도하게 단정하지 않는다.'
+        ].join('\n');
+
+        const user = [
+            '[사용자 키워드]',
+            keywords.trim() || '(없음)',
+            '',
+            '[제작자 설정 / 상세 설명]',
+            storyDetail.trim() || '(읽은 설정 없음)',
+            '',
+            '[최근 채팅 맥락]',
+            recentContext.length
+                ? recentContext.map(item => '· ' + item).join('\n')
+                : '(없음)',
+            '',
+            '위 자료를 바탕으로 페르소나 칸에 바로 넣을 완성형 페르소나만 출력해줘.'
         ].join('\n');
 
         return { system, user };
     }
 
-    function callGemini(dialogue, action, pov, length, onDone, onError) {
-        const key = String(GM_getValue(K_KEY, '') || '').trim();
-        const model = String(GM_getValue(K_MODEL, 'gemini-2.5-flash') || 'gemini-2.5-flash').trim();
+    /* =========================
+     * Gemini / 모델
+     * ========================= */
+    function fetchModels(onDone, onError) {
+        const apiKey = String(GM_getValue(K_APIKEY, '') || '').trim();
 
-        if (!key) {
-            onError('⚙️ 설정에서 Gemini API 키를 먼저 저장해 주세요.');
+        if (!apiKey) {
+            onError('API 키를 먼저 저장해 주세요.');
             return;
         }
 
-        if (!dialogue.trim() && !action.trim()) {
-            onError('대사나 행동 중 하나는 입력해 주세요.');
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url:
+                'https://generativelanguage.googleapis.com/v1beta/models' +
+                '?pageSize=200&key=' +
+                encodeURIComponent(apiKey),
+            timeout: 30000,
+            onload(response) {
+                if (response.status < 200 || response.status >= 300) {
+                    onError('모델 목록 조회 실패 (' + response.status + ')');
+                    return;
+                }
+
+                try {
+                    const data = JSON.parse(response.responseText);
+                    const models = (data.models || [])
+                        .filter(model => {
+                            return (model.supportedGenerationMethods || [])
+                                .includes('generateContent');
+                        })
+                        .filter(model => /gemini/i.test(model.name || ''))
+                        .map(model => ({
+                            id: String(model.name || '').replace(/^models\//, ''),
+                            label:
+                                model.displayName ||
+                                String(model.name || '').replace(/^models\//, '')
+                        }));
+
+                    if (!models.length) {
+                        onError('사용 가능한 Gemini 모델을 찾지 못했어요.');
+                        return;
+                    }
+
+                    onDone(models);
+                } catch (error) {
+                    onError('모델 목록 응답을 읽지 못했어요.');
+                }
+            },
+            onerror() {
+                onError('네트워크 오류예요.');
+            },
+            ontimeout() {
+                onError('모델 목록 요청 시간이 초과됐어요.');
+            }
+        });
+    }
+
+    function requestGemini(system, user, label, onDone, onError) {
+        const apiKey = String(GM_getValue(K_APIKEY, '') || '').trim();
+        const model = String(
+            GM_getValue(K_MODEL, DEFAULT_MODELS[0].id) ||
+            DEFAULT_MODELS[0].id
+        ).trim();
+
+        if (!apiKey) {
+            onError('API 키가 없어요. ⚙️ 설정에서 먼저 저장해 주세요.');
             return;
         }
 
-        const prompt = buildPrompt(dialogue, action, pov, length);
-        const url =
+        const endpoint =
             'https://generativelanguage.googleapis.com/v1beta/models/' +
             encodeURIComponent(model) +
             ':generateContent?key=' +
-            encodeURIComponent(key);
+            encodeURIComponent(apiKey);
 
         GM_xmlhttpRequest({
             method: 'POST',
-            url,
+            url: endpoint,
             headers: {
                 'Content-Type': 'application/json'
             },
             data: JSON.stringify({
                 system_instruction: {
-                    parts: [{ text: prompt.system }]
+                    parts: [{ text: system }]
                 },
                 contents: [{
                     role: 'user',
-                    parts: [{ text: prompt.user }]
+                    parts: [{ text: user }]
                 }],
                 generationConfig: {
                     maxOutputTokens: 8192
@@ -134,21 +784,35 @@
                     const output = candidate &&
                         candidate.content &&
                         Array.isArray(candidate.content.parts)
-                        ? candidate.content.parts.map(part => part.text || '').join('').trim()
+                        ? candidate.content.parts
+                            .map(part => part.text || '')
+                            .join('')
+                            .trim()
                         : '';
 
                     if (!output) {
-                        onError('응답이 비어 있어요. 모델이나 입력을 바꿔 다시 시도해 주세요.');
+                        const reason =
+                            (candidate && candidate.finishReason) ||
+                            (data.promptFeedback && data.promptFeedback.blockReason) ||
+                            '알 수 없음';
+
+                        onError('응답이 비어 있어요 (사유: ' + reason + ').');
                         return;
                     }
 
-                    onDone(output);
+                    const cost = recordCostUsage(
+                        model,
+                        data.usageMetadata,
+                        label
+                    );
+
+                    onDone(output, cost);
                 } catch (error) {
-                    onError('응답을 읽지 못했어요.');
+                    onError('API 응답을 읽지 못했어요.');
                 }
             },
             onerror() {
-                onError('네트워크 오류가 발생했어요.');
+                onError('네트워크 오류예요.');
             },
             ontimeout() {
                 onError('요청 시간이 초과됐어요.');
@@ -156,90 +820,246 @@
         });
     }
 
-    function getViewport() {
-        const vv = window.visualViewport;
+    /* =========================
+     * 비용 추정
+     * ========================= */
+    function getModelCostRates(modelId, inputTokens) {
+        const id = String(modelId || '').toLowerCase();
+        const over200k = Number(inputTokens || 0) > 200000;
+
+        if (id.includes('gemini-2.5-pro')) {
+            return {
+                input: over200k ? 2.50 : 1.25,
+                output: over200k ? 15.00 : 10.00,
+                label: over200k ? 'Gemini 2.5 Pro >200K' : 'Gemini 2.5 Pro'
+            };
+        }
+
+        if (id.includes('gemini-2.5-flash-lite')) {
+            return {
+                input: 0.10,
+                output: 0.40,
+                label: 'Gemini 2.5 Flash-Lite'
+            };
+        }
+
+        if (id.includes('gemini-2.5-flash')) {
+            return {
+                input: 0.30,
+                output: 2.50,
+                label: 'Gemini 2.5 Flash'
+            };
+        }
 
         return {
-            left: vv ? vv.offsetLeft : 0,
-            top: vv ? vv.offsetTop : 0,
-            width: vv ? vv.width : window.innerWidth,
-            height: vv ? vv.height : window.innerHeight
+            input: 1.50,
+            output: 9.00,
+            label: (modelId || '알 수 없는 모델') + ' · 임시 추정'
         };
     }
 
-    function clamp(value, min, max) {
-        return Math.max(min, Math.min(max, value));
+    function getUsageTokens(usage) {
+        const data = usage || {};
+
+        const input =
+            Number(data.promptTokenCount || 0) +
+            Number(data.cachedContentTokenCount || 0);
+
+        const output =
+            Number(data.candidatesTokenCount || 0) +
+            Number(data.thoughtsTokenCount || 0);
+
+        return {
+            input,
+            output,
+            total: Number(data.totalTokenCount || input + output)
+        };
     }
 
-    function clampElement(element, saveKey) {
-        if (!element || getComputedStyle(element).display === 'none') return;
+    function formatMoney(value) {
+        const number = Number(value || 0);
 
-        const viewport = getViewport();
-        const rect = element.getBoundingClientRect();
-        const width = rect.width || element.offsetWidth;
-        const height = rect.height || element.offsetHeight;
+        if (number < 1) return number.toFixed(2);
+        if (number < 1000) return number.toFixed(1);
 
-        let left = Number.parseFloat(element.style.left);
-        let top = Number.parseFloat(element.style.top);
-
-        if (!Number.isFinite(left)) left = rect.left;
-        if (!Number.isFinite(top)) top = rect.top;
-
-        if (
-            rect.right < viewport.left ||
-            rect.left > viewport.left + viewport.width ||
-            !Number.isFinite(left)
-        ) {
-            left = viewport.left + viewport.width - width - EDGE;
-        }
-
-        if (
-            rect.bottom < viewport.top ||
-            rect.top > viewport.top + viewport.height ||
-            !Number.isFinite(top)
-        ) {
-            top = viewport.top + EDGE;
-        }
-
-        left = clamp(
-            left,
-            viewport.left + EDGE,
-            Math.max(viewport.left + EDGE, viewport.left + viewport.width - width - EDGE)
-        );
-
-        top = clamp(
-            top,
-            viewport.top + EDGE,
-            Math.max(viewport.top + EDGE, viewport.top + viewport.height - Math.min(height, 80) - EDGE)
-        );
-
-        element.style.left = left + 'px';
-        element.style.top = top + 'px';
-        element.style.right = 'auto';
-        element.style.bottom = 'auto';
-
-        if (saveKey) {
-            GM_setValue(saveKey, { left, top });
-        }
+        return Math.round(number).toLocaleString('ko-KR');
     }
 
+    function getCostLog() {
+        const value = GM_getValue(K_COST_LOG, []);
+        return Array.isArray(value) ? value : [];
+    }
+
+    function recordCostUsage(modelId, usage, label) {
+        const tokens = getUsageTokens(usage);
+
+        if (!tokens.input && !tokens.output) return null;
+
+        const rates = getModelCostRates(modelId, tokens.input);
+        const usd =
+            (
+                tokens.input * rates.input +
+                tokens.output * rates.output
+            ) / 1000000;
+
+        const usdkrw = Math.max(
+            1,
+            parseFloat(GM_getValue(K_COST_USDKRW, 1400)) || 1400
+        );
+
+        const krw = usd * usdkrw;
+        const totalUsd =
+            (parseFloat(GM_getValue(K_COST_TOTAL_USD, 0)) || 0) + usd;
+
+        const totalIn =
+            (parseInt(GM_getValue(K_COST_TOTAL_IN, 0), 10) || 0) +
+            tokens.input;
+
+        const totalOut =
+            (parseInt(GM_getValue(K_COST_TOTAL_OUT, 0), 10) || 0) +
+            tokens.output;
+
+        const totalReq =
+            (parseInt(GM_getValue(K_COST_REQ_COUNT, 0), 10) || 0) + 1;
+
+        GM_setValue(K_COST_TOTAL_USD, totalUsd);
+        GM_setValue(K_COST_TOTAL_IN, totalIn);
+        GM_setValue(K_COST_TOTAL_OUT, totalOut);
+        GM_setValue(K_COST_REQ_COUNT, totalReq);
+
+        const entry = {
+            at: new Date().toLocaleString('ko-KR'),
+            label: label || '요청',
+            model: modelId,
+            modelLabel: rates.label,
+            input: tokens.input,
+            output: tokens.output,
+            usd,
+            krw
+        };
+
+        const log = getCostLog();
+        log.unshift(entry);
+        GM_setValue(K_COST_LOG, log.slice(0, 50));
+
+        return {
+            ...entry,
+            totalUsd,
+            totalKrw: totalUsd * usdkrw,
+            totalIn,
+            totalOut,
+            totalReq,
+            message:
+                '💸 이번 약 ₩' +
+                formatMoney(krw) +
+                ' / 누적 약 ₩' +
+                formatMoney(totalUsd * usdkrw)
+        };
+    }
+
+    function getCostTopText(lastInfo) {
+        if (!GM_getValue(K_COST_ON, true)) {
+            return '표시 꺼짐 · 비용 기록은 계속 누적돼요.';
+        }
+
+        const usdkrw = Math.max(
+            1,
+            parseFloat(GM_getValue(K_COST_USDKRW, 1400)) || 1400
+        );
+
+        const totalUsd =
+            parseFloat(GM_getValue(K_COST_TOTAL_USD, 0)) || 0;
+
+        const totalIn =
+            parseInt(GM_getValue(K_COST_TOTAL_IN, 0), 10) || 0;
+
+        const totalOut =
+            parseInt(GM_getValue(K_COST_TOTAL_OUT, 0), 10) || 0;
+
+        const totalReq =
+            parseInt(GM_getValue(K_COST_REQ_COUNT, 0), 10) || 0;
+
+        const last = lastInfo || getCostLog()[0];
+
+        const lines = [
+            '누적 약 ₩' +
+                formatMoney(totalUsd * usdkrw) +
+                ' · 요청 ' +
+                totalReq +
+                '회',
+            '입력 ' +
+                totalIn.toLocaleString('ko-KR') +
+                'tok · 출력 ' +
+                totalOut.toLocaleString('ko-KR') +
+                'tok'
+        ];
+
+        if (last) {
+            lines.push(
+                '최근: ' +
+                last.label +
+                ' · 약 ₩' +
+                formatMoney(last.krw)
+            );
+        }
+
+        return lines.join('\n');
+    }
+
+    function getCostSummaryText() {
+        const lines = [getCostTopText()];
+
+        const log = getCostLog().slice(0, 15);
+
+        if (log.length) {
+            lines.push('');
+            lines.push('최근 사용내역');
+
+            log.forEach((item, index) => {
+                lines.push(
+                    (index + 1) +
+                    '. ' +
+                    item.at +
+                    ' · ' +
+                    item.label +
+                    ' · ' +
+                    item.modelLabel +
+                    ' · 약 ₩' +
+                    formatMoney(item.krw)
+                );
+            });
+        } else {
+            lines.push('');
+            lines.push('아직 기록된 요청이 없어요.');
+        }
+
+        lines.push('');
+        lines.push(
+            '※ Standard 단가 기반의 대략값이며 무료 티어, 캐시, 세금, 실제 환율은 다를 수 있어요.'
+        );
+
+        return lines.join('\n');
+    }
+
+    function resetCostStats() {
+        GM_setValue(K_COST_TOTAL_USD, 0);
+        GM_setValue(K_COST_TOTAL_IN, 0);
+        GM_setValue(K_COST_TOTAL_OUT, 0);
+        GM_setValue(K_COST_REQ_COUNT, 0);
+        GM_setValue(K_COST_LOG, []);
+    }
+
+    /* =========================
+     * 채팅 입력
+     * ========================= */
     function findChatInput() {
         const panel = document.getElementById(PANEL_ID);
 
         const candidates = Array.from(document.querySelectorAll(
             'textarea, [contenteditable="true"], [contenteditable=""]'
-        )).filter(element => {
-            if (panel && panel.contains(element)) return false;
-
-            const rect = element.getBoundingClientRect();
-            const style = getComputedStyle(element);
-
-            return (
-                rect.width > 20 &&
-                rect.height > 15 &&
-                style.display !== 'none' &&
-                style.visibility !== 'hidden'
-            );
+        )).filter(el => {
+            if (panel && panel.contains(el)) return false;
+            return isVisible(el);
         });
 
         candidates.sort((a, b) => {
@@ -249,345 +1069,627 @@
         return candidates[0] || null;
     }
 
-    function setChatValue(element, text) {
-        if (!element) return false;
+    function insertIntoChat(text) {
+        const el = findChatInput();
 
-        if (element.tagName === 'TEXTAREA' || element.tagName === 'INPUT') {
-            const prototype = element.tagName === 'TEXTAREA'
-                ? window.HTMLTextAreaElement.prototype
-                : window.HTMLInputElement.prototype;
+        if (!el) return false;
 
-            const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+            const prototype =
+                el.tagName === 'TEXTAREA'
+                    ? window.HTMLTextAreaElement.prototype
+                    : window.HTMLInputElement.prototype;
+
+            const descriptor =
+                Object.getOwnPropertyDescriptor(prototype, 'value');
 
             if (descriptor && descriptor.set) {
-                descriptor.set.call(element, text);
+                descriptor.set.call(el, text);
             } else {
-                element.value = text;
+                el.value = text;
             }
 
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-            element.dispatchEvent(new Event('change', { bubbles: true }));
-            return true;
-        }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        } else {
+            el.focus();
+            el.textContent = text;
 
-        element.focus();
-        element.textContent = text;
+            try {
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType: 'insertText',
+                    data: text
+                }));
+            } catch (_) {
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        }
 
         try {
-            element.dispatchEvent(new InputEvent('input', {
-                bubbles: true,
-                inputType: 'insertText',
-                data: text
-            }));
-        } catch (_) {
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-        }
+            el.blur();
+        } catch (_) {}
 
         return true;
     }
 
-    function copyText(text) {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-            return navigator.clipboard.writeText(text);
+    /* =========================
+     * UI 스타일
+     * ========================= */
+    const CSS = `
+        #${PANEL_ID}, #${FAB_ID}, #${PANEL_ID} * {
+            box-sizing: border-box;
+            font-family: Pretendard, "Noto Sans KR", system-ui, sans-serif;
         }
 
-        return new Promise((resolve, reject) => {
-            const area = document.createElement('textarea');
-            area.value = text;
-            area.style.position = 'fixed';
-            area.style.opacity = '0';
-            document.body.appendChild(area);
-            area.select();
+        #${PANEL_ID} {
+            position: fixed;
+            z-index: 2147483646;
+            width: 326px;
+            max-width: calc(100vw - 24px);
+            max-height: calc(100dvh - 24px);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            color: #eceef6;
+            background: #1d1f27;
+            border: 1px solid #363b4d;
+            border-radius: 15px;
+            box-shadow: 0 12px 40px rgba(0,0,0,.45);
+            font-size: 13px;
+        }
 
-            try {
-                document.execCommand('copy');
-                resolve();
-            } catch (error) {
-                reject(error);
-            } finally {
-                area.remove();
-            }
-        });
-    }
+        #se-head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 45px;
+            padding: 9px 11px;
+            cursor: grab;
+            touch-action: none;
+            user-select: none;
+            background: linear-gradient(135deg,#2a2d3a,#23262f);
+            border-bottom: 1px solid #363b4d;
+        }
 
-    function injectStyle() {
-        if (document.getElementById('se-standalone-style')) return;
+        #se-title {
+            flex: 1;
+            font-size: 12px;
+            font-weight: 850;
+        }
 
-        const style = document.createElement('style');
-        style.id = 'se-standalone-style';
-        style.textContent = `
-            #${PANEL_ID}, #${FAB_ID}, #${PANEL_ID} * {
-                box-sizing: border-box;
-                font-family: Pretendard, "Noto Sans KR", system-ui, sans-serif;
-            }
+        #se-head button {
+            border: 0;
+            padding: 3px 5px;
+            background: transparent;
+            color: #fff;
+            font-size: 16px;
+            cursor: pointer;
+        }
 
+        #se-body,
+        #se-settings {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-height: 0;
+            padding: 10px;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        #se-settings {
+            display: none;
+        }
+
+        #se-settings.show {
+            display: flex;
+        }
+
+        #se-body.hide {
+            display: none;
+        }
+
+        .se-label {
+            margin: 0 2px -4px;
+            color: #a9aec1;
+            font-size: 11px;
+            font-weight: 750;
+        }
+
+        #${PANEL_ID} textarea,
+        #${PANEL_ID} input,
+        #${PANEL_ID} select {
+            width: 100%;
+            min-width: 0;
+            border: 1px solid #363b4d;
+            border-radius: 9px;
+            padding: 8px;
+            background: #14161c;
+            color: #eceef6;
+            font-size: 12px;
+        }
+
+        #${PANEL_ID} textarea {
+            min-height: 50px;
+            resize: vertical;
+            line-height: 1.5;
+        }
+
+        #se-dialogue {
+            border-left: 3px solid #5fd0c3 !important;
+        }
+
+        #se-action {
+            border-left: 3px solid #c8a6ff !important;
+        }
+
+        .se-tabs {
+            display: flex;
+            gap: 4px;
+            padding: 3px;
+            border-radius: 9px;
+            background: #14161c;
+        }
+
+        .se-tabs button {
+            flex: 1;
+            border: 0;
+            border-radius: 7px;
+            padding: 7px 2px;
+            background: transparent;
+            color: #9da2b6;
+            font-size: 11px;
+            font-weight: 750;
+            cursor: pointer;
+        }
+
+        .se-tabs button.active {
+            background: #41475c;
+            color: #fff;
+        }
+
+        #se-go,
+        #se-insert,
+        #se-save {
+            width: 100%;
+            min-height: 42px;
+            border: 0;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 850;
+            cursor: pointer;
+        }
+
+        #se-go {
+            color: #fff;
+            background: linear-gradient(135deg,#6c7bff,#8a5cff);
+        }
+
+        #se-insert {
+            display: none;
+            color: #07241c;
+            background: linear-gradient(135deg,#3ecf8e,#2fb3c0);
+        }
+
+        #se-save {
+            color: #fff;
+            background: #6c7bff;
+        }
+
+        #se-go:disabled,
+        #se-persona-suggest:disabled,
+        #se-fetch:disabled {
+            opacity: .6;
+            cursor: default;
+        }
+
+        #se-status,
+        #se-fetch-status,
+        #se-persona-status,
+        #se-ctx-status,
+        #se-sync-status {
+            min-height: 15px;
+            color: #9da2b6;
+            white-space: pre-wrap;
+            font-size: 11px;
+            line-height: 1.45;
+        }
+
+        .err {
+            color: #ff9292 !important;
+        }
+
+        #se-output {
+            display: none;
+            min-height: 44px;
+            max-height: 38vh;
+            overflow-y: auto;
+            padding: 10px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.65;
+            border: 1px solid #363b4d;
+            border-radius: 9px;
+            background: #14161c;
+        }
+
+        #se-output.show,
+        #se-insert.show,
+        #se-result-buttons.show {
+            display: block;
+        }
+
+        #se-result-buttons {
+            display: none;
+        }
+
+        .se-btn-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .se-btn-row button,
+        .se-secondary {
+            flex: 1;
+            min-height: 38px;
+            border: 1px solid #464c61;
+            border-radius: 9px;
+            padding: 7px;
+            background: #252833;
+            color: #e6e8f0;
+            font-size: 11px;
+            font-weight: 750;
+            cursor: pointer;
+        }
+
+        #se-cost-top {
+            padding: 8px;
+            white-space: pre-wrap;
+            border: 1px solid rgba(244,114,182,.35);
+            border-radius: 11px;
+            background: rgba(244,114,182,.08);
+            color: #f5f7ff;
+            font-size: 10.5px;
+            line-height: 1.45;
+        }
+
+        details.se-section {
+            border: 1px solid rgba(148,163,184,.22);
+            border-radius: 11px;
+            background: rgba(255,255,255,.025);
+            overflow: hidden;
+        }
+
+        details.se-section > summary {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            list-style: none;
+            padding: 9px;
+            cursor: pointer;
+            color: #f4f5fa;
+            font-size: 12px;
+            font-weight: 800;
+        }
+
+        details.se-section > summary::-webkit-details-marker {
+            display: none;
+        }
+
+        details.se-section > summary::after {
+            content: "열기";
+            padding: 2px 7px;
+            border: 1px solid #454b60;
+            border-radius: 999px;
+            color: #aeb3c5;
+            font-size: 10px;
+        }
+
+        details.se-section[open] > summary::after {
+            content: "닫기";
+        }
+
+        .se-section-body {
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+            padding: 8px;
+            border-top: 1px solid rgba(148,163,184,.17);
+        }
+
+        .se-slot {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            padding: 7px;
+            border: 1px solid #363b4d;
+            border-radius: 9px;
+            background: #181a21;
+        }
+
+        .se-slot-head,
+        .se-inline {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        #${PANEL_ID} input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            flex: 0 0 auto;
+            padding: 0;
+            accent-color: #6c7bff;
+        }
+
+        .se-slot-name {
+            flex: 1 1 130px;
+        }
+
+        .se-inline-number {
+            width: 72px !important;
+            flex: 0 0 auto;
+            text-align: center;
+        }
+
+        #se-cost-detail {
+            max-height: 150px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            color: #aeb3c5;
+            font-size: 10.5px;
+            line-height: 1.45;
+        }
+
+        #se-sync-box {
+            min-height: 70px !important;
+        }
+
+        #${FAB_ID} {
+            position: fixed;
+            z-index: 2147483647;
+            display: flex !important;
+            align-items: center;
+            justify-content: center;
+            width: 58px;
+            height: 58px;
+            border: 3px solid #fff;
+            border-radius: 50%;
+            background: #ff3a98;
+            color: #fff;
+            box-shadow: 0 6px 20px rgba(0,0,0,.45);
+            font-size: 23px;
+            cursor: pointer;
+            touch-action: none;
+            user-select: none;
+        }
+
+        @media (pointer: coarse), (max-width: 700px) {
             #${PANEL_ID} {
-                position: fixed;
-                z-index: 2147483646;
-                width: 330px;
-                max-width: calc(100vw - 24px);
+                width: min(326px, calc(100vw - 24px));
                 max-height: calc(100dvh - 24px);
-                display: flex;
-                flex-direction: column;
-                overflow: hidden;
-                color: #f7f7fb;
-                background: #1c1e26;
-                border: 1px solid #414657;
-                border-radius: 15px;
-                box-shadow: 0 12px 38px rgba(0,0,0,.45);
-            }
-
-            #se-s-head {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                min-height: 46px;
-                padding: 9px 11px;
-                background: #292c38;
-                border-bottom: 1px solid #414657;
-                cursor: grab;
-                touch-action: none;
-                user-select: none;
-            }
-
-            #se-s-title {
-                flex: 1;
-                font-size: 13px;
-                font-weight: 800;
-            }
-
-            #se-s-head button {
-                border: 0;
-                background: transparent;
-                color: #fff;
-                font-size: 17px;
-                cursor: pointer;
-            }
-
-            #se-s-body, #se-s-settings {
-                display: flex;
-                flex-direction: column;
-                gap: 8px;
-                padding: 10px;
-                overflow-y: auto;
-            }
-
-            #se-s-settings {
-                display: none;
-            }
-
-            #se-s-settings.show {
-                display: flex;
-            }
-
-            #se-s-body.hide {
-                display: none;
-            }
-
-            #${PANEL_ID} textarea,
-            #${PANEL_ID} input,
-            #${PANEL_ID} select {
-                width: 100%;
-                border: 1px solid #414657;
-                border-radius: 9px;
-                padding: 9px;
-                background: #12141a;
-                color: #fff;
-                font-size: 13px;
-            }
-
-            #${PANEL_ID} textarea {
-                min-height: 58px;
-                resize: vertical;
-                line-height: 1.5;
-            }
-
-            .se-s-label {
-                margin: 1px 2px -4px;
-                color: #b5b8c7;
-                font-size: 11px;
-                font-weight: 750;
-            }
-
-            .se-s-tabs {
-                display: flex;
-                gap: 4px;
-                padding: 3px;
-                background: #12141a;
-                border-radius: 9px;
-            }
-
-            .se-s-tabs button {
-                flex: 1;
-                padding: 7px 4px;
-                border: 0;
-                border-radius: 7px;
-                background: transparent;
-                color: #a8abba;
-                font-size: 12px;
-                font-weight: 700;
-                cursor: pointer;
-            }
-
-            .se-s-tabs button.active {
-                background: #484e65;
-                color: #fff;
-            }
-
-            #se-s-run, #se-s-insert, #se-s-save {
-                width: 100%;
-                min-height: 43px;
-                border: 0;
                 border-radius: 10px;
-                font-size: 13px;
-                font-weight: 850;
-                cursor: pointer;
-            }
-
-            #se-s-run {
-                background: linear-gradient(135deg,#6d7cff,#945cff);
-                color: #fff;
-            }
-
-            #se-s-insert {
-                display: none;
-                background: linear-gradient(135deg,#43d49a,#32b8c6);
-                color: #062a20;
-            }
-
-            #se-s-save {
-                background: #6d7cff;
-                color: #fff;
-            }
-
-            #se-s-output {
-                display: none;
-                min-height: 50px;
-                max-height: 38vh;
-                overflow-y: auto;
-                padding: 10px;
-                white-space: pre-wrap;
-                word-break: break-word;
-                line-height: 1.65;
-                border: 1px solid #414657;
-                border-radius: 9px;
-                background: #12141a;
-                font-size: 13px;
-            }
-
-            #se-s-output.show, #se-s-insert.show, #se-s-result-buttons.show {
-                display: block;
-            }
-
-            #se-s-result-buttons {
-                display: none;
-            }
-
-            #se-s-result-buttons button {
-                width: 100%;
-                min-height: 38px;
-                border: 1px solid #414657;
-                border-radius: 9px;
-                background: #292c38;
-                color: #fff;
-                cursor: pointer;
-            }
-
-            #se-s-status {
-                min-height: 18px;
-                white-space: pre-wrap;
-                color: #adb1c1;
-                font-size: 12px;
-            }
-
-            #se-s-status.error {
-                color: #ff9292;
+                box-shadow: none;
             }
 
             #${FAB_ID} {
-                position: fixed;
-                z-index: 2147483647;
                 display: flex !important;
-                align-items: center;
-                justify-content: center;
-                width: 58px;
-                height: 58px;
-                border: 3px solid #fff;
-                border-radius: 50%;
-                background: #ff3995;
-                color: #fff;
-                box-shadow: 0 6px 20px rgba(0,0,0,.45);
-                font-size: 23px;
-                cursor: pointer;
-                touch-action: none;
-                user-select: none;
+                visibility: visible !important;
+                opacity: 1 !important;
+                pointer-events: auto !important;
             }
 
-            @media (max-width: 700px), (pointer: coarse) {
-                #${PANEL_ID} {
-                    width: min(330px, calc(100vw - 24px));
-                    box-shadow: none;
-                }
-
-                #${FAB_ID} {
-                    display: flex !important;
-                    visibility: visible !important;
-                    opacity: 1 !important;
-                    pointer-events: auto !important;
-                }
+            #se-body,
+            #se-settings {
+                padding: 8px;
+                gap: 6px;
             }
-        `;
 
+            #${PANEL_ID} textarea {
+                min-height: 44px;
+                max-height: 105px;
+            }
+        }
+    `;
+
+    function injectStyle() {
+        if (document.getElementById('se-full-style')) return;
+
+        const style = document.createElement('style');
+        style.id = 'se-full-style';
+        style.textContent = CSS;
         document.head.appendChild(style);
+    }
+
+    /* =========================
+     * UI 생성
+     * ========================= */
+    function slotHTML(type, count, label) {
+        let html = '';
+
+        for (let i = 0; i < count; i++) {
+            html += `
+                <div class="se-slot">
+                    <div class="se-slot-head">
+                        <input type="checkbox" id="se-${type}-on-${i}">
+                        <input
+                            class="se-slot-name"
+                            id="se-${type}-name-${i}"
+                            type="text"
+                            placeholder="${label} ${i + 1} 이름"
+                        >
+                    </div>
+                    <textarea
+                        id="se-${type}-text-${i}"
+                        placeholder="${label} 내용을 입력하세요"
+                    ></textarea>
+                </div>
+            `;
+        }
+
+        return html;
     }
 
     function buildUI() {
         const panel = document.createElement('div');
         panel.id = PANEL_ID;
         panel.innerHTML = `
-            <div id="se-s-head">
-                <span id="se-s-title">✨ 문장 부풀리기 · v6.12.20</span>
-                <button id="se-s-gear" type="button" title="설정">⚙️</button>
-                <button id="se-s-close" type="button" title="닫기">✕</button>
+            <div id="se-head">
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.21</span>
+                <button id="se-gear" type="button" title="설정">⚙️</button>
+                <button id="se-close" type="button" title="닫기">✕</button>
             </div>
 
-            <div id="se-s-body">
-                <div class="se-s-label">💬 대사</div>
-                <textarea id="se-s-dialogue" placeholder="예: 괜찮아, 내가 도와줄게"></textarea>
+            <div id="se-body">
+                <div id="se-cost-top">아직 계산된 사용량이 없어요.</div>
 
-                <div class="se-s-label">🎬 행동</div>
-                <textarea id="se-s-action" placeholder="예: 눈을 피하며 작게 웃는다"></textarea>
+                <div class="se-label">💬 대사</div>
+                <textarea id="se-dialogue" placeholder="예: 괜찮아, 내가 도와줄게"></textarea>
 
-                <div class="se-s-tabs" id="se-s-pov">
+                <div class="se-label">🎬 행동</div>
+                <textarea id="se-action" placeholder="예: 시선을 피하며 작게 웃는다"></textarea>
+
+                <div class="se-tabs" id="se-pov">
                     <button type="button" data-value="first">1인칭</button>
                     <button type="button" data-value="third">3인칭</button>
                 </div>
 
-                <div class="se-s-tabs" id="se-s-length">
+                <div class="se-tabs" id="se-length">
                     <button type="button" data-value="three">세줄</button>
                     <button type="button" data-value="short">짧게</button>
                     <button type="button" data-value="medium">중간</button>
                     <button type="button" data-value="long">길게</button>
                 </div>
 
-                <button id="se-s-run" type="button">✨ 문학적으로 늘리기</button>
-                <div id="se-s-status"></div>
-                <div id="se-s-output"></div>
-                <button id="se-s-insert" type="button">💬 채팅창에 바로 넣기</button>
-                <div id="se-s-result-buttons">
-                    <button id="se-s-copy" type="button">📋 결과 복사</button>
+                <button id="se-go" type="button">✨ 문학적으로 늘리기</button>
+                <div id="se-status"></div>
+                <div id="se-output"></div>
+                <button id="se-insert" type="button">💬 채팅창에 바로 넣기</button>
+
+                <div class="se-btn-row" id="se-result-buttons">
+                    <button id="se-copy" type="button">📋 복사</button>
+                    <button id="se-retry" type="button">🔄 다시 뽑기</button>
                 </div>
             </div>
 
-            <div id="se-s-settings">
-                <div class="se-s-label">🔑 Gemini API 키</div>
-                <input id="se-s-key" type="password" placeholder="AIza...">
+            <div id="se-settings">
+                <details class="se-section" open>
+                    <summary>🎭 페르소나 / 자동추천</summary>
+                    <div class="se-section-body">
+                        <textarea
+                            id="se-persona-hint"
+                            placeholder="추천 키워드 예: 여자 검사, 무뚝뚝, 책임감 강함"
+                        ></textarea>
 
-                <div class="se-s-label">🤖 모델 ID</div>
-                <input id="se-s-model" type="text" placeholder="gemini-2.5-flash">
+                        <button
+                            id="se-persona-suggest"
+                            class="se-secondary"
+                            type="button"
+                        >✨ 현재 설정으로 페르소나 추천</button>
 
-                <button id="se-s-save" type="button">저장</button>
-                <div class="se-s-label">Google AI Studio에서 발급한 API 키를 사용합니다.</div>
+                        <div id="se-persona-status"></div>
+                        ${slotHTML('persona', PERSONA_SLOTS, '페르소나')}
+                    </div>
+                </details>
+
+                <details class="se-section">
+                    <summary>✍️ 문체 규칙</summary>
+                    <div class="se-section-body">
+                        ${slotHTML('style', STYLE_SLOTS, '문체')}
+                    </div>
+                </details>
+
+                <details class="se-section">
+                    <summary>💬 최근 대화 맥락</summary>
+                    <div class="se-section-body">
+                        <div class="se-inline">
+                            <input id="se-ctx-on" type="checkbox">
+                            <span>맥락 참고 · 최근</span>
+                            <input
+                                id="se-ctx-n"
+                                class="se-inline-number"
+                                type="number"
+                                min="1"
+                                max="30"
+                                value="6"
+                            >
+                            <span>개</span>
+                        </div>
+
+                        <div class="se-btn-row">
+                            <button id="se-ctx-preview" type="button">🔍 맥락 미리보기</button>
+                            <button id="se-ctx-clear" type="button">🧹 이 채팅방 캐시 지우기</button>
+                        </div>
+
+                        <div id="se-ctx-status"></div>
+                    </div>
+                </details>
+
+                <details class="se-section">
+                    <summary>🤖 API / 모델 / 기본 설정</summary>
+                    <div class="se-section-body">
+                        <div class="se-label">캐릭터 이름 (3인칭용)</div>
+                        <input id="se-name" type="text" placeholder="예: 서지훈">
+
+                        <div class="se-label">Gemini API 키</div>
+                        <input id="se-key" type="password" placeholder="AIza...">
+
+                        <div class="se-label">모델 드롭다운</div>
+                        <select id="se-model"></select>
+
+                        <button id="se-fetch" class="se-secondary" type="button">
+                            🔄 사용 가능한 모델 불러오기
+                        </button>
+
+                        <div id="se-fetch-status"></div>
+                    </div>
+                </details>
+
+                <details class="se-section">
+                    <summary>💸 API 비용 추정 / 사용내역</summary>
+                    <div class="se-section-body">
+                        <div class="se-inline">
+                            <input id="se-cost-on" type="checkbox">
+                            <span>상단 표시 · 환율</span>
+                            <input
+                                id="se-cost-rate"
+                                class="se-inline-number"
+                                type="number"
+                                min="1"
+                                value="1400"
+                            >
+                            <span>원/USD</span>
+                        </div>
+
+                        <button id="se-cost-reset" class="se-secondary" type="button">
+                            🧹 비용 누적 초기화
+                        </button>
+
+                        <div id="se-cost-detail"></div>
+                    </div>
+                </details>
+
+                <details class="se-section">
+                    <summary>🔄 설정 동기화</summary>
+                    <div class="se-section-body">
+                        <textarea
+                            id="se-sync-box"
+                            placeholder="내보내기 코드를 복사하거나 다른 기기의 코드를 붙여넣으세요."
+                        ></textarea>
+
+                        <div class="se-btn-row">
+                            <button id="se-export" type="button">📤 내보내기</button>
+                            <button id="se-import" type="button">📥 가져오기</button>
+                        </div>
+
+                        <div id="se-sync-status"></div>
+                    </div>
+                </details>
+
+                <button id="se-save" type="button">저장하고 닫기</button>
             </div>
         `;
 
@@ -603,54 +1705,298 @@
         wireUI(panel, fab);
     }
 
+    /* =========================
+     * 위치 / 드래그
+     * ========================= */
+    function clampElementToViewport(element, saveKey, isPanel) {
+        if (!element || getComputedStyle(element).display === 'none') return;
+
+        const viewport = getViewport();
+        const rect = element.getBoundingClientRect();
+        const width = rect.width || element.offsetWidth || (isPanel ? 326 : 58);
+        const height = rect.height || element.offsetHeight || (isPanel ? 500 : 58);
+
+        let left = parseFloat(element.style.left);
+        let top = parseFloat(element.style.top);
+
+        if (!Number.isFinite(left)) left = rect.left;
+        if (!Number.isFinite(top)) top = rect.top;
+
+        const lost =
+            rect.right < viewport.left ||
+            rect.left > viewport.left + viewport.width ||
+            rect.bottom < viewport.top ||
+            rect.top > viewport.top + viewport.height;
+
+        if (lost || !Number.isFinite(left) || !Number.isFinite(top)) {
+            left = isPanel
+                ? viewport.left + EDGE
+                : viewport.left + viewport.width - width - EDGE;
+
+            top = isPanel
+                ? viewport.top + EDGE
+                : viewport.top + viewport.height - height - 100;
+        }
+
+        left = clamp(
+            left,
+            viewport.left + EDGE,
+            Math.max(
+                viewport.left + EDGE,
+                viewport.left + viewport.width - width - EDGE
+            )
+        );
+
+        top = clamp(
+            top,
+            viewport.top + EDGE,
+            Math.max(
+                viewport.top + EDGE,
+                viewport.top + viewport.height -
+                    Math.min(height, isPanel ? 90 : height) -
+                    EDGE
+            )
+        );
+
+        element.style.setProperty('position', 'fixed', 'important');
+        element.style.setProperty('left', left + 'px', 'important');
+        element.style.setProperty('top', top + 'px', 'important');
+        element.style.setProperty('right', 'auto', 'important');
+        element.style.setProperty('bottom', 'auto', 'important');
+        element.style.setProperty('transform', 'none', 'important');
+
+        if (saveKey) {
+            GM_setValue(saveKey, { left, top });
+        }
+    }
+
+    function makeDraggable(element, handle, saveKey, isPanel, onTap) {
+        let dragging = false;
+        let moved = false;
+        let pointerId = null;
+        let offsetX = 0;
+        let offsetY = 0;
+        let startX = 0;
+        let startY = 0;
+
+        handle.addEventListener('pointerdown', event => {
+            if (isPanel && event.target.closest('button')) return;
+
+            dragging = true;
+            moved = false;
+            pointerId = event.pointerId;
+
+            const rect = element.getBoundingClientRect();
+            offsetX = event.clientX - rect.left;
+            offsetY = event.clientY - rect.top;
+            startX = event.clientX;
+            startY = event.clientY;
+
+            try {
+                handle.setPointerCapture(pointerId);
+            } catch (_) {}
+
+            event.preventDefault();
+        }, { passive: false });
+
+        handle.addEventListener('pointermove', event => {
+            if (!dragging || event.pointerId !== pointerId) return;
+
+            if (
+                Math.abs(event.clientX - startX) +
+                Math.abs(event.clientY - startY) > 9
+            ) {
+                moved = true;
+            }
+
+            if (!moved) return;
+
+            const viewport = getViewport();
+            const width = element.offsetWidth;
+            const height = element.offsetHeight;
+
+            const left = clamp(
+                event.clientX - offsetX,
+                viewport.left + EDGE,
+                viewport.left + viewport.width - width - EDGE
+            );
+
+            const top = clamp(
+                event.clientY - offsetY,
+                viewport.top + EDGE,
+                viewport.top + viewport.height -
+                    Math.min(height, isPanel ? 90 : height) -
+                    EDGE
+            );
+
+            element.style.left = left + 'px';
+            element.style.top = top + 'px';
+            element.style.right = 'auto';
+            element.style.bottom = 'auto';
+
+            event.preventDefault();
+        }, { passive: false });
+
+        function finish(event) {
+            if (!dragging) return;
+            if (
+                event &&
+                event.pointerId != null &&
+                event.pointerId !== pointerId
+            ) {
+                return;
+            }
+
+            dragging = false;
+            pointerId = null;
+
+            clampElementToViewport(element, saveKey, isPanel);
+
+            if (!moved && typeof onTap === 'function') {
+                onTap();
+            }
+
+            moved = false;
+
+            if (event) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+        }
+
+        handle.addEventListener('pointerup', finish, { passive: false });
+        handle.addEventListener('pointercancel', finish, { passive: false });
+    }
+
+    /* =========================
+     * UI 연결
+     * ========================= */
     function wireUI(panel, fab) {
-        const get = selector => panel.querySelector(selector);
+        const $ = selector => panel.querySelector(selector);
 
-        const body = get('#se-s-body');
-        const settings = get('#se-s-settings');
-        const dialogue = get('#se-s-dialogue');
-        const action = get('#se-s-action');
-        const output = get('#se-s-output');
-        const status = get('#se-s-status');
-        const runButton = get('#se-s-run');
-        const insertButton = get('#se-s-insert');
-        const resultButtons = get('#se-s-result-buttons');
-        const keyInput = get('#se-s-key');
-        const modelInput = get('#se-s-model');
+        const body = $('#se-body');
+        const settings = $('#se-settings');
+        const dialogue = $('#se-dialogue');
+        const action = $('#se-action');
+        const output = $('#se-output');
+        const insertButton = $('#se-insert');
+        const resultButtons = $('#se-result-buttons');
+        const status = $('#se-status');
+        const goButton = $('#se-go');
 
-        let result = '';
+        const keyInput = $('#se-key');
+        const modelSelect = $('#se-model');
+        const nameInput = $('#se-name');
 
-        const savedPanelPos = GM_getValue(K_PANEL_POS, null);
-        if (savedPanelPos && Number.isFinite(savedPanelPos.left) && Number.isFinite(savedPanelPos.top)) {
-            panel.style.left = savedPanelPos.left + 'px';
-            panel.style.top = savedPanelPos.top + 'px';
-        } else {
-            panel.style.left = '12px';
-            panel.style.top = '76px';
+        const personaHint = $('#se-persona-hint');
+        const personaStatus = $('#se-persona-status');
+
+        const ctxOn = $('#se-ctx-on');
+        const ctxN = $('#se-ctx-n');
+        const ctxStatus = $('#se-ctx-status');
+
+        const costTop = $('#se-cost-top');
+        const costOn = $('#se-cost-on');
+        const costRate = $('#se-cost-rate');
+        const costDetail = $('#se-cost-detail');
+
+        const syncBox = $('#se-sync-box');
+        const syncStatus = $('#se-sync-status');
+
+        let lastResult = '';
+        let statusTimer = null;
+
+        function flash(message, error) {
+            status.textContent = message || '';
+            status.classList.toggle('err', !!error);
+
+            if (statusTimer) clearTimeout(statusTimer);
+
+            if (message && !error) {
+                statusTimer = setTimeout(() => {
+                    status.textContent = '';
+                }, 3000);
+            }
         }
 
-        const savedFabPos = GM_getValue(K_FAB_POS, null);
-        if (savedFabPos && Number.isFinite(savedFabPos.left) && Number.isFinite(savedFabPos.top)) {
-            fab.style.left = savedFabPos.left + 'px';
-            fab.style.top = savedFabPos.top + 'px';
-        } else {
-            fab.style.right = '14px';
-            fab.style.bottom = 'calc(18px + env(safe-area-inset-bottom, 0px))';
+        function setInfo(element, message, error) {
+            element.textContent = message || '';
+            element.classList.toggle('err', !!error);
         }
 
-        if (GM_getValue(K_OPEN, true) === false) {
-            panel.style.display = 'none';
+        function refreshCost(lastInfo) {
+            costTop.textContent = getCostTopText(lastInfo);
+            costDetail.textContent = getCostSummaryText();
         }
 
-        keyInput.value = GM_getValue(K_KEY, '');
-        modelInput.value = GM_getValue(K_MODEL, 'gemini-2.5-flash');
+        function loadSlots(type, values, count) {
+            for (let i = 0; i < count; i++) {
+                const item = values[i];
 
-        function selectTab(containerSelector, key, fallback) {
-            const container = get(containerSelector);
-            const current = GM_getValue(key, fallback);
+                $('#se-' + type + '-on-' + i).checked = !!item.on;
+                $('#se-' + type + '-name-' + i).value = item.name || '';
+                $('#se-' + type + '-text-' + i).value = item.text || '';
+            }
+        }
+
+        function collectSlots(type, count, prefix) {
+            const result = [];
+
+            for (let i = 0; i < count; i++) {
+                result.push({
+                    on: $('#se-' + type + '-on-' + i).checked,
+                    name:
+                        $('#se-' + type + '-name-' + i).value.trim() ||
+                        prefix + ' ' + (i + 1),
+                    text: $('#se-' + type + '-text-' + i).value
+                });
+            }
+
+            return result;
+        }
+
+        function saveSlots() {
+            GM_setValue(
+                K_PERSONAS,
+                collectSlots('persona', PERSONA_SLOTS, '페르소나')
+            );
+
+            GM_setValue(
+                K_STYLES,
+                collectSlots('style', STYLE_SLOTS, '문체')
+            );
+        }
+
+        function populateModels(models, selected) {
+            modelSelect.innerHTML = '';
+
+            models.forEach(model => {
+                const option = document.createElement('option');
+                option.value = model.id;
+                option.textContent = model.label;
+                modelSelect.appendChild(option);
+            });
+
+            const wanted =
+                selected ||
+                GM_getValue(K_MODEL, models[0] && models[0].id);
+
+            if (wanted && models.some(model => model.id === wanted)) {
+                modelSelect.value = wanted;
+            } else if (models[0]) {
+                modelSelect.value = models[0].id;
+            }
+        }
+
+        function setTab(containerSelector, storageKey, fallback) {
+            const container = $(containerSelector);
+            const current = GM_getValue(storageKey, fallback);
 
             container.querySelectorAll('button').forEach(button => {
-                button.classList.toggle('active', button.dataset.value === current);
+                button.classList.toggle(
+                    'active',
+                    button.dataset.value === current
+                );
 
                 button.addEventListener('click', () => {
                     container.querySelectorAll('button').forEach(item => {
@@ -658,39 +2004,71 @@
                     });
 
                     button.classList.add('active');
-                    GM_setValue(key, button.dataset.value);
+                    GM_setValue(storageKey, button.dataset.value);
                 });
             });
         }
 
-        selectTab('#se-s-pov', K_POV, 'first');
-        selectTab('#se-s-length', K_LENGTH, 'medium');
+        /* 초기 값 */
+        keyInput.value = GM_getValue(K_APIKEY, '');
+        nameInput.value = GM_getValue(K_NAME, '');
+        personaHint.value = GM_getValue(K_PERSONA_HINT, '');
 
-        function setStatus(message, error = false) {
-            status.textContent = message;
-            status.classList.toggle('error', error);
+        ctxOn.checked = GM_getValue(K_CTX_ON, false);
+        ctxN.value = GM_getValue(K_CTX_N, 6);
+
+        costOn.checked = GM_getValue(K_COST_ON, true);
+        costRate.value = GM_getValue(K_COST_USDKRW, 1400);
+
+        loadSlots('persona', getPersonaSlots(), PERSONA_SLOTS);
+        loadSlots('style', getStyleSlots(), STYLE_SLOTS);
+
+        const storedModels = GM_getValue(K_MODELLIST, DEFAULT_MODELS);
+        populateModels(
+            Array.isArray(storedModels) && storedModels.length
+                ? storedModels
+                : DEFAULT_MODELS
+        );
+
+        setTab('#se-pov', K_POV, 'first');
+        setTab('#se-length', K_LENGTH, 'medium');
+        refreshCost();
+
+        /* 위치 복구 */
+        const panelPos = GM_getValue(K_POS, null);
+
+        if (
+            panelPos &&
+            Number.isFinite(panelPos.left) &&
+            Number.isFinite(panelPos.top)
+        ) {
+            panel.style.left = panelPos.left + 'px';
+            panel.style.top = panelPos.top + 'px';
+        } else {
+            panel.style.left = '12px';
+            panel.style.top = '70px';
         }
 
-        get('#se-s-gear').addEventListener('click', () => {
-            const opening = !settings.classList.contains('show');
-            settings.classList.toggle('show', opening);
-            body.classList.toggle('hide', opening);
-            clampElement(panel);
-        });
+        const fabPos = GM_getValue(K_FABPOS, null);
 
-        get('#se-s-save').addEventListener('click', () => {
-            GM_setValue(K_KEY, keyInput.value.trim());
-            GM_setValue(K_MODEL, modelInput.value.trim() || 'gemini-2.5-flash');
+        if (
+            fabPos &&
+            Number.isFinite(fabPos.left) &&
+            Number.isFinite(fabPos.top)
+        ) {
+            fab.style.left = fabPos.left + 'px';
+            fab.style.top = fabPos.top + 'px';
+        } else {
+            const viewport = getViewport();
+            fab.style.left =
+                Math.max(EDGE, viewport.width - 58 - EDGE) + 'px';
+            fab.style.top =
+                Math.max(EDGE, viewport.height - 58 - 100) + 'px';
+        }
 
-            settings.classList.remove('show');
-            body.classList.remove('hide');
-            setStatus('설정이 저장됐어요 ✅');
-        });
-
-        get('#se-s-close').addEventListener('click', () => {
+        if (GM_getValue(K_OPEN, true) === false) {
             panel.style.display = 'none';
-            GM_setValue(K_OPEN, false);
-        });
+        }
 
         function togglePanel() {
             const open = getComputedStyle(panel).display !== 'none';
@@ -701,175 +2079,496 @@
             } else {
                 panel.style.display = 'flex';
                 GM_setValue(K_OPEN, true);
-                requestAnimationFrame(() => clampElement(panel));
+
+                requestAnimationFrame(() => {
+                    clampElementToViewport(panel, K_POS, true);
+                });
             }
         }
 
-        function run() {
-            runButton.disabled = true;
-            output.classList.remove('show');
-            insertButton.classList.remove('show');
-            resultButtons.classList.remove('show');
-            setStatus('늘리는 중… ✍️');
-
-            callGemini(
-                dialogue.value,
-                action.value,
-                GM_getValue(K_POV, 'first'),
-                GM_getValue(K_LENGTH, 'medium'),
-                text => {
-                    result = text;
-                    output.textContent = text;
-                    output.classList.add('show');
-                    insertButton.classList.add('show');
-                    resultButtons.classList.add('show');
-                    runButton.disabled = false;
-                    setStatus('');
-                    clampElement(panel);
-                },
-                error => {
-                    runButton.disabled = false;
-                    setStatus(error, true);
-                }
-            );
-        }
-
-        runButton.addEventListener('click', run);
-
-        get('#se-s-copy').addEventListener('click', () => {
-            if (!result) return;
-
-            copyText(result)
-                .then(() => setStatus('복사했어요 📋'))
-                .catch(() => setStatus('복사에 실패했어요.', true));
-        });
-
-        insertButton.addEventListener('click', () => {
-            if (!result) return;
-
-            const input = findChatInput();
-
-            if (!input) {
-                copyText(result)
-                    .then(() => setStatus('채팅창을 못 찾아 결과를 복사했어요.', true))
-                    .catch(() => setStatus('채팅창을 찾지 못했어요.', true));
-                return;
-            }
-
-            setChatValue(input, result);
-            dialogue.value = '';
-            action.value = '';
+        /* 헤더 버튼 */
+        $('#se-close').addEventListener('click', () => {
             panel.style.display = 'none';
             GM_setValue(K_OPEN, false);
         });
 
-        [dialogue, action].forEach(area => {
-            area.addEventListener('keydown', event => {
-                if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+        $('#se-gear').addEventListener('click', () => {
+            const opening = !settings.classList.contains('show');
+
+            settings.classList.toggle('show', opening);
+            body.classList.toggle('hide', opening);
+
+            if (opening) settings.scrollTop = 0;
+
+            requestAnimationFrame(() => {
+                clampElementToViewport(panel, null, true);
+            });
+        });
+
+        /* 저장 */
+        $('#se-save').addEventListener('click', () => {
+            GM_setValue(K_APIKEY, keyInput.value.trim());
+            GM_setValue(K_NAME, nameInput.value.trim());
+            GM_setValue(K_PERSONA_HINT, personaHint.value.trim());
+            GM_setValue(K_CTX_ON, ctxOn.checked);
+            GM_setValue(
+                K_CTX_N,
+                clamp(parseInt(ctxN.value, 10) || 6, 1, 30)
+            );
+            GM_setValue(K_COST_ON, costOn.checked);
+            GM_setValue(
+                K_COST_USDKRW,
+                Math.max(1, parseFloat(costRate.value) || 1400)
+            );
+
+            if (modelSelect.value) {
+                GM_setValue(K_MODEL, modelSelect.value);
+            }
+
+            saveSlots();
+            refreshCost();
+
+            settings.classList.remove('show');
+            body.classList.remove('hide');
+            flash('저장됐어요 ✅');
+        });
+
+        /* 모델 불러오기 */
+        $('#se-fetch').addEventListener('click', () => {
+            const button = $('#se-fetch');
+            const fetchStatus = $('#se-fetch-status');
+
+            GM_setValue(K_APIKEY, keyInput.value.trim());
+
+            button.disabled = true;
+            setInfo(fetchStatus, '불러오는 중…', false);
+
+            fetchModels(
+                models => {
+                    GM_setValue(K_MODELLIST, models);
+                    populateModels(models, modelSelect.value);
+                    button.disabled = false;
+                    setInfo(
+                        fetchStatus,
+                        models.length + '개 모델을 불러왔어요 ✅',
+                        false
+                    );
+                },
+                error => {
+                    button.disabled = false;
+                    setInfo(fetchStatus, error, true);
+                }
+            );
+        });
+
+        modelSelect.addEventListener('change', () => {
+            GM_setValue(K_MODEL, modelSelect.value);
+        });
+
+        /* 페르소나 자동추천 */
+        $('#se-persona-suggest').addEventListener('click', () => {
+            const button = $('#se-persona-suggest');
+            const keywords = personaHint.value.trim();
+
+            GM_setValue(K_APIKEY, keyInput.value.trim());
+            GM_setValue(K_MODEL, modelSelect.value);
+            GM_setValue(K_PERSONA_HINT, keywords);
+
+            const storyDetail = collectStoryDetail();
+            const context = collectChatContext(
+                clamp(parseInt(ctxN.value, 10) || 10, 6, 20)
+            );
+
+            if (!keywords && !storyDetail && !context.length) {
+                setInfo(
+                    personaStatus,
+                    '키워드나 읽을 설정/최근 맥락이 없어요.',
+                    true
+                );
+                return;
+            }
+
+            const prompt = buildPersonaPrompt(
+                keywords,
+                storyDetail,
+                context
+            );
+
+            button.disabled = true;
+            setInfo(
+                personaStatus,
+                '설정과 최근 맥락을 읽고 페르소나 추천 중…',
+                false
+            );
+
+            requestGemini(
+                prompt.system,
+                prompt.user,
+                '페르소나 추천',
+                (text, costInfo) => {
+                    const slots = collectSlots(
+                        'persona',
+                        PERSONA_SLOTS,
+                        '페르소나'
+                    );
+
+                    let index = slots.findIndex(item => item.on);
+                    if (index < 0) {
+                        index = slots.findIndex(item => !item.text.trim());
+                    }
+                    if (index < 0) index = 0;
+
+                    $('#se-persona-on-' + index).checked = true;
+                    $('#se-persona-text-' + index).value = text;
+
+                    const nameInput = $('#se-persona-name-' + index);
+                    if (
+                        !nameInput.value.trim() ||
+                        /^페르소나\s*\d+$/.test(nameInput.value.trim())
+                    ) {
+                        nameInput.value = '자동추천 페르소나';
+                    }
+
+                    saveSlots();
+                    refreshCost(costInfo);
+
+                    button.disabled = false;
+                    setInfo(
+                        personaStatus,
+                        '페르소나 ' +
+                            (index + 1) +
+                            '번 칸에 넣었어요 ✅' +
+                            (costInfo ? '\n' + costInfo.message : ''),
+                        false
+                    );
+                },
+                error => {
+                    button.disabled = false;
+                    setInfo(personaStatus, error, true);
+                }
+            );
+        });
+
+        /* 맥락 */
+        ctxOn.addEventListener('change', () => {
+            GM_setValue(K_CTX_ON, ctxOn.checked);
+        });
+
+        $('#se-ctx-preview').addEventListener('click', () => {
+            const n = clamp(parseInt(ctxN.value, 10) || 6, 1, 30);
+            GM_setValue(K_CTX_N, n);
+
+            const visible = collectVisibleChatLines();
+            rememberCtxLines(visible);
+
+            const context = collectChatContext(n);
+
+            if (!context.length) {
+                setInfo(
+                    ctxStatus,
+                    '대화를 못 잡았어요. 시작 카드와 채팅이 보이는 상태에서 다시 눌러보세요.',
+                    true
+                );
+                return;
+            }
+
+            setInfo(
+                ctxStatus,
+                context.length +
+                    '개 참고 예정 (요청 ' +
+                    n +
+                    '개) / 화면 후보 ' +
+                    visible.length +
+                    '개 / 누적 캐시 ' +
+                    getCtxCache().length +
+                    '개\n' +
+                    context.map((item, index) => {
+                        return (
+                            (index + 1) +
+                            '. ' +
+                            (
+                                item.length > 130
+                                    ? item.slice(0, 130) + '…'
+                                    : item
+                            )
+                        );
+                    }).join('\n'),
+                false
+            );
+        });
+
+        $('#se-ctx-clear').addEventListener('click', () => {
+            clearCtxCache();
+            setInfo(
+                ctxStatus,
+                '현재 채팅방의 저장된 맥락 캐시를 지웠어요 🧹',
+                false
+            );
+        });
+
+        /* 비용 */
+        costOn.addEventListener('change', () => {
+            GM_setValue(K_COST_ON, costOn.checked);
+            refreshCost();
+        });
+
+        costRate.addEventListener('change', () => {
+            GM_setValue(
+                K_COST_USDKRW,
+                Math.max(1, parseFloat(costRate.value) || 1400)
+            );
+            refreshCost();
+        });
+
+        $('#se-cost-reset').addEventListener('click', () => {
+            resetCostStats();
+            refreshCost();
+        });
+
+        /* 설정 동기화 */
+        const syncKeys = [
+            K_APIKEY,
+            K_MODEL,
+            K_MODELLIST,
+            K_PERSONAS,
+            K_PERSONA_HINT,
+            K_STYLES,
+            K_NAME,
+            K_POV,
+            K_LENGTH,
+            K_CTX_ON,
+            K_CTX_N,
+            K_COST_ON,
+            K_COST_USDKRW,
+            K_COST_TOTAL_USD,
+            K_COST_TOTAL_IN,
+            K_COST_TOTAL_OUT,
+            K_COST_REQ_COUNT,
+            K_COST_LOG
+        ];
+
+        $('#se-export').addEventListener('click', () => {
+            saveSlots();
+
+            const data = {};
+
+            syncKeys.forEach(key => {
+                const value = GM_getValue(key, null);
+                if (value !== null && value !== undefined) {
+                    data[key] = value;
+                }
+            });
+
+            const code =
+                'CSE1:' +
+                b64encUtf8(JSON.stringify({
+                    version: 1,
+                    app: 'crack-se',
+                    data
+                }));
+
+            syncBox.value = code;
+
+            copyToClipboard(code)
+                .then(() => {
+                    setInfo(
+                        syncStatus,
+                        '동기화 코드를 만들고 복사했어요 📋',
+                        false
+                    );
+                })
+                .catch(() => {
+                    setInfo(
+                        syncStatus,
+                        '코드를 만들었어요. 위 칸을 직접 복사해 주세요.',
+                        false
+                    );
+                });
+        });
+
+        $('#se-import').addEventListener('click', () => {
+            let raw = syncBox.value.trim();
+
+            if (!raw) {
+                setInfo(syncStatus, '가져올 코드를 붙여넣어 주세요.', true);
+                return;
+            }
+
+            raw = raw
+                .replace(/^```(?:txt|json|js)?/i, '')
+                .replace(/```$/i, '')
+                .trim();
+
+            try {
+                let parsed;
+
+                if (raw.startsWith('CSE1:')) {
+                    parsed = JSON.parse(
+                        b64decUtf8(raw.slice(5).replace(/\s+/g, ''))
+                    );
+                } else {
+                    parsed = JSON.parse(raw);
+                }
+
+                if (!parsed || !parsed.data) {
+                    throw new Error('설정 데이터 없음');
+                }
+
+                let count = 0;
+
+                syncKeys.forEach(key => {
+                    if (
+                        Object.prototype.hasOwnProperty.call(
+                            parsed.data,
+                            key
+                        )
+                    ) {
+                        GM_setValue(key, parsed.data[key]);
+                        count++;
+                    }
+                });
+
+                setInfo(
+                    syncStatus,
+                    count +
+                        '개 설정을 가져왔어요. 잠시 후 새로고침할게요…',
+                    false
+                );
+
+                setTimeout(() => location.reload(), 700);
+            } catch (error) {
+                setInfo(
+                    syncStatus,
+                    '코드를 읽지 못했어요. 전체 코드를 다시 붙여넣어 주세요.',
+                    true
+                );
+            }
+        });
+
+        /* 문장 생성 */
+        function renderResult(text) {
+            lastResult = text;
+            output.textContent = text;
+            output.classList.add('show');
+            insertButton.classList.add('show');
+            resultButtons.classList.add('show');
+
+            requestAnimationFrame(() => {
+                clampElementToViewport(panel, null, true);
+            });
+        }
+
+        function run() {
+            const d = dialogue.value;
+            const a = action.value;
+
+            if (!d.trim() && !a.trim()) {
+                flash('대사나 행동 중 하나는 입력해 주세요.', true);
+                return;
+            }
+
+            GM_setValue(K_APIKEY, keyInput.value.trim());
+            GM_setValue(K_MODEL, modelSelect.value);
+            saveSlots();
+
+            const context = ctxOn.checked
+                ? collectChatContext(
+                    clamp(parseInt(ctxN.value, 10) || 6, 1, 30)
+                )
+                : [];
+
+            const prompt = buildPrompt(d, a, context);
+
+            goButton.disabled = true;
+            output.classList.remove('show');
+            insertButton.classList.remove('show');
+            resultButtons.classList.remove('show');
+            flash('늘리는 중… ✍️');
+
+            requestGemini(
+                prompt.system,
+                prompt.user,
+                '문장 부풀리기',
+                (text, costInfo) => {
+                    renderResult(text);
+                    refreshCost(costInfo);
+                    goButton.disabled = false;
+                    flash(costInfo ? costInfo.message : '');
+                },
+                error => {
+                    goButton.disabled = false;
+                    flash(error, true);
+                }
+            );
+        }
+
+        goButton.addEventListener('click', run);
+        $('#se-retry').addEventListener('click', run);
+
+        [dialogue, action].forEach(ta => {
+            ta.addEventListener('keydown', event => {
+                if (
+                    (event.ctrlKey || event.metaKey) &&
+                    event.key === 'Enter'
+                ) {
                     event.preventDefault();
                     run();
                 }
             });
         });
 
-        function makeDraggable(element, handle, saveKey, onTap) {
-            let dragging = false;
-            let moved = false;
-            let pointerId = null;
-            let offsetX = 0;
-            let offsetY = 0;
-            let startX = 0;
-            let startY = 0;
+        $('#se-copy').addEventListener('click', () => {
+            if (!lastResult) return;
 
-            handle.addEventListener('pointerdown', event => {
-                if (event.target.closest('button') && element === panel) return;
+            copyToClipboard(lastResult)
+                .then(() => flash('복사 완료 📋'))
+                .catch(() => flash('복사 실패 😢', true));
+        });
 
-                dragging = true;
-                moved = false;
-                pointerId = event.pointerId;
+        insertButton.addEventListener('click', () => {
+            if (!lastResult) return;
 
-                const rect = element.getBoundingClientRect();
-                offsetX = event.clientX - rect.left;
-                offsetY = event.clientY - rect.top;
-                startX = event.clientX;
-                startY = event.clientY;
-
-                element.style.right = 'auto';
-                element.style.bottom = 'auto';
-
-                try {
-                    handle.setPointerCapture(pointerId);
-                } catch (_) {}
-
-                event.preventDefault();
-            }, { passive: false });
-
-            handle.addEventListener('pointermove', event => {
-                if (!dragging || event.pointerId !== pointerId) return;
-
-                if (
-                    Math.abs(event.clientX - startX) +
-                    Math.abs(event.clientY - startY) > 8
-                ) {
-                    moved = true;
-                }
-
-                if (!moved) return;
-
-                const viewport = getViewport();
-                const width = element.offsetWidth;
-                const height = element.offsetHeight;
-
-                const left = clamp(
-                    event.clientX - offsetX,
-                    viewport.left + EDGE,
-                    viewport.left + viewport.width - width - EDGE
-                );
-
-                const top = clamp(
-                    event.clientY - offsetY,
-                    viewport.top + EDGE,
-                    viewport.top + viewport.height - Math.min(height, 80) - EDGE
-                );
-
-                element.style.left = left + 'px';
-                element.style.top = top + 'px';
-
-                event.preventDefault();
-            }, { passive: false });
-
-            function finish(event) {
-                if (!dragging) return;
-                if (event && event.pointerId !== pointerId) return;
-
-                dragging = false;
-                pointerId = null;
-
-                clampElement(element, saveKey);
-
-                if (!moved && typeof onTap === 'function') {
-                    onTap();
-                }
-
-                moved = false;
-
-                if (event) {
-                    event.preventDefault();
-                    event.stopPropagation();
-                }
+            if (insertIntoChat(lastResult)) {
+                dialogue.value = '';
+                action.value = '';
+                panel.style.display = 'none';
+                GM_setValue(K_OPEN, false);
+            } else {
+                copyToClipboard(lastResult)
+                    .then(() => {
+                        flash(
+                            '채팅창을 못 찾아 결과를 복사했어요.',
+                            true
+                        );
+                    })
+                    .catch(() => {
+                        flash('채팅창을 찾지 못했어요.', true);
+                    });
             }
+        });
 
-            handle.addEventListener('pointerup', finish, { passive: false });
-            handle.addEventListener('pointercancel', finish, { passive: false });
-        }
+        /* 드래그 */
+        makeDraggable(
+            panel,
+            $('#se-head'),
+            K_POS,
+            true
+        );
 
-        makeDraggable(panel, get('#se-s-head'), K_PANEL_POS);
-        makeDraggable(fab, fab, K_FAB_POS, togglePanel);
+        makeDraggable(
+            fab,
+            fab,
+            K_FABPOS,
+            false,
+            togglePanel
+        );
 
+        /* 모바일 화면 변화 복구 */
         const repair = () => {
-            clampElement(fab);
+            clampElementToViewport(fab, null, false);
+
             if (getComputedStyle(panel).display !== 'none') {
-                clampElement(panel);
+                clampElementToViewport(panel, null, true);
             }
         };
 
@@ -879,7 +2578,17 @@
         }, { passive: true });
 
         if (window.visualViewport) {
-            window.visualViewport.addEventListener('resize', repair, { passive: true });
+            window.visualViewport.addEventListener(
+                'resize',
+                repair,
+                { passive: true }
+            );
+
+            window.visualViewport.addEventListener(
+                'scroll',
+                repair,
+                { passive: true }
+            );
         }
 
         [0, 100, 400, 1000, 2500].forEach(delay => {
@@ -887,11 +2596,35 @@
         });
     }
 
+    /* =========================
+     * 시작
+     * ========================= */
     function init() {
         if (document.getElementById(PANEL_ID)) return;
 
         injectStyle();
         buildUI();
+        attachContextObserver();
+
+        routeTimer = setInterval(() => {
+            if (location.href !== lastUrl) {
+                lastUrl = location.href;
+                setTimeout(attachContextObserver, 300);
+                setTimeout(() => {
+                    const panel = document.getElementById(PANEL_ID);
+                    const fab = document.getElementById(FAB_ID);
+
+                    clampElementToViewport(fab, null, false);
+
+                    if (
+                        panel &&
+                        getComputedStyle(panel).display !== 'none'
+                    ) {
+                        clampElementToViewport(panel, null, true);
+                    }
+                }, 500);
+            }
+        }, 1600);
     }
 
     if (document.readyState === 'loading') {
