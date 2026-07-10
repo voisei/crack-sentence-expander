@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.23
+// @version      6.12.24
 // @author       me
 // @description  대사/행동 분리, 페르소나 자동추천·3칸, 문체 3칸, 모델 드롭다운, 최근 대화 맥락·캐시, 비용 추적, 설정 동기화, 모바일 토글/패널 위치 제한.
 // @match        https://crack.wrtn.ai/*
@@ -39,7 +39,7 @@
 
     const K_CTX_ON = 'se_ctx_on';
     const K_CTX_N = 'se_ctx_n';
-    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v2';
+    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v3';
 
     const K_COST_ON = 'se_cost_on';
     const K_COST_USDKRW = 'se_cost_usdkrw';
@@ -218,11 +218,19 @@
 
     function getCtxCache() {
         const value = GM_getValue(getCurrentChatCacheKey(), []);
-        return Array.isArray(value) ? value : [];
+        if (!Array.isArray(value)) return [];
+
+        return value.filter(item => {
+            return item && typeof item === 'object' &&
+                typeof item.id === 'string' &&
+                typeof item.text === 'string';
+        });
     }
 
-    function saveCtxCache(lines) {
-        const value = Array.isArray(lines) ? lines.slice(-CTX_CACHE_LIMIT) : [];
+    function saveCtxCache(records) {
+        const value = Array.isArray(records)
+            ? records.slice(-CTX_CACHE_LIMIT)
+            : [];
         GM_setValue(getCurrentChatCacheKey(), value);
     }
 
@@ -250,34 +258,14 @@
     }
 
     function isBadContextLine(line) {
-        if (!line || line.length < 2 || line.length > 6000) return true;
+        if (!line || line.length < 2 || line.length > 12000) return true;
 
         const exact = new Set([
-            '문장 부풀리기',
-            '대사',
-            '행동',
-            '1인칭',
-            '3인칭',
-            '세줄',
-            '짧게',
-            '중간',
-            '길게',
-            '문학적으로 늘리기',
-            '채팅창에 바로 넣기',
-            '복사',
-            '다시 뽑기',
-            '설정',
-            '저장',
-            '닫기',
-            '확인',
-            '취소',
-            '삭제',
-            '수정',
-            '뒤로',
-            '추가',
-            '최신순',
-            '오래된순',
-            '이 채팅방 캐시 지우기'
+            '문장 부풀리기', '대사', '행동', '1인칭', '3인칭',
+            '세줄', '짧게', '중간', '길게', '문학적으로 늘리기',
+            '채팅창에 바로 넣기', '복사', '다시 뽑기', '설정',
+            '저장', '닫기', '확인', '취소', '삭제', '수정', '뒤로',
+            '추가', '최신순', '오래된순', '이 채팅방 캐시 지우기'
         ]);
 
         if (exact.has(line)) return true;
@@ -285,73 +273,103 @@
         if (/Gemini API|API 키|사용 가능한 모델|페르소나 자동추천/.test(line)) return true;
         if (/최근 대화 맥락 참고|맥락 미리보기/.test(line)) return true;
         if (/설정 동기화|내보내기|가져오기/.test(line)) return true;
-        if (/^\s*\[\s*턴\s*\d+\s*[|｜][^\]]*\]\s*$/.test(line)) return true;
-        if (/^\s*\[[^\]]*\d+\s*일차[^\]]*\]\s*$/.test(line)) return true;
         if (/^[\s\W_]+$/.test(line)) return true;
-
         return false;
     }
 
-    function dropStreamingPrefixes(lines) {
-        const output = [];
-
-        for (const current of lines || []) {
-            while (output.length) {
-                const previous = output[output.length - 1];
-
-                if (
-                    current.length > previous.length &&
-                    current.startsWith(previous)
-                ) {
-                    output.pop();
-                    continue;
-                }
-
-                break;
-            }
-
-            output.push(current);
+    function hashContextId(value) {
+        let hash = 2166136261;
+        const text = String(value || '');
+        for (let i = 0; i < text.length; i++) {
+            hash ^= text.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
         }
-
-        return output;
+        return (hash >>> 0).toString(36);
     }
 
-    function uniqueContextLines(lines) {
-        const output = [];
+    function normalizeContextRecord(record) {
+        if (!record || typeof record !== 'object') return null;
+        const text = cleanContextLine(record.text);
+        if (isBadContextLine(text)) return null;
 
-        for (const raw of lines || []) {
-            const line = cleanContextLine(raw);
-
-            if (isBadContextLine(line)) continue;
-
-            /* 같은 메시지 안에서 부모/자식 DOM이 연속 중복된 경우만 제거한다.
-             * 서로 다른 턴에서 같은 말을 반복한 것은 지우지 않는다. */
-            if (output.length && output[output.length - 1] === line) continue;
-
-            output.push(line);
-        }
-
-        return dropStreamingPrefixes(output);
+        return {
+            id: String(record.id || ('fallback-' + hashContextId(text))),
+            role: record.role === 'user' || record.role === 'assistant'
+                ? record.role
+                : 'unknown',
+            text,
+            nearInput: !!record.nearInput
+        };
     }
 
-    function rememberCtxLines(lines) {
-        const fresh = uniqueContextLines(lines);
+    function rememberCtxLines(records) {
+        const fresh = (Array.isArray(records) ? records : [])
+            .map(normalizeContextRecord)
+            .filter(Boolean);
         if (!fresh.length) return;
 
-        /*
-         * 화면에서 다시 읽힌 항목은 기존 캐시 위치에서 제거한 뒤
-         * 현재 화면의 과거→최신 순서대로 맨 뒤에 다시 붙인다.
-         * SPA 이동·가상 스크롤·flex 역순 때문에 최신 대화 순서가
-         * 뒤섞이는 문제를 방지한다.
-         */
-        const freshSet = new Set(fresh);
-        const kept = getCtxCache().filter(line => !freshSet.has(line));
-        const merged = dropStreamingPrefixes([
-            ...kept,
-            ...fresh,
-        ]);
+        let cache = getCtxCache().map(normalizeContextRecord).filter(Boolean);
+        if (!cache.length) {
+            saveCtxCache(fresh);
+            return;
+        }
 
-        saveCtxCache(merged);
+        const byId = new Map(cache.map((item, index) => [item.id, index]));
+
+        /* 이미 본 메시지는 텍스트/역할만 갱신하고 위치는 절대 바꾸지 않는다.
+         * 23버전은 재스캔된 과거 메시지를 캐시 맨 뒤로 옮겨 과거를 최신으로
+         * 착각하게 만들었다. */
+        for (const item of fresh) {
+            if (byId.has(item.id)) {
+                const index = byId.get(item.id);
+                cache[index] = { ...cache[index], ...item };
+            }
+        }
+
+        const freshIds = fresh.map(item => item.id);
+        const cacheIds = new Set(cache.map(item => item.id));
+
+        for (let i = 0; i < fresh.length; i++) {
+            const item = fresh[i];
+            if (cacheIds.has(item.id)) continue;
+
+            let inserted = false;
+
+            /* 화면상 바로 앞 메시지를 기준으로 정확한 위치에 삽입 */
+            for (let p = i - 1; p >= 0; p--) {
+                const prevId = freshIds[p];
+                const prevIndex = cache.findIndex(entry => entry.id === prevId);
+                if (prevIndex >= 0) {
+                    cache.splice(prevIndex + 1, 0, item);
+                    inserted = true;
+                    break;
+                }
+            }
+
+            /* 앞 기준이 없으면 화면상 바로 뒤 메시지 앞에 삽입 */
+            if (!inserted) {
+                for (let n = i + 1; n < fresh.length; n++) {
+                    const nextId = freshIds[n];
+                    const nextIndex = cache.findIndex(entry => entry.id === nextId);
+                    if (nextIndex >= 0) {
+                        cache.splice(nextIndex, 0, item);
+                        inserted = true;
+                        break;
+                    }
+                }
+            }
+
+            /* 겹치는 메시지가 전혀 없는 별도 화면 조각은 입력창 근처일 때만
+             * 최신으로 추가한다. 과거로 스크롤했을 때 낡은 턴이 뒤에 붙는 것을 방지. */
+            if (!inserted && item.nearInput) {
+                cache.push(item);
+                inserted = true;
+            }
+
+            if (inserted) cacheIds.add(item.id);
+        }
+
+        saveCtxCache(cache);
     }
 
     function collectScenarioCards() {
@@ -424,24 +442,19 @@
         const parts = [];
         let node = contentEl || group;
 
-        for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
+        for (let depth = 0; node && depth < 7; depth++, node = node.parentElement) {
             if (node === document.body) break;
 
-            const attrs = [
+            [
                 'data-role', 'data-author', 'data-message-role',
-                'data-testid', 'aria-label'
-            ];
-
-            attrs.forEach(name => {
+                'data-testid', 'aria-label', 'data-side'
+            ].forEach(name => {
                 const value = node.getAttribute && node.getAttribute(name);
                 if (value) parts.push(name + '=' + value);
             });
 
             if (node.id) parts.push('id=' + node.id);
-            if (typeof node.className === 'string') {
-                parts.push('class=' + node.className);
-            }
-
+            if (typeof node.className === 'string') parts.push('class=' + node.className);
             if (node === group) break;
         }
 
@@ -453,21 +466,17 @@
 
         if (
             /(?:data-role|data-author|data-message-role)=(?:user|human|me)\b/.test(signature) ||
-            /(?:data-testid|aria-label)=[^ ]*(?:user|human)[^ ]*/.test(signature) ||
-            /(?:user-message|message-user|chat-user|human-message)/.test(signature) ||
+            /(?:data-testid|aria-label)=[^ ]*(?:user|human|mine)[^ ]*/.test(signature) ||
+            /(?:user-message|message-user|chat-user|human-message|from-user|is-user)/.test(signature) ||
             /(?:사용자|내 메시지|나의 메시지)/.test(signature)
-        ) {
-            return 'user';
-        }
+        ) return 'user';
 
         if (
             /(?:data-role|data-author|data-message-role)=(?:assistant|ai|bot|character|agent)\b/.test(signature) ||
             /(?:data-testid|aria-label)=[^ ]*(?:assistant|character|bot|agent)[^ ]*/.test(signature) ||
-            /(?:assistant-message|message-assistant|ai-message|bot-message|character-message)/.test(signature) ||
+            /(?:assistant-message|message-assistant|ai-message|bot-message|character-message|from-assistant)/.test(signature) ||
             /(?:캐릭터 메시지|AI 메시지|어시스턴트)/.test(signature)
-        ) {
-            return 'assistant';
-        }
+        ) return 'assistant';
 
         const target = contentEl || group;
         const rect = target && target.getBoundingClientRect
@@ -476,55 +485,36 @@
         const style = target ? getComputedStyle(target) : null;
 
         if (style) {
-            if (style.alignSelf === 'flex-end' || style.marginLeft === 'auto') {
-                return 'user';
-            }
-            if (style.alignSelf === 'flex-start' || style.marginRight === 'auto') {
-                return 'assistant';
-            }
+            if (style.alignSelf === 'flex-end' || style.marginLeft === 'auto') return 'user';
+            if (style.alignSelf === 'flex-start' || style.marginRight === 'auto') return 'assistant';
         }
 
-        /* 크랙의 일반적인 말풍선 배치: 유저는 오른쪽의 비교적 좁은 말풍선,
-         * 캐릭터 출력은 왼쪽/전체 폭의 마크다운 영역이다. */
         if (rect && rect.width > 0) {
             const viewport = getViewport();
             const center = rect.left + rect.width / 2;
             const viewportCenter = viewport.left + viewport.width / 2;
-
-            if (
-                center > viewportCenter + viewport.width * 0.08 &&
-                rect.width < viewport.width * 0.78
-            ) {
+            if (center > viewportCenter + viewport.width * 0.10 && rect.width < viewport.width * 0.82) {
                 return 'user';
             }
         }
 
-        if (contentEl && contentEl.classList.contains('wrtn-markdown')) {
-            return 'assistant';
-        }
-
+        /* wrtn-markdown은 유저/캐릭터 양쪽에 쓰일 수 있으므로 역할 근거로 삼지 않는다. */
         return 'unknown';
     }
 
     function getBestMessageNode(group) {
         const selectors = [
-            '.wrtn-markdown',
-            '[data-role="user"]',
-            '[data-role="assistant"]',
-            '[data-message-role]',
-            '[data-author]',
-            '[data-testid*="user"]',
-            '[data-testid*="assistant"]',
-            '[data-testid*="message"]',
-            '[class*="whitespace-pre-wrap"]',
-            '[class*="break-words"]'
+            '[data-role="user"]', '[data-role="assistant"]',
+            '[data-message-role]', '[data-author]',
+            '[data-testid*="user"]', '[data-testid*="assistant"]',
+            '[data-testid*="message"]', '.wrtn-markdown',
+            '[class*="whitespace-pre-wrap"]', '[class*="break-words"]'
         ].join(',');
 
         const candidates = Array.from(group.querySelectorAll(selectors))
             .filter(el => {
                 if (el.closest('#' + PANEL_ID)) return false;
-                if (el.querySelector('textarea, input, select')) return false;
-
+                if (el.querySelector('textarea, input, select, button')) return false;
                 const text = cleanContextLine(el.innerText || el.textContent || '');
                 return text.length >= 1 && text.length <= 12000;
             });
@@ -534,23 +524,18 @@
         const scored = candidates.map(el => {
             const text = cleanContextLine(el.innerText || el.textContent || '');
             let score = Math.min(text.length, 5000);
+            if (el.hasAttribute('data-role')) score += 12000;
+            if (el.hasAttribute('data-message-role')) score += 12000;
+            if (el.hasAttribute('data-author')) score += 12000;
+            if ((el.getAttribute('data-testid') || '').toLowerCase().includes('message')) score += 7000;
+            if (el.classList.contains('wrtn-markdown')) score += 4000;
 
-            if (el.classList.contains('wrtn-markdown')) score += 10000;
-            if (el.hasAttribute('data-role')) score += 7000;
-            if (el.hasAttribute('data-message-role')) score += 7000;
-            if (el.hasAttribute('data-author')) score += 7000;
-            if ((el.getAttribute('data-testid') || '').toLowerCase().includes('message')) {
-                score += 4000;
-            }
-
-            /* 같은 본문을 품은 바깥 컨테이너보다 실제 텍스트 노드를 선호 */
             const equivalentChild = Array.from(el.children || []).some(child => {
                 const childText = cleanContextLine(child.innerText || child.textContent || '');
                 return childText && childText.length >= text.length * 0.88;
             });
-            if (equivalentChild) score -= 6000;
-
-            return { el, text, score };
+            if (equivalentChild) score -= 8000;
+            return { el, score };
         });
 
         scored.sort((a, b) => b.score - a.score);
@@ -563,54 +548,49 @@
             : role === 'assistant'
                 ? '상대 캐릭터'
                 : '역할 미확인';
-
         return '[' + label + ']\n' + text;
     }
 
     function collectVisibleChatLines() {
         const panel = document.getElementById(PANEL_ID);
+        const input = findChatInput();
+        const inputTop = input ? input.getBoundingClientRect().top : window.innerHeight;
         const entries = [];
 
-        /* 반드시 메시지 그룹 하나당 본문 하나만 뽑는다.
-         * 기존처럼 부모/자식 DOM을 모두 넣으면 한 턴이 2~4개로 중복되어
-         * '최근 10개'가 실제로는 2~3턴밖에 되지 않는 문제가 생긴다. */
-        const groups = Array.from(
-            document.querySelectorAll('[data-message-group-id]')
-        ).filter(group => !panel || !panel.contains(group));
+        const groups = Array.from(document.querySelectorAll('[data-message-group-id]'))
+            .filter(group => !panel || !panel.contains(group));
 
         groups.forEach((group, index) => {
             const contentEl = getBestMessageNode(group);
-            const text = cleanContextLine(
-                contentEl.innerText || contentEl.textContent || ''
-            );
-
+            const text = cleanContextLine(contentEl.innerText || contentEl.textContent || '');
             if (isBadContextLine(text)) return;
 
             const rect = group.getBoundingClientRect();
-            const role = detectMessageRole(group, contentEl);
-
+            const rawId = group.getAttribute('data-message-group-id') || '';
             entries.push({
+                id: rawId || ('group-' + hashContextId(text + '|' + index)),
                 text,
-                role,
+                role: detectMessageRole(group, contentEl),
                 top: Number.isFinite(rect.top) ? rect.top : index,
-                domIndex: index
+                domIndex: index,
+                nearInput: rect.bottom <= inputTop + 100 && rect.bottom >= inputTop - 1800
             });
         });
 
-        /* 그룹 선택자가 없는 화면에서만 마크다운을 보조 수집한다. */
         if (!entries.length) {
             Array.from(document.querySelectorAll('.wrtn-markdown'))
                 .filter(el => !el.closest('#' + PANEL_ID))
                 .forEach((el, index) => {
                     const text = cleanContextLine(el.innerText || el.textContent || '');
                     if (isBadContextLine(text)) return;
-
                     const rect = el.getBoundingClientRect();
                     entries.push({
+                        id: 'markdown-' + hashContextId(text),
                         text,
                         role: detectMessageRole(el.parentElement || el, el),
                         top: Number.isFinite(rect.top) ? rect.top : index,
-                        domIndex: index
+                        domIndex: index,
+                        nearInput: rect.bottom <= inputTop + 100 && rect.bottom >= inputTop - 1800
                     });
                 });
         }
@@ -620,45 +600,41 @@
             return a.domIndex - b.domIndex;
         });
 
-        /* 역할을 못 찾은 턴은 주변의 확정 역할을 기준으로 교대로 보정한다. */
-        for (let i = 0; i < entries.length; i++) {
-            if (entries[i].role !== 'unknown') continue;
-
-            const prev = i > 0 ? entries[i - 1].role : 'unknown';
-            const next = i + 1 < entries.length ? entries[i + 1].role : 'unknown';
-
-            if (prev === 'user') entries[i].role = 'assistant';
-            else if (prev === 'assistant') entries[i].role = 'user';
-            else if (next === 'user') entries[i].role = 'assistant';
-            else if (next === 'assistant') entries[i].role = 'user';
+        /* 역할 표지가 하나도 없으면 채팅 입력창 직전의 마지막 출력은 상대
+         * 캐릭터라고 보고 아래에서부터 유저/캐릭터를 교대로 복원한다. */
+        const hasKnownRole = entries.some(item => item.role !== 'unknown');
+        if (!hasKnownRole && entries.length) {
+            let role = 'assistant';
+            for (let i = entries.length - 1; i >= 0; i--) {
+                entries[i].role = role;
+                role = role === 'assistant' ? 'user' : 'assistant';
+            }
+        } else {
+            for (let i = entries.length - 1; i >= 0; i--) {
+                if (entries[i].role !== 'unknown') continue;
+                const next = i + 1 < entries.length ? entries[i + 1].role : 'unknown';
+                if (next === 'assistant') entries[i].role = 'user';
+                else if (next === 'user') entries[i].role = 'assistant';
+            }
+            for (let i = 0; i < entries.length; i++) {
+                if (entries[i].role !== 'unknown') continue;
+                const prev = i > 0 ? entries[i - 1].role : 'unknown';
+                if (prev === 'assistant') entries[i].role = 'user';
+                else if (prev === 'user') entries[i].role = 'assistant';
+            }
         }
 
-        return uniqueContextLines(
-            entries.map(entry => formatContextMessage(entry.role, entry.text))
-        );
+        return entries.map(normalizeContextRecord).filter(Boolean);
     }
 
     function collectChatContext(maxN) {
         const n = clamp(parseInt(maxN, 10) || 6, 1, 30);
-        const visible = collectVisibleChatLines();
+        const visibleRecords = collectVisibleChatLines();
+        rememberCtxLines(visibleRecords);
 
-        rememberCtxLines(visible);
-
-        /*
-         * 현재 화면에서 읽은 메시지가 충분하면 그것을 우선 사용한다.
-         * 부족한 경우에만 캐시의 과거 항목을 앞쪽에 보충한다.
-         */
-        if (visible.length >= n) {
-            return visible.slice(-n);
-        }
-
-        const visibleSet = new Set(visible);
-        const older = getCtxCache().filter(line => !visibleSet.has(line));
-
-        return uniqueContextLines([
-            ...older,
-            ...visible,
-        ]).slice(-n);
+        const cache = getCtxCache();
+        const records = cache.length ? cache : visibleRecords;
+        return records.slice(-n).map(item => formatContextMessage(item.role, item.text));
     }
 
     function findChatRoot() {
@@ -746,22 +722,34 @@
             lines.push('- 위 문체 규칙을 적극 반영한다.');
         }
 
+        let latestAssistant = '';
+        let priorContext = Array.isArray(context) ? context.slice() : [];
+
+        for (let i = priorContext.length - 1; i >= 0; i--) {
+            if (/^\[상대 캐릭터\]/.test(priorContext[i])) {
+                latestAssistant = priorContext[i]
+                    .replace(/^\[상대 캐릭터\]\s*/, '')
+                    .trim();
+                priorContext.splice(i, 1);
+                break;
+            }
+        }
+
+        if (priorContext.length) {
+            lines.push('');
+            lines.push('[이전 대화 기록: 위가 과거, 아래가 최신]');
+            priorContext.forEach(item => lines.push('· ' + item));
+        }
+
         if (context && context.length) {
             lines.push('');
-            lines.push('[최근 채팅 맥락: 위가 과거, 아래가 최신]');
-            context.forEach((item, index) => {
-                lines.push(
-                    (index === context.length - 1 ? '· [가장 최신] ' : '· ') +
-                    item
-                );
-            });
+            lines.push('[문맥 판정 규칙]');
+            lines.push('- 먼저 직전 상대 출력에서 현재 장소, 서로의 자세, 신체 접촉, 거리, 시선, 들고 있는 물건, 감정, 질문을 내부적으로 판정한다.');
+            lines.push('- 그 판정과 입력된 대사/행동이 모순되지 않게 이어 쓴다.');
+            lines.push('- 과거 상태와 직전 상태가 충돌하면 직전 상대 출력의 상태가 현재 사실이다.');
             lines.push('- [유저]와 [상대 캐릭터]의 역할을 절대 뒤바꾸지 않는다.');
-            lines.push('- 아래에서 위로 거슬러 읽지 말고, 과거→최신 순서의 인과관계를 유지한다.');
-            lines.push('- 가장 마지막 [상대 캐릭터] 메시지에서 현재 장소·자세·접촉·거리·감정·질문·요구를 먼저 판정한다.');
-            lines.push('- 오래된 상태와 최신 상태가 충돌하면 최신 상태만 현재 사실로 사용한다.');
-            lines.push('- 이번 [대사]/[행동]은 마지막 상대 캐릭터 메시지에 대한 유저의 즉각적인 다음 반응이다.');
-            lines.push('- 맥락 내용을 요약하거나 되풀이하지 말고, 필요한 사실만 자연스럽게 반영한다.');
-            lines.push('- 이미 벌어진 상태 변화를 유지한다.');
+            lines.push('- 상대 캐릭터의 행동이나 반응을 대신 진행하지 않는다.');
+            lines.push('- 맥락을 요약하거나 그대로 재진술하지 않는다.');
         }
 
         lines.push('');
@@ -790,13 +778,16 @@
         lines.push('- 길이: ' + (LENGTHS[length] || LENGTHS.medium).guide);
 
         const user = [
-            '[대사]',
+            '[직전 상대 캐릭터 출력 — 현재 장면의 기준]',
+            latestAssistant || '(직전 상대 출력을 찾지 못함)',
+            '',
+            '[이번 유저 대사]',
             dialogue.trim() || '(없음)',
             '',
-            '[행동]',
+            '[이번 유저 행동]',
             action.trim() || '(없음)',
             '',
-            '위 규칙대로 유저 캐릭터의 이번 반응 본문만 출력해줘.'
+            '직전 상대 출력 바로 다음 순간부터 이어지는 유저 캐릭터의 반응 본문만 출력해줘.'
         ].join('\n');
 
         return {
@@ -1737,7 +1728,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.23</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.24</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
