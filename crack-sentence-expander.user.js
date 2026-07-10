@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         크랙 문장 부풀리기 (Gemini) · 시작채팅/캐시 핫픽스
+// @name         크랙 문장 부풀리기 (Gemini) · v6.12.19 FINAL
 // @namespace    https://crack.wrtn.ai
 // @version      6.12.19
 // @author       me
@@ -20,7 +20,7 @@
     'use strict';
 
     /*
-     * v6.12.18 핫픽스
+     * v6.12.19 핫픽스
      *
      * 원본 v6.12.13의 모든 기능은 @require로 그대로 실행한다.
      * 이 아래 코드는 원본 내부 함수를 건드리지 않고 다음만 보강한다.
