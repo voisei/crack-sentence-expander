@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.28
+// @version      6.12.29
 // @author       me
-// @description  실제 화면의 마지막 턴을 생성 기준으로 고정하고, 문맥과 어긋난 일반론 출력은 자동 재교정하는 단일 실행판.
+// @description  실제 직전 턴 고정·자동 재교정에 더해, 모바일 키보드가 열릴 때 플로팅 토글이 위로 밀리지 않도록 고정한 단일 실행판.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -103,6 +103,37 @@
             style.visibility !== 'hidden' &&
             style.opacity !== '0'
         );
+    }
+
+    let stableViewportHeight = window.visualViewport
+        ? window.visualViewport.height
+        : window.innerHeight;
+
+    function isTypingElement(element) {
+        if (!element) return false;
+
+        const tag = String(element.tagName || '').toLowerCase();
+
+        return (
+            tag === 'textarea' ||
+            tag === 'input' ||
+            element.isContentEditable
+        );
+    }
+
+    function isSoftKeyboardOpen() {
+        const vv = window.visualViewport;
+        if (!vv) return false;
+
+        const focused = isTypingElement(document.activeElement);
+        const heightLoss = stableViewportHeight - vv.height;
+
+        /* 키보드가 닫힌 상태에서만 기준 높이를 갱신한다. */
+        if (!focused && vv.height > stableViewportHeight - 40) {
+            stableViewportHeight = Math.max(stableViewportHeight, vv.height);
+        }
+
+        return focused && heightLoss > 120;
     }
 
     function getViewport() {
@@ -2047,7 +2078,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.28</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.29</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -3125,9 +3156,17 @@
             togglePanel
         );
 
-        /* 모바일 화면 변화 복구 */
+        /* 모바일 화면 변화 복구
+         * 소프트 키보드가 열리면 visualViewport 높이가 줄어드는데,
+         * 이때 FAB을 보정하면 토글이 키보드 위로 튀어 오른다.
+         * 키보드가 열린 동안에는 FAB 위치를 그대로 유지한다.
+         */
         const repair = () => {
-            clampElementToViewport(fab, null, false);
+            const keyboardOpen = isSoftKeyboardOpen();
+
+            if (!keyboardOpen) {
+                clampElementToViewport(fab, null, false);
+            }
 
             if (getComputedStyle(panel).display !== 'none') {
                 clampElementToViewport(panel, null, true);
@@ -3136,7 +3175,15 @@
 
         window.addEventListener('resize', repair, { passive: true });
         window.addEventListener('orientationchange', () => {
-            setTimeout(repair, 250);
+            setTimeout(() => {
+                if (!isSoftKeyboardOpen()) {
+                    stableViewportHeight = window.visualViewport
+                        ? window.visualViewport.height
+                        : window.innerHeight;
+                }
+
+                repair();
+            }, 350);
         }, { passive: true });
 
         if (window.visualViewport) {
@@ -3182,7 +3229,9 @@
                     const panel = document.getElementById(PANEL_ID);
                     const fab = document.getElementById(FAB_ID);
 
-                    clampElementToViewport(fab, null, false);
+                    if (!isSoftKeyboardOpen()) {
+                        clampElementToViewport(fab, null, false);
+                    }
 
                     if (
                         panel &&
