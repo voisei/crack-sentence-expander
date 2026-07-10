@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 시작채팅/캐시 핫픽스
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.16
+// @version      6.12.17
 // @author       me
-// @description  v6.12.13 전체 기능 + 시작 상황 카드 전체 감지 + 맥락 미리보기 교체 + 채팅방별 캐시 지우기
+// @description  v6.12.13 전체 기능 + 시작 상황 카드 전체 감지 + 맥락 미리보기 교체 + 채팅방별 캐시 지우기 + 모바일 이동 범위 제한
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -20,7 +20,7 @@
     'use strict';
 
     /*
-     * v6.12.16 핫픽스
+     * v6.12.17 핫픽스
      *
      * 원본 v6.12.13의 모든 기능은 @require로 그대로 실행한다.
      * 이 아래 코드는 원본 내부 함수를 건드리지 않고 다음만 보강한다.
@@ -33,10 +33,12 @@
      * 6) 원본 맥락 미리보기 버튼을 새 수집기로 교체
      * 7) 설정의 "이 채팅방 캐시 지우기" 버튼 복구
      * 8) document.body 전체를 상시 감시하지 않고 채팅 영역만 감시
+     * 9) 모바일에서 실행 버튼과 패널이 화면 밖으로 나가지 않게 제한
      */
 
     const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room';
     const CTX_CACHE_LIMIT = 300;
+    const MOBILE_EDGE_GAP = 12;
 
     let observer = null;
     let observedRoot = null;
@@ -44,6 +46,9 @@
     let routeTimer = null;
     let uiTimer = null;
     let lastUrl = location.href;
+
+    let positionGuardObserver = null;
+    let positionGuardTimer = null;
 
     function getCurrentChatCacheKey() {
         const path = location.pathname || '';
@@ -225,10 +230,6 @@
         const panel = document.getElementById('se-panel');
         const collected = [];
 
-        /*
-         * 메시지 그룹을 먼저 읽는다.
-         * 시작 메시지가 일반 wrtn-markdown과 다른 구조여도 여기서 잡힌다.
-         */
         const groups = Array.from(
             document.querySelectorAll('[data-message-group-id]')
         ).filter(group => !panel || !panel.contains(group));
@@ -237,9 +238,6 @@
             collected.push(...extractFromMessageGroup(group));
         }
 
-        /*
-         * 그룹 밖에 독립적으로 렌더링된 시작 메시지/프롤로그도 읽는다.
-         */
         const orphanMarkdowns = Array.from(
             document.querySelectorAll('.wrtn-markdown')
         ).filter(el => {
@@ -257,9 +255,6 @@
             if (!isBadContextLine(text)) collected.push(text);
         }
 
-        /*
-         * 사이트 구조가 바뀐 경우를 위한 마지막 비상 수집.
-         */
         const fallbackNodes = Array.from(document.querySelectorAll(
             '[data-testid*="assistant"],' +
             '[data-testid*="message"],' +
@@ -289,11 +284,6 @@
             if (!isBadContextLine(text)) collected.push(text);
         }
 
-        /*
-         * 첫 시작 화면은 message-group / wrtn-markdown이 아닌
-         * 일반 React div와 p 태그로 표시되는 경우가 있다.
-         * 채팅 입력창 주변의 실제 보이는 '잎 텍스트 블록'도 후보로 읽는다.
-         */
         const chatInput = findPageChatInput();
         const genericRoot =
             (chatInput && findConversationRootFromInput(chatInput)) ||
@@ -318,10 +308,8 @@
 
                 const rect = el.getBoundingClientRect();
 
-                // 입력창 아래쪽이나 화면 밖의 UI는 제외
                 if (rect.top >= inputTop + 20) return false;
 
-                // 큰 부모 래퍼 대신 실제 본문에 가까운 안쪽 블록만 사용
                 const childTextBlock = Array.from(el.children || []).some(child => {
                     const childText = cleanContextLine(
                         child.innerText || child.textContent || ''
@@ -342,10 +330,6 @@
                 if (!isBadContextLine(text)) collected.push(text);
             }
 
-            /*
-             * p/li 같은 태그도 없는 완전한 div 기반 시작문구를 위한 최종 수집.
-             * 텍스트 노드의 부모가 작은 보이는 블록일 때만 가져온다.
-             */
             if (!uniqueLines(collected).length || uniqueLines(collected).length < 2) {
                 const walker = document.createTreeWalker(
                     genericRoot,
@@ -380,7 +364,6 @@
                                 return NodeFilter.FILTER_REJECT;
                             }
 
-                            // 페이지 전체를 감싼 거대한 부모 텍스트는 제외
                             if (
                                 rect.width > window.innerWidth * 0.98 &&
                                 rect.height > window.innerHeight * 0.8
@@ -401,11 +384,6 @@
             }
         }
 
-        /*
-         * 노란색/갈색 배경으로 표시되는 '시작 상황 카드'는
-         * 메시지 그룹도 wrtn-markdown도 아닐 수 있다.
-         * 입력창 바로 위의 큰 본문 카드를 찾아 전체를 한 문맥으로 저장한다.
-         */
         const scenarioCards = collectScenarioCards();
 
         for (const cardText of scenarioCards) {
@@ -452,11 +430,8 @@
 
             const rect = el.getBoundingClientRect();
 
-            // 시작 상황 카드는 입력창 위에 있어야 한다.
             if (rect.top >= inputTop) continue;
             if (rect.bottom > inputTop + 30) continue;
-
-            // 버튼 한 줄이나 작은 UI 조각 제외
             if (rect.width < Math.min(220, window.innerWidth * 0.48)) continue;
             if (rect.height < 90) continue;
 
@@ -466,7 +441,6 @@
 
             if (text.length < 120 || text.length > 14000) continue;
 
-            // 상단 메뉴나 페이지 전체 래퍼가 섞인 후보 제외
             const uiNoise = [
                 '앱에서 더 편하게',
                 '다운로드',
@@ -486,10 +460,6 @@
 
             if (noiseCount >= 2) continue;
 
-            /*
-             * 페이지 전체를 감싼 거대한 컨테이너는 제외한다.
-             * 다만 긴 시작 상황 카드는 허용한다.
-             */
             if (
                 rect.width > window.innerWidth * 0.98 &&
                 rect.height > window.innerHeight * 0.92
@@ -508,10 +478,6 @@
                     return childText.length >= Math.max(100, text.length * 0.72);
                 });
 
-            /*
-             * 거의 같은 본문을 가진 더 안쪽 자식이 있으면
-             * 바깥 래퍼는 후보에서 제외한다.
-             */
             if (childCandidates.length) continue;
 
             const distance = Math.max(0, inputTop - rect.bottom);
@@ -623,7 +589,6 @@
 
             const rect = root.getBoundingClientRect();
 
-            // 화면의 대화 본문과 입력창을 함께 감싼 정도에서 멈춘다.
             if (
                 rect.height >= window.innerHeight * 0.55 ||
                 root.tagName === 'MAIN'
@@ -692,7 +657,6 @@
             return firstMarkdown.parentElement;
         }
 
-        // 첫 시작 화면처럼 전용 메시지 선택자가 없을 때는 입력창의 대화 컨테이너 감시
         const input = findPageChatInput();
         return findConversationRootFromInput(input);
     }
@@ -726,10 +690,6 @@
 
         observedRoot = nextRoot;
         observer = new MutationObserver(() => {
-            /*
-             * 스트리밍 글자 하나마다 저장하지 않고
-             * 변화가 잠잠해졌을 때 한 번만 저장한다.
-             */
             scheduleScan(1100);
         });
 
@@ -752,12 +712,15 @@
             setTimeout(attachObserver, 150);
             setTimeout(attachObserver, 600);
             setTimeout(scanNow, 1000);
+            setTimeout(clampAllFloatingElements, 700);
             return;
         }
 
         if (!observedRoot || !document.contains(observedRoot)) {
             attachObserver();
         }
+
+        schedulePositionClamp(0);
     }
 
     function setContextStatus(message, isError) {
@@ -775,16 +738,12 @@
         const title = panel.querySelector('#se-title');
         if (title) {
             title.textContent = (title.textContent || '')
-                .replace(/v6\.12\.(?:13|14|15)/g, 'v6.12.16');
+                .replace(/v6\.12\.(?:13|14|15|16)/g, 'v6.12.17');
         }
 
         let previewButton = panel.querySelector('#se-ctx-test');
         if (!previewButton) return false;
 
-        /*
-         * 원본 버튼에 달린 기존 클릭 리스너를 제거하기 위해 복제 교체한다.
-         * 이제 미리보기는 이 핫픽스의 특수 시작화면 감지기를 직접 사용한다.
-         */
         if (!previewButton.dataset.seHotfixPreview) {
             const freshPreview = previewButton.cloneNode(true);
             freshPreview.dataset.seHotfixPreview = '1';
@@ -877,10 +836,6 @@
 
         buttonWrap.appendChild(button);
 
-        /*
-         * 원본 CSS에 버튼 스타일이 빠진 버전에서도
-         * 다른 설정 버튼과 같은 모양으로 보이게 한다.
-         */
         if (!document.getElementById('se-context-hotfix-style')) {
             const style = document.createElement('style');
             style.id = 'se-context-hotfix-style';
@@ -909,14 +864,314 @@
             document.head.appendChild(style);
         }
 
+        schedulePositionClamp(0);
         return true;
     }
 
+    function getSafeViewport() {
+        const viewport = window.visualViewport;
+
+        return {
+            left: viewport ? viewport.offsetLeft : 0,
+            top: viewport ? viewport.offsetTop : 0,
+            width: viewport ? viewport.width : window.innerWidth,
+            height: viewport ? viewport.height : window.innerHeight
+        };
+    }
+
+    function isFloatingElement(el) {
+        if (!el || !document.body.contains(el)) return false;
+
+        const style = getComputedStyle(el);
+
+        return (
+            style.position === 'fixed' ||
+            style.position === 'absolute'
+        );
+    }
+
+    function findSentenceExpanderFloatingElements() {
+        const panel = document.getElementById('se-panel');
+        const result = [];
+
+        if (panel) result.push(panel);
+
+        const selectors = [
+            '#se-fab',
+            '#se-toggle',
+            '#se-launcher',
+            '#se-floating-button',
+            '#se-open-btn',
+            '#se-main-button',
+            '[id^="se-fab"]',
+            '[id^="se-toggle"]',
+            '[id^="se-launch"]',
+            '[data-se-fab]',
+            '[aria-label*="문장 부풀리기"]',
+            '[title*="문장 부풀리기"]'
+        ];
+
+        for (const selector of selectors) {
+            let elements = [];
+
+            try {
+                elements = Array.from(document.querySelectorAll(selector));
+            } catch (_) {
+                continue;
+            }
+
+            for (const el of elements) {
+                if (panel && panel.contains(el)) continue;
+                if (!result.includes(el)) result.push(el);
+            }
+        }
+
+        const fixedCandidates = Array.from(
+            document.querySelectorAll('button, [role="button"], div')
+        ).filter(el => {
+            if (panel && panel.contains(el)) return false;
+            if (!isFloatingElement(el)) return false;
+
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 32 || rect.height < 32) return false;
+            if (rect.width > 130 || rect.height > 130) return false;
+
+            const style = getComputedStyle(el);
+            const zIndex = parseInt(style.zIndex, 10);
+
+            if (Number.isFinite(zIndex) && zIndex < 100) return false;
+
+            const text = String(
+                el.getAttribute('aria-label') ||
+                el.getAttribute('title') ||
+                el.textContent ||
+                ''
+            ).trim();
+
+            return (
+                text.includes('✨') ||
+                text.includes('문장') ||
+                text.includes('부풀리기')
+            );
+        });
+
+        for (const el of fixedCandidates) {
+            if (!result.includes(el)) result.push(el);
+        }
+
+        return result;
+    }
+
+    function clampFloatingElement(el) {
+        if (!el || !document.body.contains(el)) return false;
+
+        const style = getComputedStyle(el);
+
+        if (
+            style.display === 'none' ||
+            style.visibility === 'hidden'
+        ) {
+            return false;
+        }
+
+        const viewport = getSafeViewport();
+        const rect = el.getBoundingClientRect();
+
+        if (rect.width < 2 || rect.height < 2) return false;
+
+        const gap = MOBILE_EDGE_GAP;
+        const minLeft = viewport.left + gap;
+        const minTop = viewport.top + gap;
+
+        const maxLeft = Math.max(
+            minLeft,
+            viewport.left + viewport.width - rect.width - gap
+        );
+
+        const visibleHeight = el.id === 'se-panel'
+            ? Math.min(rect.height, 100)
+            : rect.height;
+
+        const maxTop = Math.max(
+            minTop,
+            viewport.top + viewport.height - visibleHeight - gap
+        );
+
+        const safeLeft = Math.min(
+            maxLeft,
+            Math.max(minLeft, rect.left)
+        );
+
+        const safeTop = Math.min(
+            maxTop,
+            Math.max(minTop, rect.top)
+        );
+
+        const moved =
+            Math.abs(safeLeft - rect.left) > 0.5 ||
+            Math.abs(safeTop - rect.top) > 0.5;
+
+        if (!moved) return false;
+
+        el.style.setProperty('position', 'fixed', 'important');
+        el.style.setProperty('left', safeLeft + 'px', 'important');
+        el.style.setProperty('top', safeTop + 'px', 'important');
+        el.style.setProperty('right', 'auto', 'important');
+        el.style.setProperty('bottom', 'auto', 'important');
+        el.style.setProperty('transform', 'none', 'important');
+
+        return true;
+    }
+
+    function clampAllFloatingElements() {
+        const elements = findSentenceExpanderFloatingElements();
+
+        for (const el of elements) {
+            clampFloatingElement(el);
+        }
+    }
+
+    function schedulePositionClamp(delay) {
+        if (positionGuardTimer) {
+            clearTimeout(positionGuardTimer);
+        }
+
+        positionGuardTimer = setTimeout(() => {
+            positionGuardTimer = null;
+            clampAllFloatingElements();
+        }, Number.isFinite(delay) ? delay : 30);
+    }
+
+    function installMobilePositionGuard() {
+        if (!document.getElementById('se-mobile-position-guard-style')) {
+            const style = document.createElement('style');
+            style.id = 'se-mobile-position-guard-style';
+            style.textContent = `
+                @media (pointer: coarse), (max-width: 700px) {
+                    #se-panel {
+                        max-width: calc(100vw - 24px) !important;
+                        max-height: calc(100dvh - 24px) !important;
+                        overscroll-behavior: contain !important;
+                    }
+
+                    #se-panel > * {
+                        max-width: 100% !important;
+                    }
+
+                    #se-fab,
+                    #se-toggle,
+                    #se-launcher,
+                    #se-floating-button,
+                    #se-open-btn,
+                    #se-main-button,
+                    [id^="se-fab"],
+                    [id^="se-toggle"],
+                    [id^="se-launch"] {
+                        touch-action: none !important;
+                    }
+                }
+            `;
+
+            document.head.appendChild(style);
+        }
+
+        const moveEvents = [
+            'pointermove',
+            'touchmove',
+            'mousemove'
+        ];
+
+        for (const eventName of moveEvents) {
+            document.addEventListener(
+                eventName,
+                () => schedulePositionClamp(0),
+                { capture: true, passive: true }
+            );
+        }
+
+        const endEvents = [
+            'pointerup',
+            'pointercancel',
+            'touchend',
+            'touchcancel',
+            'mouseup'
+        ];
+
+        for (const eventName of endEvents) {
+            document.addEventListener(
+                eventName,
+                () => schedulePositionClamp(0),
+                true
+            );
+        }
+
+        window.addEventListener(
+            'resize',
+            () => schedulePositionClamp(20),
+            { passive: true }
+        );
+
+        window.addEventListener(
+            'orientationchange',
+            () => {
+                schedulePositionClamp(50);
+                setTimeout(clampAllFloatingElements, 300);
+            },
+            { passive: true }
+        );
+
+        if (window.visualViewport) {
+            window.visualViewport.addEventListener(
+                'resize',
+                () => schedulePositionClamp(20),
+                { passive: true }
+            );
+
+            window.visualViewport.addEventListener(
+                'scroll',
+                () => schedulePositionClamp(20),
+                { passive: true }
+            );
+        }
+
+        if (!positionGuardObserver) {
+            positionGuardObserver = new MutationObserver(mutations => {
+                const shouldCheck = mutations.some(mutation => {
+                    if (mutation.type === 'attributes') return true;
+
+                    return Array.from(mutation.addedNodes || []).some(node => {
+                        return (
+                            node.nodeType === Node.ELEMENT_NODE &&
+                            (
+                                node.id === 'se-panel' ||
+                                node.querySelector?.('#se-panel') ||
+                                String(node.id || '').startsWith('se-')
+                            )
+                        );
+                    });
+                });
+
+                if (shouldCheck) {
+                    schedulePositionClamp(30);
+                }
+            });
+
+            positionGuardObserver.observe(document.documentElement, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['style', 'class']
+            });
+        }
+
+        [0, 100, 300, 700, 1500, 3000].forEach(delay => {
+            setTimeout(clampAllFloatingElements, delay);
+        });
+    }
+
     function start() {
-        /*
-         * @require 원본 UI가 생성된 직후 버튼을 붙인다.
-         * 사이트 렌더링이 늦어도 일정 시간 동안만 확인한다.
-         */
+        installMobilePositionGuard();
+
         let attempts = 0;
 
         uiTimer = setInterval(() => {
@@ -932,24 +1187,18 @@
 
         attachObserver();
 
-        /*
-         * 첫 채팅은 이미 렌더링돼 있을 수 있으므로
-         * 즉시/조금 뒤/렌더링 완료 뒤 세 차례 읽는다.
-         */
         setTimeout(scanNow, 50);
         setTimeout(() => {
             attachObserver();
             scanNow();
+            clampAllFloatingElements();
         }, 500);
         setTimeout(() => {
             attachObserver();
             scanNow();
+            clampAllFloatingElements();
         }, 1300);
 
-        /*
-         * SPA 주소 이동과 채팅 루트 교체만 가볍게 확인한다.
-         * 실제 메시지 수집은 MutationObserver의 디바운스 방식이다.
-         */
         routeTimer = setInterval(checkRoute, 1800);
 
         window.addEventListener('popstate', () => {
