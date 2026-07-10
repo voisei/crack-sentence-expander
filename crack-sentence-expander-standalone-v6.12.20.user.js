@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.29
+// @version      6.12.30
 // @author       me
-// @description  실제 직전 턴 고정·자동 재교정에 더해, 모바일 키보드가 열릴 때 플로팅 토글이 위로 밀리지 않도록 고정한 단일 실행판.
+// @description  직전 턴 전체 흐름을 균형 있게 읽고 마지막 문장에 기계적으로 집착하지 않으며, 모바일 키보드에서도 플로팅 토글 위치를 고정한 단일 실행판.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -856,16 +856,18 @@
         return { text: '', source: '판별 실패', role: 'unknown' };
     }
 
-    function extractCueKeywords(cue) {
+    function extractSceneKeywords(text) {
         const stop = new Set([
             '그렇지', '여보', '알겠습니다', '말씀', '하시죠', '하겠습니다',
             '하십시오', '합니다', '있습니다', '없습니다', '그러면', '그리고',
             '하지만', '당신', '제가', '나는', '내가', '우리', '저희',
             '정말', '바로', '당장', '이제', '오늘도', '그냥', '조금',
-            '완벽한', '완벽하게', '확실하게', '사항', '임무', '조건'
+            '완벽한', '완벽하게', '확실하게', '사항', '임무', '조건',
+            '그가', '그녀가', '그는', '그녀는', '하며', '했다', '하였다'
         ]);
 
-        const tokens = String(cue || '')
+        const tokens = String(text || '')
+            .replace(/```상태창[\s\S]*?```/g, ' ')
             .replace(/[^0-9A-Za-z가-힣 ]+/g, ' ')
             .split(/\s+/)
             .map(token => token.trim())
@@ -880,22 +882,24 @@
             if (!out.includes(value)) out.push(value);
         }
 
-        return out.slice(0, 8);
+        return out.slice(0, 12);
     }
 
-    function isContextGroundedOutput(output, cue) {
-        const keywords = extractCueKeywords(cue);
-        if (!keywords.length) return true;
-
+    function isContextGroundedOutput(output, sceneFocus) {
         const normalized = String(output || '').replace(/\s+/g, ' ');
-        const hit = keywords.filter(word => normalized.includes(word));
-
-        /* 구체 단서가 여러 개면 최소 하나는 실제 출력에 남아야 한다.
-         * 하나도 없고 막연한 복종 문구만 있으면 문맥 이탈로 본다. */
-        if (hit.length >= 1) return true;
-
         const generic = /(?:말씀하신 사항|어떤 임무든|맡겨만 주시면|완벽하게 완수|확실하게 완수|악으로|깡으로|최선을 다하|문제없이 해내|명령대로 하)/;
-        return !generic.test(normalized);
+
+        /* 자동 재교정은 마지막 문장을 못 따라갔다는 이유로 발동하지 않는다.
+         * 어느 장면에도 붙일 수 있는 범용 복종문만 나온 경우에 한해,
+         * 직전 장면 전체에서 뽑은 단서가 하나라도 반영됐는지 확인한다. */
+        if (!generic.test(normalized)) return true;
+
+        const keywords = Array.isArray(sceneFocus && sceneFocus.keywords)
+            ? sceneFocus.keywords
+            : [];
+        if (!keywords.length) return false;
+
+        return keywords.some(word => normalized.includes(word));
     }
 
     function findChatRoot() {
@@ -955,32 +959,36 @@
     /* =========================
      * 프롬프트
      * ========================= */
-    function extractLatestActionableCue(text) {
+    function extractSceneFocus(text) {
         const cleaned = String(text || '')
             .replace(/\[\/\/\]:\s*#\s*\([^\n]*\)/g, ' ')
             .replace(/```상태창[\s\S]*?```/g, ' ')
             .replace(/```[\s\S]*?```/g, ' ')
             .trim();
 
-        if (!cleaned) return { cue: '', tail: '' };
+        if (!cleaned) {
+            return {
+                recentDialogue: [],
+                tail: '',
+                keywords: []
+            };
+        }
 
         const quotes = [];
         const quotePattern = /"([^"\n]{1,2000})"/g;
         let match;
 
         while ((match = quotePattern.exec(cleaned))) {
-            quotes.push({
-                text: match[1].trim(),
-                index: match.index
-            });
+            quotes.push(match[1].trim());
         }
 
-        const lastQuote = quotes.length ? quotes[quotes.length - 1] : null;
-        const cue = lastQuote ? lastQuote.text : '';
-        const anchor = lastQuote ? Math.max(0, lastQuote.index - 900) : Math.max(0, cleaned.length - 1800);
-        const tail = cleaned.slice(anchor).slice(-2200).trim();
+        const tail = cleaned.slice(-3000).trim();
 
-        return { cue, tail };
+        return {
+            recentDialogue: quotes.slice(-4),
+            tail,
+            keywords: extractSceneKeywords(tail)
+        };
     }
 
     function buildPrompt(dialogue, action, context, latestSnapshot) {
@@ -1064,7 +1072,7 @@
             }
         }
 
-        const actionable = extractLatestActionableCue(latestAssistant);
+        const sceneFocus = extractSceneFocus(latestAssistant);
 
         if (priorContext.length) {
             lines.push('');
@@ -1077,11 +1085,12 @@
             lines.push('[문맥 판정 규칙]');
             lines.push('- 먼저 현재 장면에서 장소, 함께 있는 인물, 제삼자의 질문이나 의심, 서로의 자세, 신체 접촉, 거리, 시선, 감정과 위기를 내부적으로 판정한다.');
             lines.push('- 상대 캐릭터가 방금 시작한 연기, 거짓말, 위장, 협조 요청, 질문 또는 행동 신호가 있다면 유저 반응은 그 의도를 즉시 이어받아야 한다.');
-            lines.push('- 직전 출력의 마지막 직접 질문·명령·제안·요청을 이번 반응의 최우선 대상으로 삼는다.');
-            lines.push('- 구체적인 지시가 있으면 첫 대사나 첫 행동에서 그 지시를 직접 받아야 한다. 막연한 충성, 각오, 임무 수행 선언으로 바꾸지 않는다.');
-            lines.push('- "알겠습니다", "완수하겠습니다", "맡겨만 주십시오"처럼 어느 장면에도 붙일 수 있는 일반론만으로 답하지 않는다.');
-            lines.push('- 직전 지시의 시간, 장소, 대상, 행동 중 최소 하나를 실제 대사나 행동에 구체적으로 반영한다.');
-            lines.push('- 예: "오늘 퇴근 후 짐을 싸서 들어오라"는 지시에는 오늘 퇴근 후 짐을 싸서 들어가겠다는 수락·거절·조건을 구체적으로 답한다. "무엇이든 해내겠습니다"처럼 핵심 행동을 생략하지 않는다.');
+            lines.push('- 직전 출력 전체의 흐름을 읽고, 지금 유저가 가장 자연스럽게 반응해야 할 지점을 스스로 고른다.');
+            lines.push('- 마지막 문장은 여러 단서 중 하나일 뿐이다. 마지막 문장만 기계적으로 받아치거나 그 표현을 반복하지 않는다.');
+            lines.push('- 마지막 발화가 단순한 마무리, 확인, 호칭, 전환 문구라면 그 앞의 사건·감정·행동 변화에 반응해도 된다.');
+            lines.push('- 질문·명령·제안이 있더라도 장면 전체의 감정선과 관계 변화까지 함께 고려하며, 반드시 첫 문장에서 직접 답할 필요는 없다.');
+            lines.push('- 다만 "알겠습니다", "완수하겠습니다", "맡겨만 주십시오"처럼 어느 장면에도 붙일 수 있는 일반론만으로 끝내지 않는다.');
+            lines.push('- 직전 장면의 장소, 행동, 감정, 관계, 문제 중 자연스러운 단서를 반영하되 특정 단어를 억지로 복창하지 않는다.');
             lines.push('- 현재 장면의 공동 목표와 당장 해결해야 할 위기를 페르소나와 평소 말투보다 우선한다.');
             lines.push('- 페르소나는 상황에 맞는 반응을 선택한 뒤 그 반응의 말투와 표현 방식에만 적용한다.');
             lines.push('- 첫 턴에는 [시작 상황/플레이 가이드] 안의 마지막 장면을 현재 시점으로 사용한다. 일반 턴에는 직전 상대 캐릭터 출력을 현재 시점으로 사용한다.');
@@ -1122,14 +1131,16 @@
             '[현재 장면의 기준 — ' + (latestSceneSource || '판별 실패') + ']',
             latestAssistant || '(현재 장면을 찾지 못함)',
             '',
-            '[직전 출력의 마지막 반응 대상]',
-            actionable.cue || '(직접 발화 없음 — 직전 장면의 마지막 행동과 상황에 반응)',
+            '[직전 장면의 최근 대화]',
+            sceneFocus.recentDialogue.length
+                ? sceneFocus.recentDialogue.map(item => '· ' + item).join('\n')
+                : '(직접 발화 없음)',
             '',
-            '[반드시 반영할 구체 단서]',
-            extractCueKeywords(actionable.cue).join(', ') || '(직접 발화 단서 없음)',
+            '[직전 장면의 최근 흐름]',
+            sceneFocus.tail || latestAssistant || '(없음)',
             '',
-            '[직전 장면의 마지막 부분]',
-            actionable.tail || latestAssistant || '(없음)',
+            '[장면 전체 참고 단서 — 복창 의무 없음]',
+            sceneFocus.keywords.join(', ') || '(없음)',
             '',
             '[이번 유저 대사]',
             dialogue.trim() || '(없음)',
@@ -1137,7 +1148,7 @@
             '[이번 유저 행동]',
             action.trim() || '(없음)',
             '',
-            '먼저 [직전 출력의 마지막 반응 대상]에 직접 답해. 구체적인 질문·명령·제안이 있다면 첫 대사나 첫 행동에서 반드시 그 내용을 받아야 한다. 그다음 현재 장면과 페르소나에 맞게 자연스럽게 확장해. 입력 초안이 장면과 충돌하면 장면에 맞게 고쳐 써.'
+            '직전 장면 전체의 흐름을 먼저 이해하고, 가장 자연스러운 반응 지점을 골라 현재 장면과 페르소나에 맞게 확장해. 마지막 문장만 기계적으로 받아치거나 특정 단어를 억지로 반복하지 마. 입력 초안이 장면과 충돌하면 핵심 의도만 살려 자연스럽게 고쳐 써.'
         ].join('\n');
 
         return {
@@ -2078,7 +2089,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.29</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.30</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -2803,7 +2814,7 @@
 
             const context = collectChatContext(n);
             const latestSnapshot = collectLatestSceneSnapshot();
-            const latestCue = extractLatestActionableCue(latestSnapshot.text);
+            const sceneFocus = extractSceneFocus(latestSnapshot.text);
 
             if (!context.length && !latestSnapshot.text) {
                 setInfo(
@@ -2818,10 +2829,10 @@
                 ctxStatus,
                 '실제 생성 기준: ' +
                     (latestSnapshot.source || '판별 실패') + '\n' +
-                    '마지막 반응 대상: ' +
-                    (latestCue.cue || '(직접 발화 없음)') + '\n' +
-                    '구체 단서: ' +
-                    (extractCueKeywords(latestCue.cue).join(', ') || '(없음)') + '\n\n' +
+                    '최근 대화 흐름: ' +
+                    (sceneFocus.recentDialogue.length ? sceneFocus.recentDialogue.join(' / ') : '(직접 발화 없음)') + '\n' +
+                    '장면 참고 단서: ' +
+                    (sceneFocus.keywords.join(', ') || '(없음)') + '\n\n' +
                     context.length +
                     '개 참고 예정 (요청 ' +
                     n +
@@ -3027,7 +3038,7 @@
             const latestSnapshot = ctxOn.checked
                 ? collectLatestSceneSnapshot()
                 : { text: '', source: '맥락 참고 꺼짐', role: 'unknown' };
-            const actionable = extractLatestActionableCue(latestSnapshot.text);
+            const sceneFocus = extractSceneFocus(latestSnapshot.text);
             const prompt = buildPrompt(d, a, context, latestSnapshot);
 
             goButton.disabled = true;
@@ -3043,8 +3054,7 @@
                 (text, costInfo) => {
                     if (
                         ctxOn.checked &&
-                        actionable.cue &&
-                        !isContextGroundedOutput(text, actionable.cue)
+                        !isContextGroundedOutput(text, sceneFocus)
                     ) {
                         flash('문맥과 동떨어진 일반론을 감지해 자동으로 다시 맞추는 중…');
 
@@ -3052,11 +3062,11 @@
                             prompt.user,
                             '',
                             '[재교정 요청]',
-                            '아래 첫 출력은 직전 장면의 구체 지시를 반영하지 못했다.',
+                            '아래 첫 출력은 어느 장면에도 붙일 수 있는 범용 복종문에 치우쳤다.',
                             '첫 출력: ' + text,
-                            '반드시 반영할 직전 발화: ' + actionable.cue,
-                            '구체 단서: ' + (extractCueKeywords(actionable.cue).join(', ') || '(없음)'),
-                            '막연한 각오·복종·임무 완수 선언을 버리고, 직전 발화에 실제로 답하는 유저 반응 본문만 새로 작성해.'
+                            '직전 장면의 최근 흐름: ' + (sceneFocus.tail || latestSnapshot.text || '(없음)'),
+                            '장면 전체 참고 단서: ' + (sceneFocus.keywords.join(', ') || '(없음)'),
+                            '마지막 문장 하나를 복창하지 말고 직전 장면 전체의 사건·감정·관계 변화 중 가장 자연스러운 지점에 반응하는 본문으로 다시 작성해.'
                         ].join('\n');
 
                         requestGemini(
