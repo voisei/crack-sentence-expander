@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 시작채팅/캐시 핫픽스
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.17
+// @version      6.12.18
 // @author       me
 // @description  v6.12.13 전체 기능 + 시작 상황 카드 전체 감지 + 맥락 미리보기 교체 + 채팅방별 캐시 지우기 + 모바일 이동 범위 제한
 // @match        https://crack.wrtn.ai/*
@@ -20,7 +20,7 @@
     'use strict';
 
     /*
-     * v6.12.17 핫픽스
+     * v6.12.18 핫픽스
      *
      * 원본 v6.12.13의 모든 기능은 @require로 그대로 실행한다.
      * 이 아래 코드는 원본 내부 함수를 건드리지 않고 다음만 보강한다.
@@ -738,7 +738,7 @@
         const title = panel.querySelector('#se-title');
         if (title) {
             title.textContent = (title.textContent || '')
-                .replace(/v6\.12\.(?:13|14|15|16)/g, 'v6.12.17');
+                .replace(/v6\.12\.(?:13|14|15|16|17)/g, 'v6.12.18');
         }
 
         let previewButton = panel.querySelector('#se-ctx-test');
@@ -1042,6 +1042,56 @@
         }, Number.isFinite(delay) ? delay : 30);
     }
 
+    function installEmergencyRecoveryButton() {
+        if (document.getElementById('se-emergency-recover')) return;
+
+        const button = document.createElement('button');
+        button.id = 'se-emergency-recover';
+        button.type = 'button';
+        button.textContent = '✨ 복구';
+        button.title = '문장 부풀리기 버튼/창을 화면 안으로 복구';
+
+        button.addEventListener('click', () => {
+            const panel = document.getElementById('se-panel');
+
+            if (panel) {
+                panel.style.setProperty('display', 'block', 'important');
+                panel.style.setProperty('visibility', 'visible', 'important');
+                panel.style.setProperty('opacity', '1', 'important');
+                panel.style.setProperty('position', 'fixed', 'important');
+                panel.style.setProperty('left', '12px', 'important');
+                panel.style.setProperty('top', '12px', 'important');
+                panel.style.setProperty('right', 'auto', 'important');
+                panel.style.setProperty('bottom', 'auto', 'important');
+                panel.style.setProperty('transform', 'none', 'important');
+                panel.style.setProperty('z-index', '2147483646', 'important');
+            }
+
+            clampAllFloatingElements();
+            setTimeout(clampAllFloatingElements, 100);
+            setTimeout(clampAllFloatingElements, 500);
+        });
+
+        Object.assign(button.style, {
+            position: 'fixed',
+            right: '12px',
+            bottom: '88px',
+            zIndex: '2147483647',
+            padding: '9px 11px',
+            border: '1px solid #53596d',
+            borderRadius: '999px',
+            background: '#23262f',
+            color: '#ffffff',
+            fontSize: '12px',
+            fontWeight: '700',
+            boxShadow: '0 4px 14px rgba(0,0,0,.35)',
+            cursor: 'pointer',
+            touchAction: 'manipulation'
+        });
+
+        document.body.appendChild(button);
+    }
+
     function installMobilePositionGuard() {
         if (!document.getElementById('se-mobile-position-guard-style')) {
             const style = document.createElement('style');
@@ -1171,6 +1221,7 @@
 
     function start() {
         installMobilePositionGuard();
+        installEmergencyRecoveryButton();
 
         let attempts = 0;
 
