@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.24
+// @version      6.12.25
 // @author       me
-// @description  대사/행동 분리, 페르소나 자동추천·3칸, 문체 3칸, 모델 드롭다운, 최근 대화 맥락·캐시, 비용 추적, 설정 동기화, 모바일 토글/패널 위치 제한.
+// @description  미리보기와 실제 생성이 동일한 맥락을 사용하며 시작 상황/플레이 가이드까지 통합 수집하는 단일 실행판.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -39,7 +39,8 @@
 
     const K_CTX_ON = 'se_ctx_on';
     const K_CTX_N = 'se_ctx_n';
-    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v3';
+    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v4';
+    const K_STORY_BOOTSTRAP_BASE = 'se_ctx_story_bootstrap_v4';
 
     const K_COST_ON = 'se_cost_on';
     const K_COST_USDKRW = 'se_cost_usdkrw';
@@ -627,14 +628,174 @@
         return entries.map(normalizeContextRecord).filter(Boolean);
     }
 
-    function collectChatContext(maxN) {
+    function getStoryId() {
+        const match = (location.pathname || '').match(/\/stories\/([^/?#]+)/i);
+        return match ? match[1] : '';
+    }
+
+    function getStoryBootstrapKey() {
+        const storyId = getStoryId();
+        return storyId ? K_STORY_BOOTSTRAP_BASE + '::' + storyId : '';
+    }
+
+    function getStoryBootstrap() {
+        const key = getStoryBootstrapKey();
+        if (!key) return [];
+        const value = GM_getValue(key, []);
+        if (!Array.isArray(value)) return [];
+
+        return value
+            .map(item => cleanContextLine(
+                item && typeof item === 'object' ? item.text : item
+            ))
+            .filter(text => text && !isBadContextLine(text));
+    }
+
+    function saveStoryBootstrap(lines) {
+        const key = getStoryBootstrapKey();
+        if (!key) return;
+
+        const old = getStoryBootstrap();
+        const merged = [];
+
+        for (const raw of [...old, ...(Array.isArray(lines) ? lines : [])]) {
+            const text = cleanContextLine(raw);
+            if (!text || isBadContextLine(text)) continue;
+
+            /* 부모 카드와 자식 카드가 둘 다 잡히면 더 구체적인 짧은 카드만 남긴다. */
+            const same = merged.findIndex(item => item === text);
+            if (same >= 0) continue;
+
+            const containedByNew = merged.findIndex(item =>
+                text.length >= item.length * 1.15 && text.includes(item)
+            );
+            if (containedByNew >= 0) continue;
+
+            for (let i = merged.length - 1; i >= 0; i--) {
+                if (
+                    merged[i].length >= text.length * 1.15 &&
+                    merged[i].includes(text)
+                ) {
+                    merged.splice(i, 1);
+                }
+            }
+
+            merged.push(text);
+        }
+
+        GM_setValue(key, merged.slice(-12));
+    }
+
+    function collectStoryBootstrap() {
+        const panel = document.getElementById(PANEL_ID);
+        const root = document.querySelector('main') || document.body;
+        const found = [];
+
+        const selectors = [
+            '#story-detail-scroll',
+            '[id*="story-detail"]',
+            '[data-testid*="story-detail"]',
+            '[class*="story-detail"]',
+            '[data-testid*="prologue"]',
+            '[data-testid*="scenario"]',
+            '[class*="prologue"]',
+            '[class*="scenario"]',
+            '[data-testid*="play-guide"]',
+            '[class*="play-guide"]',
+            '[data-testid*="status"]',
+            '[class*="status-window"]'
+        ];
+
+        for (const selector of selectors) {
+            let nodes = [];
+            try {
+                nodes = Array.from(document.querySelectorAll(selector));
+            } catch (_) {
+                continue;
+            }
+
+            for (const el of nodes) {
+                if (panel && panel.contains(el)) continue;
+                if (el.closest('[data-message-group-id]')) continue;
+                if (!isVisible(el)) continue;
+
+                const text = cleanContextLine(el.innerText || el.textContent || '');
+                if (text.length >= 20 && text.length <= 14000 && !isBadContextLine(text)) {
+                    found.push(text);
+                }
+            }
+        }
+
+        /* 전용 선택자가 없는 시작 카드용 보조 수집. 실제 채팅 그룹은 제외한다. */
+        const candidates = [];
+        for (const el of root.querySelectorAll('article, section, [role="article"], div')) {
+            if (!el || el === root) continue;
+            if (panel && panel.contains(el)) continue;
+            if (el.closest('[data-message-group-id]')) continue;
+            if (el.querySelector('[data-message-group-id]')) continue;
+            if (el.closest('nav, header, footer, aside, button, textarea, input, select, script, style')) continue;
+            if (!isVisible(el)) continue;
+
+            const rect = el.getBoundingClientRect();
+            if (rect.width < Math.min(220, window.innerWidth * 0.45)) continue;
+            if (rect.height < 70) continue;
+
+            const text = cleanContextLine(el.innerText || el.textContent || '');
+            if (text.length < 60 || text.length > 14000 || isBadContextLine(text)) continue;
+
+            const noisy = [
+                '문장 부풀리기', 'API 비용 추정', '설정 동기화',
+                '저장하고 닫기', '채팅창에 바로 넣기'
+            ].filter(word => text.includes(word)).length;
+            if (noisy >= 2) continue;
+
+            const childEquivalent = Array.from(el.children || []).some(child => {
+                const childText = cleanContextLine(child.innerText || child.textContent || '');
+                return childText.length >= Math.max(50, text.length * 0.82);
+            });
+            if (childEquivalent) continue;
+
+            candidates.push({
+                text,
+                top: rect.top,
+                score: Math.min(text.length, 8000) / 10 + Math.min(rect.height, 1400) / 6
+            });
+        }
+
+        candidates
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 5)
+            .sort((a, b) => a.top - b.top)
+            .forEach(item => found.push(item.text));
+
+        saveStoryBootstrap(found);
+        return getStoryBootstrap();
+    }
+
+    function getUnifiedContext(maxN) {
         const n = clamp(parseInt(maxN, 10) || 6, 1, 30);
+
+        /* 미리보기와 실제 생성이 반드시 이 함수 하나만 사용한다. */
+        collectStoryBootstrap();
+
         const visibleRecords = collectVisibleChatLines();
         rememberCtxLines(visibleRecords);
 
         const cache = getCtxCache();
         const records = cache.length ? cache : visibleRecords;
-        return records.slice(-n).map(item => formatContextMessage(item.role, item.text));
+        const recent = records
+            .slice(-n)
+            .map(item => formatContextMessage(item.role, item.text));
+
+        const story = getStoryBootstrap()
+            .slice(-4)
+            .map(text => '[시작 상황/플레이 가이드]\n' + text);
+
+        return [...story, ...recent];
+    }
+
+    function collectChatContext(maxN) {
+        return getUnifiedContext(maxN);
     }
 
     function findChatRoot() {
@@ -677,6 +838,7 @@
 
             contextScanTimer = setTimeout(() => {
                 rememberCtxLines(collectVisibleChatLines());
+                collectStoryBootstrap();
             }, 1000);
         });
 
@@ -687,6 +849,7 @@
         });
 
         rememberCtxLines(collectVisibleChatLines());
+        collectStoryBootstrap();
     }
 
     /* =========================
@@ -746,6 +909,7 @@
             lines.push('[문맥 판정 규칙]');
             lines.push('- 먼저 직전 상대 출력에서 현재 장소, 서로의 자세, 신체 접촉, 거리, 시선, 들고 있는 물건, 감정, 질문을 내부적으로 판정한다.');
             lines.push('- 그 판정과 입력된 대사/행동이 모순되지 않게 이어 쓴다.');
+            lines.push('- [시작 상황/플레이 가이드]는 배경 설정일 뿐, 현재 시점은 반드시 직전 상대 출력으로 판단한다.');
             lines.push('- 과거 상태와 직전 상태가 충돌하면 직전 상대 출력의 상태가 현재 사실이다.');
             lines.push('- [유저]와 [상대 캐릭터]의 역할을 절대 뒤바꾸지 않는다.');
             lines.push('- 상대 캐릭터의 행동이나 반응을 대신 진행하지 않는다.');
@@ -1728,7 +1892,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.24</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.25</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -2796,10 +2960,16 @@
         buildUI();
         attachContextObserver();
 
+        [100, 500, 1200, 2500, 5000].forEach(delay => {
+            setTimeout(collectStoryBootstrap, delay);
+        });
+
         routeTimer = setInterval(() => {
             if (location.href !== lastUrl) {
                 lastUrl = location.href;
                 setTimeout(attachContextObserver, 300);
+                setTimeout(collectStoryBootstrap, 350);
+                setTimeout(collectStoryBootstrap, 1200);
                 setTimeout(() => {
                     const panel = document.getElementById(PANEL_ID);
                     const fab = document.getElementById(FAB_ID);
