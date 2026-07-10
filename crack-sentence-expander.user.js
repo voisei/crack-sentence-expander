@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 시작채팅/캐시 핫픽스
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.18
+// @version      6.12.19
 // @author       me
-// @description  v6.12.13 전체 기능 + 시작 상황 카드 전체 감지 + 맥락 미리보기 교체 + 채팅방별 캐시 지우기 + 모바일 이동 범위 제한
+// @description  v6.12.13 전체 기능 + 시작 상황 카드 전체 감지 + 맥락 미리보기 교체 + 채팅방별 캐시 지우기 + 모바일 이동 범위 제한 + 고정 대체 토글
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -738,7 +738,7 @@
         const title = panel.querySelector('#se-title');
         if (title) {
             title.textContent = (title.textContent || '')
-                .replace(/v6\.12\.(?:13|14|15|16|17)/g, 'v6.12.18');
+                .replace(/v6\.12\.(?:13|14|15|16|17|18)/g, 'v6.12.19');
         }
 
         let previewButton = panel.querySelector('#se-ctx-test');
@@ -1043,53 +1043,136 @@
     }
 
     function installEmergencyRecoveryButton() {
-        if (document.getElementById('se-emergency-recover')) return;
+        let button = document.getElementById('se-emergency-recover');
 
-        const button = document.createElement('button');
-        button.id = 'se-emergency-recover';
-        button.type = 'button';
-        button.textContent = '✨ 복구';
-        button.title = '문장 부풀리기 버튼/창을 화면 안으로 복구';
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'se-emergency-recover';
+            button.type = 'button';
+            button.textContent = '✨ 문장';
+            button.title = '문장 부풀리기 열기/닫기';
+            button.setAttribute('aria-label', '문장 부풀리기 열기/닫기');
 
-        button.addEventListener('click', () => {
-            const panel = document.getElementById('se-panel');
+            Object.assign(button.style, {
+                position: 'fixed',
+                right: '12px',
+                bottom: '88px',
+                zIndex: '2147483647',
+                minWidth: '58px',
+                minHeight: '42px',
+                padding: '9px 12px',
+                border: '1px solid #53596d',
+                borderRadius: '999px',
+                background: '#23262f',
+                color: '#ffffff',
+                fontSize: '12px',
+                fontWeight: '700',
+                cursor: 'pointer',
+                boxShadow: '0 5px 18px rgba(0, 0, 0, 0.35)',
+                touchAction: 'manipulation'
+            });
 
-            if (panel) {
-                panel.style.setProperty('display', 'block', 'important');
-                panel.style.setProperty('visibility', 'visible', 'important');
-                panel.style.setProperty('opacity', '1', 'important');
-                panel.style.setProperty('position', 'fixed', 'important');
-                panel.style.setProperty('left', '12px', 'important');
-                panel.style.setProperty('top', '12px', 'important');
-                panel.style.setProperty('right', 'auto', 'important');
-                panel.style.setProperty('bottom', 'auto', 'important');
-                panel.style.setProperty('transform', 'none', 'important');
-                panel.style.setProperty('z-index', '2147483646', 'important');
-            }
+            document.body.appendChild(button);
+        }
+
+        function getPanel() {
+            return document.getElementById('se-panel');
+        }
+
+        function isPanelOpen(panel) {
+            if (!panel) return false;
+
+            const style = getComputedStyle(panel);
+            const rect = panel.getBoundingClientRect();
+
+            return (
+                style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0' &&
+                rect.width > 2 &&
+                rect.height > 2
+            );
+        }
+
+        function syncToggleLabel() {
+            const panel = getPanel();
+            const opened = isPanelOpen(panel);
+
+            button.textContent = opened ? '✕ 닫기' : '✨ 문장';
+            button.setAttribute('aria-expanded', opened ? 'true' : 'false');
+        }
+
+        function openPanel(panel) {
+            panel.hidden = false;
+            panel.removeAttribute('hidden');
+            panel.style.setProperty('display', 'block', 'important');
+            panel.style.setProperty('visibility', 'visible', 'important');
+            panel.style.setProperty('opacity', '1', 'important');
+            panel.style.setProperty('position', 'fixed', 'important');
+            panel.style.setProperty('left', '12px', 'important');
+            panel.style.setProperty('top', '12px', 'important');
+            panel.style.setProperty('right', 'auto', 'important');
+            panel.style.setProperty('bottom', 'auto', 'important');
+            panel.style.setProperty('transform', 'none', 'important');
+            panel.style.setProperty('z-index', '2147483646', 'important');
 
             clampAllFloatingElements();
             setTimeout(clampAllFloatingElements, 100);
             setTimeout(clampAllFloatingElements, 500);
-        });
+        }
 
-        Object.assign(button.style, {
-            position: 'fixed',
-            right: '12px',
-            bottom: '88px',
-            zIndex: '2147483647',
-            padding: '9px 11px',
-            border: '1px solid #53596d',
-            borderRadius: '999px',
-            background: '#23262f',
-            color: '#ffffff',
-            fontSize: '12px',
-            fontWeight: '700',
-            boxShadow: '0 4px 14px rgba(0,0,0,.35)',
-            cursor: 'pointer',
-            touchAction: 'manipulation'
-        });
+        function closePanel(panel) {
+            panel.style.setProperty('display', 'none', 'important');
+        }
 
-        document.body.appendChild(button);
+        if (!button.dataset.seToggleInstalled) {
+            button.dataset.seToggleInstalled = '1';
+
+            button.addEventListener('click', () => {
+                let panel = getPanel();
+
+                if (!panel) {
+                    button.textContent = '로딩…';
+
+                    let tries = 0;
+                    const waitPanel = setInterval(() => {
+                        tries += 1;
+                        panel = getPanel();
+
+                        if (panel) {
+                            clearInterval(waitPanel);
+                            openPanel(panel);
+                            syncToggleLabel();
+                            return;
+                        }
+
+                        if (tries >= 20) {
+                            clearInterval(waitPanel);
+                            button.textContent = '⚠️ 없음';
+                            button.title = '@require 원본 스크립트가 실행되지 않았어요. 페이지 새로고침 후 다시 눌러주세요.';
+                            setTimeout(syncToggleLabel, 1800);
+                        }
+                    }, 150);
+
+                    return;
+                }
+
+                if (isPanelOpen(panel)) {
+                    closePanel(panel);
+                } else {
+                    openPanel(panel);
+                }
+
+                syncToggleLabel();
+            });
+        }
+
+        syncToggleLabel();
+
+        if (!button.dataset.seLabelWatcher) {
+            button.dataset.seLabelWatcher = '1';
+            setInterval(syncToggleLabel, 700);
+        }
     }
 
     function installMobilePositionGuard() {
