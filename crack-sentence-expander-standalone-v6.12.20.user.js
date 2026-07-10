@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.21
+// @version      6.12.22
 // @author       me
 // @description  대사/행동 분리, 페르소나 자동추천·3칸, 문체 3칸, 모델 드롭다운, 최근 대화 맥락·캐시, 비용 추적, 설정 동기화, 모바일 토글/패널 위치 제한.
 // @match        https://crack.wrtn.ai/*
@@ -324,20 +324,23 @@
     }
 
     function rememberCtxLines(lines) {
-        const old = getCtxCache();
-        const merged = old.slice();
-        const recentSeen = new Set(old.slice(-80));
+        const fresh = uniqueContextLines(lines);
+        if (!fresh.length) return;
 
-        for (const line of uniqueContextLines(lines)) {
-            const last = merged[merged.length - 1];
+        /*
+         * 화면에서 다시 읽힌 항목은 기존 캐시 위치에서 제거한 뒤
+         * 현재 화면의 과거→최신 순서대로 맨 뒤에 다시 붙인다.
+         * SPA 이동·가상 스크롤·flex 역순 때문에 최신 대화 순서가
+         * 뒤섞이는 문제를 방지한다.
+         */
+        const freshSet = new Set(fresh);
+        const kept = getCtxCache().filter(line => !freshSet.has(line));
+        const merged = dropStreamingPrefixes([
+            ...kept,
+            ...fresh,
+        ]);
 
-            if (last === line || recentSeen.has(line)) continue;
-
-            recentSeen.add(line);
-            merged.push(line);
-        }
-
-        saveCtxCache(dropStreamingPrefixes(merged));
+        saveCtxCache(merged);
     }
 
     function collectScenarioCards() {
@@ -408,51 +411,100 @@
 
     function collectVisibleChatLines() {
         const panel = document.getElementById(PANEL_ID);
-        const lines = [];
+        const entries = [];
+        let serial = 0;
 
-        const markdowns = Array.from(
+        function pushEntry(el, rawText, groupTop, localIndex) {
+            const text = cleanContextLine(rawText);
+            if (isBadContextLine(text)) return;
+
+            const rect = el && el.getBoundingClientRect
+                ? el.getBoundingClientRect()
+                : { top: Number.POSITIVE_INFINITY };
+
+            const top = Number.isFinite(groupTop)
+                ? groupTop
+                : (Number.isFinite(rect.top) ? rect.top : Number.POSITIVE_INFINITY);
+
+            entries.push({
+                text,
+                top,
+                localIndex: Number.isFinite(localIndex) ? localIndex : 0,
+                serial: serial++
+            });
+        }
+
+        /*
+         * 메시지 그룹 단위로 읽는다. 크랙은 DOM을 최신→과거로 두거나
+         * flex 역순으로 표시할 수 있으므로 querySelectorAll 순서를 믿지 않고
+         * 실제 화면 좌표(top) 기준으로 과거→최신 순서를 만든다.
+         */
+        const groups = Array.from(
+            document.querySelectorAll('[data-message-group-id]')
+        ).filter(group => !panel || !panel.contains(group));
+
+        for (const group of groups) {
+            const groupRect = group.getBoundingClientRect();
+            const groupTop = Number.isFinite(groupRect.top)
+                ? groupRect.top
+                : Number.POSITIVE_INFINITY;
+
+            const nodes = Array.from(group.querySelectorAll(
+                '.wrtn-markdown,' +
+                '[class*="whitespace-pre-wrap"],' +
+                '[class*="break-words"],' +
+                '[data-testid*="user"],' +
+                '[data-testid*="assistant"],' +
+                '[data-testid*="message"],' +
+                '[data-role="user"],' +
+                '[data-role="assistant"],' +
+                '[data-role="message"]'
+            )).filter(el => {
+                if (panel && panel.contains(el)) return false;
+                if (el.querySelector('.wrtn-markdown')) return false;
+                if (el.closest('.wrtn-markdown') && !el.classList.contains('wrtn-markdown')) return false;
+                if (el.querySelector('textarea, input, button, select')) return false;
+                return true;
+            });
+
+            nodes.forEach((el, index) => {
+                pushEntry(
+                    el,
+                    el.innerText || el.textContent || '',
+                    groupTop,
+                    index
+                );
+            });
+        }
+
+        /* 메시지 그룹 선택자가 없거나 일부 본문이 그룹 밖에 있을 때의 보조 수집 */
+        const orphanMarkdowns = Array.from(
             document.querySelectorAll('.wrtn-markdown')
         ).filter(el => {
             if (panel && panel.contains(el)) return false;
             if (el.querySelector('.wrtn-markdown')) return false;
+            if (el.closest('[data-message-group-id]')) return false;
             return true;
         });
 
-        for (const el of markdowns) {
-            const line = cleanContextLine(el.innerText || el.textContent || '');
-            if (!isBadContextLine(line)) lines.push(line);
-        }
+        orphanMarkdowns.forEach((el, index) => {
+            pushEntry(el, el.innerText || el.textContent || '', NaN, index);
+        });
 
-        if (!lines.length) {
-            const groups = Array.from(
-                document.querySelectorAll('[data-message-group-id]')
-            ).filter(el => !panel || !panel.contains(el));
+        entries.sort((a, b) => {
+            if (a.top !== b.top) return a.top - b.top;
+            if (a.localIndex !== b.localIndex) return a.localIndex - b.localIndex;
+            return a.serial - b.serial;
+        });
 
-            for (const group of groups) {
-                const textNodes = group.querySelectorAll(
-                    '.wrtn-markdown,' +
-                    '[class*="whitespace-pre-wrap"],' +
-                    '[class*="break-words"],' +
-                    '[data-testid*="message"],' +
-                    '[data-role*="message"]'
-                );
+        const messageLines = uniqueContextLines(entries.map(entry => entry.text));
+        const scenarioCards = uniqueContextLines(collectScenarioCards());
 
-                for (const el of textNodes) {
-                    if (el.querySelector('.wrtn-markdown')) continue;
-                    if (el.querySelector('textarea, input, button, select')) continue;
-
-                    const line = cleanContextLine(
-                        el.innerText || el.textContent || ''
-                    );
-
-                    if (!isBadContextLine(line)) lines.push(line);
-                }
-            }
-        }
-
-        lines.push(...collectScenarioCards());
-
-        return uniqueContextLines(lines);
+        /* 시작 상황/프롤로그는 최신 대화가 아니라 타임라인 맨 앞이다. */
+        return uniqueContextLines([
+            ...scenarioCards,
+            ...messageLines,
+        ]);
     }
 
     function collectChatContext(maxN) {
@@ -461,9 +513,20 @@
 
         rememberCtxLines(visible);
 
+        /*
+         * 현재 화면에서 읽은 메시지가 충분하면 그것을 우선 사용한다.
+         * 부족한 경우에만 캐시의 과거 항목을 앞쪽에 보충한다.
+         */
+        if (visible.length >= n) {
+            return visible.slice(-n);
+        }
+
+        const visibleSet = new Set(visible);
+        const older = getCtxCache().filter(line => !visibleSet.has(line));
+
         return uniqueContextLines([
-            ...getCtxCache(),
-            ...visible
+            ...older,
+            ...visible,
         ]).slice(-n);
     }
 
@@ -1538,7 +1601,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.21</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.22</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
