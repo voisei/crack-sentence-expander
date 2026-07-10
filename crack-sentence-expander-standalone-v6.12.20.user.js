@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.25
+// @version      6.12.26
 // @author       me
 // @description  미리보기와 실제 생성이 동일한 맥락을 사용하며 시작 상황/플레이 가이드까지 통합 수집하는 단일 실행판.
 // @match        https://crack.wrtn.ai/*
@@ -886,15 +886,33 @@
         }
 
         let latestAssistant = '';
+        let latestSceneSource = '';
         let priorContext = Array.isArray(context) ? context.slice() : [];
 
+        /* 일반 턴은 마지막 [상대 캐릭터]를 현재 장면으로 사용한다. */
         for (let i = priorContext.length - 1; i >= 0; i--) {
             if (/^\[상대 캐릭터\]/.test(priorContext[i])) {
                 latestAssistant = priorContext[i]
                     .replace(/^\[상대 캐릭터\]\s*/, '')
                     .trim();
+                latestSceneSource = '직전 상대 캐릭터 출력';
                 priorContext.splice(i, 1);
                 break;
+            }
+        }
+
+        /* 첫 턴에는 채팅 메시지 그룹이 없고 시작 카드만 존재할 수 있다.
+         * 이때 시작 상황 카드를 직전 장면으로 직접 승격한다. */
+        if (!latestAssistant) {
+            for (let i = priorContext.length - 1; i >= 0; i--) {
+                if (/^\[시작 상황\/플레이 가이드\]/.test(priorContext[i])) {
+                    latestAssistant = priorContext[i]
+                        .replace(/^\[시작 상황\/플레이 가이드\]\s*/, '')
+                        .trim();
+                    latestSceneSource = '첫 시작 장면';
+                    priorContext.splice(i, 1);
+                    break;
+                }
             }
         }
 
@@ -907,12 +925,16 @@
         if (context && context.length) {
             lines.push('');
             lines.push('[문맥 판정 규칙]');
-            lines.push('- 먼저 직전 상대 출력에서 현재 장소, 서로의 자세, 신체 접촉, 거리, 시선, 들고 있는 물건, 감정, 질문을 내부적으로 판정한다.');
-            lines.push('- 그 판정과 입력된 대사/행동이 모순되지 않게 이어 쓴다.');
-            lines.push('- [시작 상황/플레이 가이드]는 배경 설정일 뿐, 현재 시점은 반드시 직전 상대 출력으로 판단한다.');
-            lines.push('- 과거 상태와 직전 상태가 충돌하면 직전 상대 출력의 상태가 현재 사실이다.');
+            lines.push('- 먼저 현재 장면에서 장소, 함께 있는 인물, 제삼자의 질문이나 의심, 서로의 자세, 신체 접촉, 거리, 시선, 감정과 위기를 내부적으로 판정한다.');
+            lines.push('- 상대 캐릭터가 방금 시작한 연기, 거짓말, 위장, 협조 요청, 질문 또는 행동 신호가 있다면 유저 반응은 그 의도를 즉시 이어받아야 한다.');
+            lines.push('- 현재 장면의 공동 목표와 당장 해결해야 할 위기를 페르소나와 평소 말투보다 우선한다.');
+            lines.push('- 페르소나는 상황에 맞는 반응을 선택한 뒤 그 반응의 말투와 표현 방식에만 적용한다.');
+            lines.push('- 첫 턴에는 [시작 상황/플레이 가이드] 안의 마지막 장면을 현재 시점으로 사용한다. 일반 턴에는 직전 상대 캐릭터 출력을 현재 시점으로 사용한다.');
+            lines.push('- 입력된 대사나 행동이 현재 장면의 목적과 충돌하면, 입력의 핵심 정서나 의도만 살리고 장면에 맞게 자연스럽게 수정한다.');
+            lines.push('- 입력 문장을 그대로 반복하거나 단순히 수식어만 붙이지 말고, 직전 장면에 직접 반응하도록 재구성한다.');
+            lines.push('- 과거 상태와 현재 장면이 충돌하면 현재 장면의 상태가 사실이다.');
             lines.push('- [유저]와 [상대 캐릭터]의 역할을 절대 뒤바꾸지 않는다.');
-            lines.push('- 상대 캐릭터의 행동이나 반응을 대신 진행하지 않는다.');
+            lines.push('- 상대 캐릭터의 다음 행동이나 반응을 대신 진행하지 않는다.');
             lines.push('- 맥락을 요약하거나 그대로 재진술하지 않는다.');
         }
 
@@ -933,8 +955,8 @@
 
         lines.push('');
         lines.push('[대사와 행동 처리]');
-        lines.push('- 대사 입력은 의미를 유지하며 자연스럽게 다듬어 큰따옴표 "..."로 감싼다.');
-        lines.push('- 행동 입력은 유저 캐릭터가 실제로 수행하는 장면으로 *별표* 안에 묘사한다.');
+        lines.push('- 대사 입력은 완성본이 아니라 상황에 맞게 고쳐 쓸 수 있는 초안으로 취급한다. 핵심 의도는 살리되 직전 장면과 충돌하는 표현은 자연스럽게 바꾼다.');
+        lines.push('- 행동 입력도 초안으로 취급하며, 직전 장면의 자세·접촉·거리와 모순되지 않게 *별표* 안에 이어 쓴다.');
         lines.push('- 진행형/상태형 행동은 이미 진행 중인 현재 순간부터 이어 쓴다.');
         lines.push('- 대사와 서술 묶음은 서로 다른 줄에 쓰고 사이에 빈 줄을 넣는다.');
         lines.push('- 같은 표현, 같은 감정, 같은 행동을 반복하지 않는다.');
@@ -942,8 +964,8 @@
         lines.push('- 길이: ' + (LENGTHS[length] || LENGTHS.medium).guide);
 
         const user = [
-            '[직전 상대 캐릭터 출력 — 현재 장면의 기준]',
-            latestAssistant || '(직전 상대 출력을 찾지 못함)',
+            '[현재 장면의 기준 — ' + (latestSceneSource || '판별 실패') + ']',
+            latestAssistant || '(현재 장면을 찾지 못함)',
             '',
             '[이번 유저 대사]',
             dialogue.trim() || '(없음)',
@@ -951,7 +973,7 @@
             '[이번 유저 행동]',
             action.trim() || '(없음)',
             '',
-            '직전 상대 출력 바로 다음 순간부터 이어지는 유저 캐릭터의 반응 본문만 출력해줘.'
+            '현재 장면의 목적과 상대의 직전 신호를 먼저 이해한 뒤, 바로 다음 순간에 필요한 유저 캐릭터의 반응 본문만 출력해줘. 입력 초안이 장면과 충돌하면 장면에 맞게 고쳐 써.'
         ].join('\n');
 
         return {
@@ -1892,7 +1914,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.25</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.26</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
