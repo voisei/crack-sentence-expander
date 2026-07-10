@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.26
+// @version      6.12.27
 // @author       me
 // @description  미리보기와 실제 생성이 동일한 맥락을 사용하며 시작 상황/플레이 가이드까지 통합 수집하는 단일 실행판.
 // @match        https://crack.wrtn.ai/*
@@ -855,6 +855,34 @@
     /* =========================
      * 프롬프트
      * ========================= */
+    function extractLatestActionableCue(text) {
+        const cleaned = String(text || '')
+            .replace(/\[\/\/\]:\s*#\s*\([^\n]*\)/g, ' ')
+            .replace(/```상태창[\s\S]*?```/g, ' ')
+            .replace(/```[\s\S]*?```/g, ' ')
+            .trim();
+
+        if (!cleaned) return { cue: '', tail: '' };
+
+        const quotes = [];
+        const quotePattern = /"([^"\n]{1,2000})"/g;
+        let match;
+
+        while ((match = quotePattern.exec(cleaned))) {
+            quotes.push({
+                text: match[1].trim(),
+                index: match.index
+            });
+        }
+
+        const lastQuote = quotes.length ? quotes[quotes.length - 1] : null;
+        const cue = lastQuote ? lastQuote.text : '';
+        const anchor = lastQuote ? Math.max(0, lastQuote.index - 900) : Math.max(0, cleaned.length - 1800);
+        const tail = cleaned.slice(anchor).slice(-2200).trim();
+
+        return { cue, tail };
+    }
+
     function buildPrompt(dialogue, action, context) {
         const pov = GM_getValue(K_POV, 'first');
         const name = String(GM_getValue(K_NAME, '') || '').trim();
@@ -916,6 +944,8 @@
             }
         }
 
+        const actionable = extractLatestActionableCue(latestAssistant);
+
         if (priorContext.length) {
             lines.push('');
             lines.push('[이전 대화 기록: 위가 과거, 아래가 최신]');
@@ -927,6 +957,9 @@
             lines.push('[문맥 판정 규칙]');
             lines.push('- 먼저 현재 장면에서 장소, 함께 있는 인물, 제삼자의 질문이나 의심, 서로의 자세, 신체 접촉, 거리, 시선, 감정과 위기를 내부적으로 판정한다.');
             lines.push('- 상대 캐릭터가 방금 시작한 연기, 거짓말, 위장, 협조 요청, 질문 또는 행동 신호가 있다면 유저 반응은 그 의도를 즉시 이어받아야 한다.');
+            lines.push('- 직전 출력의 마지막 직접 질문·명령·제안·요청을 이번 반응의 최우선 대상으로 삼는다.');
+            lines.push('- 구체적인 지시가 있으면 첫 대사나 첫 행동에서 그 지시를 직접 받아야 한다. 막연한 충성, 각오, 임무 수행 선언으로 바꾸지 않는다.');
+            lines.push('- 예: "오늘 퇴근 후 짐을 싸서 들어오라"는 지시에는 오늘 퇴근 후 짐을 싸서 들어가겠다는 수락·거절·조건을 구체적으로 답한다. "무엇이든 해내겠습니다"처럼 핵심 행동을 생략하지 않는다.');
             lines.push('- 현재 장면의 공동 목표와 당장 해결해야 할 위기를 페르소나와 평소 말투보다 우선한다.');
             lines.push('- 페르소나는 상황에 맞는 반응을 선택한 뒤 그 반응의 말투와 표현 방식에만 적용한다.');
             lines.push('- 첫 턴에는 [시작 상황/플레이 가이드] 안의 마지막 장면을 현재 시점으로 사용한다. 일반 턴에는 직전 상대 캐릭터 출력을 현재 시점으로 사용한다.');
@@ -967,13 +1000,19 @@
             '[현재 장면의 기준 — ' + (latestSceneSource || '판별 실패') + ']',
             latestAssistant || '(현재 장면을 찾지 못함)',
             '',
+            '[직전 출력의 마지막 반응 대상]',
+            actionable.cue || '(직접 발화 없음 — 직전 장면의 마지막 행동과 상황에 반응)',
+            '',
+            '[직전 장면의 마지막 부분]',
+            actionable.tail || latestAssistant || '(없음)',
+            '',
             '[이번 유저 대사]',
             dialogue.trim() || '(없음)',
             '',
             '[이번 유저 행동]',
             action.trim() || '(없음)',
             '',
-            '현재 장면의 목적과 상대의 직전 신호를 먼저 이해한 뒤, 바로 다음 순간에 필요한 유저 캐릭터의 반응 본문만 출력해줘. 입력 초안이 장면과 충돌하면 장면에 맞게 고쳐 써.'
+            '먼저 [직전 출력의 마지막 반응 대상]에 직접 답해. 구체적인 질문·명령·제안이 있다면 첫 대사나 첫 행동에서 반드시 그 내용을 받아야 한다. 그다음 현재 장면과 페르소나에 맞게 자연스럽게 확장해. 입력 초안이 장면과 충돌하면 장면에 맞게 고쳐 써.'
         ].join('\n');
 
         return {
@@ -1914,7 +1953,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.26</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.27</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
