@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.30
+// @version      6.12.42
 // @author       me
-// @description  직전 턴 전체 흐름을 균형 있게 읽고 마지막 문장에 기계적으로 집착하지 않으며, 모바일 키보드에서도 플로팅 토글 위치를 고정한 단일 실행판.
+// @description  실제 메시지 그룹 전체에서 가장 큰 턴 번호를 직전 턴으로 고정하고, 읽은 채팅만 시간순으로 보여주는 단일 실행판.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -39,8 +39,8 @@
 
     const K_CTX_ON = 'se_ctx_on';
     const K_CTX_N = 'se_ctx_n';
-    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v4';
-    const K_STORY_BOOTSTRAP_BASE = 'se_ctx_story_bootstrap_v4';
+    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v12';
+    const K_STORY_BOOTSTRAP_BASE = 'se_ctx_story_bootstrap_v5';
 
     const K_COST_ON = 'se_cost_on';
     const K_COST_USDKRW = 'se_cost_usdkrw';
@@ -139,9 +139,14 @@
     function getViewport() {
         const vv = window.visualViewport;
 
+        /*
+         * position: fixed의 left/top은 레이아웃 뷰포트의 0,0을 기준으로 한다.
+         * 모바일 키보드가 열릴 때 변하는 visualViewport.offsetTop/offsetLeft를
+         * 다시 더하면 브라우저의 화면 이동값과 중복되어 패널이 아래로 밀릴 수 있다.
+         */
         return {
-            left: vv ? vv.offsetLeft : 0,
-            top: vv ? vv.offsetTop : 0,
+            left: 0,
+            top: 0,
             width: vv ? vv.width : window.innerWidth,
             height: vv ? vv.height : window.innerHeight
         };
@@ -319,6 +324,68 @@
         return (hash >>> 0).toString(36);
     }
 
+    function extractTurnNumber(value) {
+        const text = String(value || '');
+        const matches = [];
+
+        /* [턴7 | ...], [턴 7|...], 턴#7, 턴: 7을 모두 인식한다. */
+        const pattern = /(?:^|[\n\r\[【(])\s*턴\s*(?:#|:|-)?\s*(\d{1,6})(?=\s|[|｜\]】)>,.:;!?/\\-]|$)/gim;
+        let match;
+
+        while ((match = pattern.exec(text))) {
+            const number = parseInt(match[1], 10);
+            if (Number.isFinite(number)) matches.push(number);
+        }
+
+        return matches.length ? Math.max(...matches) : null;
+    }
+
+    function compareContextOrder(a, b) {
+        const aTurn = Number.isFinite(a && a.turnNumber) ? a.turnNumber : null;
+        const bTurn = Number.isFinite(b && b.turnNumber) ? b.turnNumber : null;
+
+        if (aTurn !== null && bTurn !== null && aTurn !== bTurn) {
+            return aTurn - bTurn;
+        }
+
+        if (aTurn !== null && bTurn === null) return 1;
+        if (aTurn === null && bTurn !== null) return -1;
+
+        const aTop = Number.isFinite(a && a.top) ? a.top : 0;
+        const bTop = Number.isFinite(b && b.top) ? b.top : 0;
+        if (aTop !== bTop) return aTop - bTop;
+
+        const aDom = Number.isFinite(a && a.domIndex) ? a.domIndex : -1;
+        const bDom = Number.isFinite(b && b.domIndex) ? b.domIndex : -1;
+        return aDom - bDom;
+    }
+
+    function pickLatestContextRecord(records) {
+        const list = (Array.isArray(records) ? records : []).filter(Boolean);
+        if (!list.length) return null;
+
+        const numbered = list.filter(item => Number.isFinite(item.turnNumber));
+        if (numbered.length) {
+            return numbered.reduce((latest, item) => {
+                if (!latest || item.turnNumber > latest.turnNumber) return item;
+                if (item.turnNumber === latest.turnNumber && item.distanceToInput < latest.distanceToInput) {
+                    return item;
+                }
+                return latest;
+            }, null);
+        }
+
+        const aboveInput = list.filter(item => item.nearInput || item.distanceToInput < 2600);
+        const candidates = aboveInput.length ? aboveInput : list;
+
+        return candidates.reduce((latest, item) => {
+            if (!latest) return item;
+            if (item.distanceToInput < latest.distanceToInput) return item;
+            if (item.distanceToInput === latest.distanceToInput && item.top > latest.top) return item;
+            return latest;
+        }, null);
+    }
+
     function normalizeContextRecord(record) {
         if (!record || typeof record !== 'object') return null;
         const text = cleanContextLine(record.text);
@@ -330,7 +397,16 @@
                 ? record.role
                 : 'unknown',
             text,
-            nearInput: !!record.nearInput
+            turnNumber: Number.isFinite(record.turnNumber)
+                ? record.turnNumber
+                : null,
+            nearInput: !!record.nearInput,
+            domIndex: Number.isFinite(record.domIndex) ? record.domIndex : -1,
+            top: Number.isFinite(record.top) ? record.top : 0,
+            bottom: Number.isFinite(record.bottom) ? record.bottom : 0,
+            distanceToInput: Number.isFinite(record.distanceToInput)
+                ? record.distanceToInput
+                : Number.POSITIVE_INFINITY
         };
     }
 
@@ -401,6 +477,7 @@
             if (inserted) cacheIds.add(item.id);
         }
 
+        cache.sort(compareContextOrder);
         saveCtxCache(cache);
     }
 
@@ -427,7 +504,7 @@
             if (rect.width < Math.min(220, window.innerWidth * 0.48)) continue;
             if (rect.height < 90) continue;
 
-            const text = cleanContextLine(el.innerText || el.textContent || '');
+            const text = cleanContextLine(getRawNodeText(el));
 
             if (text.length < 120 || text.length > 14000) continue;
 
@@ -547,14 +624,14 @@
             .filter(el => {
                 if (el.closest('#' + PANEL_ID)) return false;
                 if (el.querySelector('textarea, input, select, button')) return false;
-                const text = cleanContextLine(el.innerText || el.textContent || '');
+                const text = cleanContextLine(getRawNodeText(el));
                 return text.length >= 1 && text.length <= 12000;
             });
 
         if (!candidates.length) return group;
 
         const scored = candidates.map(el => {
-            const text = cleanContextLine(el.innerText || el.textContent || '');
+            const text = cleanContextLine(getRawNodeText(el));
             let score = Math.min(text.length, 5000);
             if (el.hasAttribute('data-role')) score += 12000;
             if (el.hasAttribute('data-message-role')) score += 12000;
@@ -583,57 +660,245 @@
         return '[' + label + ']\n' + text;
     }
 
-    function collectVisibleChatLines() {
+    function getRawNodeText(node) {
+        if (!node) return '';
+
+        /* 크랙은 화면 밖 메시지에 content-visibility를 사용하기 때문에
+         * innerText가 일부만 반환될 수 있다. 턴 판정에는 textContent를 우선한다. */
+        return String(node.textContent || node.innerText || '');
+    }
+
+    function getTopLevelMessageGroups(root) {
         const panel = document.getElementById(PANEL_ID);
-        const input = findChatInput();
-        const inputTop = input ? input.getBoundingClientRect().top : window.innerHeight;
-        const entries = [];
+        const scope = root && root.querySelectorAll ? root : document;
 
-        const groups = Array.from(document.querySelectorAll('[data-message-group-id]'))
-            .filter(group => !panel || !panel.contains(group));
+        return Array.from(scope.querySelectorAll('[data-message-group-id]'))
+            .filter(group => {
+                if (!group || !group.isConnected) return false;
+                if (panel && panel.contains(group)) return false;
 
-        groups.forEach((group, index) => {
-            const contentEl = getBestMessageNode(group);
-            const text = cleanContextLine(contentEl.innerText || contentEl.textContent || '');
-            if (isBadContextLine(text)) return;
+                const parentGroup = group.parentElement
+                    ? group.parentElement.closest('[data-message-group-id]')
+                    : null;
+                if (parentGroup && scope.contains(parentGroup)) return false;
 
-            const rect = group.getBoundingClientRect();
-            const rawId = group.getAttribute('data-message-group-id') || '';
-            entries.push({
-                id: rawId || ('group-' + hashContextId(text + '|' + index)),
-                text,
-                role: detectMessageRole(group, contentEl),
-                top: Number.isFinite(rect.top) ? rect.top : index,
-                domIndex: index,
-                nearInput: rect.bottom <= inputTop + 100 && rect.bottom >= inputTop - 1800
+                const cleaned = cleanContextLine(getRawNodeText(group));
+                return cleaned && !isBadContextLine(cleaned);
             });
-        });
+    }
 
-        if (!entries.length) {
-            Array.from(document.querySelectorAll('.wrtn-markdown'))
-                .filter(el => !el.closest('#' + PANEL_ID))
-                .forEach((el, index) => {
-                    const text = cleanContextLine(el.innerText || el.textContent || '');
-                    if (isBadContextLine(text)) return;
-                    const rect = el.getBoundingClientRect();
-                    entries.push({
-                        id: 'markdown-' + hashContextId(text),
-                        text,
-                        role: detectMessageRole(el.parentElement || el, el),
-                        top: Number.isFinite(rect.top) ? rect.top : index,
-                        domIndex: index,
-                        nearInput: rect.bottom <= inputTop + 100 && rect.bottom >= inputTop - 1800
-                    });
-                });
+    function findNearestMessageListRoot(anchorGroup) {
+        if (!anchorGroup) return null;
+
+        let node = anchorGroup.parentElement;
+        let best = anchorGroup.parentElement;
+
+        for (let depth = 0; node && node !== document.body && depth < 12; depth++) {
+            const groups = getTopLevelMessageGroups(node);
+
+            if (groups.length >= 2) {
+                best = node;
+
+                /* 직전 턴을 포함하면서 실제 대화 여러 개가 모인 가장 가까운
+                 * 컨테이너를 우선한다. 너무 큰 main/body까지 올라가지 않는다. */
+                if (groups.length >= 4) break;
+            }
+
+            node = node.parentElement;
         }
 
-        entries.sort((a, b) => {
-            if (a.top !== b.top) return a.top - b.top;
-            return a.domIndex - b.domIndex;
+        return best;
+    }
+
+    /* 실제 채팅 목록을 최신→과거 순서로 반환한다.
+     * 크랙의 실제 구조는 다음과 같다.
+     *   <div class="flex flex-col-reverse ...">
+     *     <div data-message-group-id>턴 7</div>  ← DOM 첫 번째, 실제 최신
+     *     <div data-message-group-id>유저</div>
+     *     <div data-message-group-id>턴 6</div>
+     *     ...
+     * 따라서 페이지 전체의 임의 후보나 캐시 순서를 쓰지 않고,
+     * 같은 부모의 직계 자식 메시지 그룹만 골라 DOM 방향을 판정한다. */
+    function getLiveMessageGroupsNewestFirst() {
+        const panel = document.getElementById(PANEL_ID);
+        const input = findChatInput();
+        const inputTop = input
+            ? input.getBoundingClientRect().top
+            : window.innerHeight;
+
+        const allGroups = Array.from(
+            document.querySelectorAll('[data-message-group-id]')
+        ).filter(group => {
+            if (!group || !group.isConnected) return false;
+            if (panel && panel.contains(group)) return false;
+            return !!group.parentElement;
         });
 
-        /* 역할 표지가 하나도 없으면 채팅 입력창 직전의 마지막 출력은 상대
-         * 캐릭터라고 보고 아래에서부터 유저/캐릭터를 교대로 복원한다. */
+        if (!allGroups.length) return [];
+
+        const parentMap = new Map();
+
+        for (const group of allGroups) {
+            const parent = group.parentElement;
+            if (!parentMap.has(parent)) parentMap.set(parent, []);
+            parentMap.get(parent).push(group);
+        }
+
+        const candidates = [];
+
+        for (const [parent] of parentMap) {
+            /* querySelectorAll이 아니라 직계 자식만 사용한다.
+             * 사이드바·숨은 복제 목록·중첩 그룹이 섞이는 것을 차단한다. */
+            const groups = Array.from(parent.children || []).filter(child => {
+                return child &&
+                    child.nodeType === 1 &&
+                    child.hasAttribute('data-message-group-id') &&
+                    (!panel || !panel.contains(child));
+            });
+
+            if (groups.length < 2) continue;
+
+            const numbered = groups.map((group, index) => ({
+                group,
+                index,
+                turn: extractTurnNumber(getRawNodeText(group))
+            })).filter(item => Number.isFinite(item.turn));
+
+            if (!numbered.length) continue;
+
+            const maxTurn = Math.max(...numbered.map(item => item.turn));
+            const minTurn = Math.min(...numbered.map(item => item.turn));
+            const maxItem = numbered.find(item => item.turn === maxTurn);
+            const minItem = numbered.find(item => item.turn === minTurn);
+            const maxRect = maxItem.group.getBoundingClientRect();
+            const style = getComputedStyle(parent);
+            const flexReverse = style.flexDirection === 'column-reverse' ||
+                String(parent.className || '').includes('flex-col-reverse');
+
+            candidates.push({
+                parent,
+                groups,
+                maxTurn,
+                minTurn,
+                maxIndex: maxItem.index,
+                minIndex: minItem.index,
+                distanceToInput: Math.abs(inputTop - maxRect.bottom),
+                flexReverse
+            });
+        }
+
+        if (!candidates.length) {
+            /* 구조가 바뀐 경우에만 전체 그룹을 보조값으로 쓴다. */
+            const fallback = allGroups.slice();
+            const numbered = fallback.map((group, index) => ({
+                index,
+                turn: extractTurnNumber(getRawNodeText(group))
+            })).filter(item => Number.isFinite(item.turn));
+
+            if (numbered.length >= 2) {
+                const maxItem = numbered.reduce((a, b) =>
+                    !a || b.turn > a.turn ? b : a, null);
+                const minItem = numbered.reduce((a, b) =>
+                    !a || b.turn < a.turn ? b : a, null);
+                if (maxItem.index > minItem.index) fallback.reverse();
+            }
+
+            return fallback;
+        }
+
+        /* 가장 큰 턴 번호가 있는 실제 대화 컨테이너를 우선한다.
+         * 같은 턴이면 입력창에 가까운 컨테이너, 그다음 메시지가 많은 컨테이너. */
+        candidates.sort((a, b) => {
+            if (a.maxTurn !== b.maxTurn) return b.maxTurn - a.maxTurn;
+            if (a.distanceToInput !== b.distanceToInput) {
+                return a.distanceToInput - b.distanceToInput;
+            }
+            return b.groups.length - a.groups.length;
+        });
+
+        const picked = candidates[0];
+        let groups = picked.groups.slice();
+
+        /* 제공된 실제 DOM에서는 maxIndex=0, minIndex=12이므로 그대로 최신→과거다.
+         * 향후 CSS/DOM 방향이 바뀌어도 턴 번호 위치로 자동 보정한다. */
+        const domIsNewestFirst = picked.maxIndex < picked.minIndex;
+        if (!domIsNewestFirst) groups.reverse();
+
+        /* 최신 턴보다 앞에 광고·시스템 그룹이 끼어 있을 경우 제거한다. */
+        const latestIndex = groups.findIndex(group =>
+            extractTurnNumber(getRawNodeText(group)) === picked.maxTurn
+        );
+        if (latestIndex > 0) groups = groups.slice(latestIndex);
+
+        return groups;
+    }
+
+    function recordFromMessageGroup(group, index) {
+        if (!group) return null;
+
+        const contentEl = getBestMessageNode(group);
+        const rawGroupText = getRawNodeText(group);
+        const rawContentText = getRawNodeText(contentEl);
+        const text = cleanContextLine(rawContentText);
+        if (isBadContextLine(text)) return null;
+
+        const input = findChatInput();
+        const inputTop = input ? input.getBoundingClientRect().top : window.innerHeight;
+        const rect = group.getBoundingClientRect();
+        const rawId = group.getAttribute('data-message-group-id') || '';
+
+        return normalizeContextRecord({
+            id: rawId || ('group-' + hashContextId(text + '|' + index)),
+            text,
+            turnNumber: extractTurnNumber(rawGroupText) ?? extractTurnNumber(rawContentText),
+            role: detectMessageRole(group, contentEl),
+            top: Number.isFinite(rect.top) ? rect.top : index,
+            bottom: Number.isFinite(rect.bottom) ? rect.bottom : index,
+            distanceToInput: Number.isFinite(rect.bottom)
+                ? Math.abs(inputTop - rect.bottom)
+                : Number.POSITIVE_INFINITY,
+            domIndex: index,
+            nearInput: true
+        });
+    }
+
+    function collectVisibleChatLines() {
+        const newestFirstGroups = getLiveMessageGroupsNewestFirst();
+        let entries = newestFirstGroups
+            .map((group, index) => recordFromMessageGroup(group, index))
+            .filter(Boolean);
+
+        if (!entries.length) {
+            entries = Array.from(document.querySelectorAll('.wrtn-markdown'))
+                .filter(el => !el.closest('#' + PANEL_ID))
+                .map((el, index) => {
+                    const text = cleanContextLine(getRawNodeText(el));
+                    if (isBadContextLine(text)) return null;
+                    const rect = el.getBoundingClientRect();
+                    return normalizeContextRecord({
+                        id: 'markdown-' + hashContextId(text),
+                        text,
+                        turnNumber: extractTurnNumber(
+                            el.closest('[data-message-group-id]')
+                                ? (el.closest('[data-message-group-id]').innerText || el.closest('[data-message-group-id]').textContent || '')
+                                : (el.parentElement ? (el.parentElement.innerText || el.parentElement.textContent || '') : text)
+                        ),
+                        role: detectMessageRole(el.parentElement || el, el),
+                        top: Number.isFinite(rect.top) ? rect.top : index,
+                        bottom: Number.isFinite(rect.bottom) ? rect.bottom : index,
+                        distanceToInput: Number.POSITIVE_INFINITY,
+                        domIndex: index,
+                        nearInput: true
+                    });
+                })
+                .filter(Boolean);
+
+            entries.sort(compareContextOrder);
+        } else {
+            /* getLiveMessageGroupsNewestFirst()는 최신→과거로 반환한다. */
+            entries.reverse();
+        }
+
         const hasKnownRole = entries.some(item => item.role !== 'unknown');
         if (!hasKnownRole && entries.length) {
             let role = 'assistant';
@@ -656,7 +921,7 @@
             }
         }
 
-        return entries.map(normalizeContextRecord).filter(Boolean);
+        return entries;
     }
 
     function getStoryId() {
@@ -719,22 +984,23 @@
 
     function collectStoryBootstrap() {
         const panel = document.getElementById(PANEL_ID);
-        const root = document.querySelector('main') || document.body;
         const found = [];
 
+        /* 채팅 턴이 이미 존재하면 시작 카드 수집을 중단한다.
+         * 사이드바의 채팅방 설정/유저 노트 같은 UI가 시작 상황으로 섞이는 것을 막는다. */
+        const hasChatTurn = Array.from(document.querySelectorAll('[data-message-group-id]'))
+            .some(group => Number.isFinite(extractTurnNumber(getRawNodeText(group))));
+
+        if (hasChatTurn) return getStoryBootstrap();
+
         const selectors = [
-            '#story-detail-scroll',
-            '[id*="story-detail"]',
-            '[data-testid*="story-detail"]',
-            '[class*="story-detail"]',
-            '[data-testid*="prologue"]',
-            '[data-testid*="scenario"]',
-            '[class*="prologue"]',
-            '[class*="scenario"]',
-            '[data-testid*="play-guide"]',
-            '[class*="play-guide"]',
-            '[data-testid*="status"]',
-            '[class*="status-window"]'
+            '#story-detail-scroll .wrtn-markdown',
+            '[data-testid*="prologue"] .wrtn-markdown',
+            '[data-testid*="scenario"] .wrtn-markdown',
+            '[data-testid*="play-guide"] .wrtn-markdown',
+            '[class*="prologue"] .wrtn-markdown',
+            '[class*="scenario"] .wrtn-markdown',
+            '[class*="play-guide"] .wrtn-markdown'
         ];
 
         for (const selector of selectors) {
@@ -750,54 +1016,12 @@
                 if (el.closest('[data-message-group-id]')) continue;
                 if (!isVisible(el)) continue;
 
-                const text = cleanContextLine(el.innerText || el.textContent || '');
-                if (text.length >= 20 && text.length <= 14000 && !isBadContextLine(text)) {
-                    found.push(text);
-                }
+                const text = cleanContextLine(getRawNodeText(el));
+                if (text.length < 20 || text.length > 14000 || isBadContextLine(text)) continue;
+                if (/채팅방 설정|플레이 가이드|대화 프로필|유저 노트|키보드 단축키|전체 설정|업데이트 정보|시작설정|기본 설정|나의 크래커/.test(text)) continue;
+                found.push(text);
             }
         }
-
-        /* 전용 선택자가 없는 시작 카드용 보조 수집. 실제 채팅 그룹은 제외한다. */
-        const candidates = [];
-        for (const el of root.querySelectorAll('article, section, [role="article"], div')) {
-            if (!el || el === root) continue;
-            if (panel && panel.contains(el)) continue;
-            if (el.closest('[data-message-group-id]')) continue;
-            if (el.querySelector('[data-message-group-id]')) continue;
-            if (el.closest('nav, header, footer, aside, button, textarea, input, select, script, style')) continue;
-            if (!isVisible(el)) continue;
-
-            const rect = el.getBoundingClientRect();
-            if (rect.width < Math.min(220, window.innerWidth * 0.45)) continue;
-            if (rect.height < 70) continue;
-
-            const text = cleanContextLine(el.innerText || el.textContent || '');
-            if (text.length < 60 || text.length > 14000 || isBadContextLine(text)) continue;
-
-            const noisy = [
-                '문장 부풀리기', 'API 비용 추정', '설정 동기화',
-                '저장하고 닫기', '채팅창에 바로 넣기'
-            ].filter(word => text.includes(word)).length;
-            if (noisy >= 2) continue;
-
-            const childEquivalent = Array.from(el.children || []).some(child => {
-                const childText = cleanContextLine(child.innerText || child.textContent || '');
-                return childText.length >= Math.max(50, text.length * 0.82);
-            });
-            if (childEquivalent) continue;
-
-            candidates.push({
-                text,
-                top: rect.top,
-                score: Math.min(text.length, 8000) / 10 + Math.min(rect.height, 1400) / 6
-            });
-        }
-
-        candidates
-            .sort((a, b) => b.score - a.score)
-            .slice(0, 5)
-            .sort((a, b) => a.top - b.top)
-            .forEach(item => found.push(item.text));
 
         saveStoryBootstrap(found);
         return getStoryBootstrap();
@@ -806,20 +1030,21 @@
     function getUnifiedContext(maxN) {
         const n = clamp(parseInt(maxN, 10) || 6, 1, 30);
 
-        /* 미리보기와 실제 생성이 반드시 이 함수 하나만 사용한다. */
-        collectStoryBootstrap();
-
         const visibleRecords = collectVisibleChatLines();
         rememberCtxLines(visibleRecords);
 
-        const cache = getCtxCache();
-        const records = cache.length ? cache : visibleRecords;
+        const records = visibleRecords.length ? visibleRecords : getCtxCache();
+        const hasNumberedChat = records.some(item => Number.isFinite(item.turnNumber));
+
         const recent = records
             .slice(-n)
             .map(item => formatContextMessage(item.role, item.text));
 
+        if (hasNumberedChat) return recent;
+
+        collectStoryBootstrap();
         const story = getStoryBootstrap()
-            .slice(-4)
+            .slice(-2)
             .map(text => '[시작 상황/플레이 가이드]\n' + text);
 
         return [...story, ...recent];
@@ -829,18 +1054,68 @@
         return getUnifiedContext(maxN);
     }
 
-    /* 실제 생성에 사용할 직전 장면은 캐시 역할 판별에 맡기지 않고
-     * 현재 화면의 마지막 메시지에서 직접 고정한다. 사용자가 부풀리기 버튼을
-     * 누르는 시점에는 마지막 채팅 메시지가 상대 캐릭터 출력이라는 전제다. */
+    /* 현재 DOM 전체에서 가장 큰 턴 번호가 실제 직전 턴이다. */
+    function collectNewestDomMessageRecord() {
+        const groups = getLiveMessageGroupsNewestFirst();
+        const records = groups
+            .map((group, index) => recordFromMessageGroup(group, index))
+            .filter(Boolean);
+
+        if (!records.length) return null;
+
+        const numbered = records.filter(item => Number.isFinite(item.turnNumber));
+        if (numbered.length) {
+            const maxTurn = Math.max(...numbered.map(item => item.turnNumber));
+            const sameTurn = numbered.filter(item => item.turnNumber === maxTurn);
+
+            return sameTurn.reduce((best, item) => {
+                if (!best) return item;
+                if (item.distanceToInput < best.distanceToInput) return item;
+                return best;
+            }, null);
+        }
+
+        return records[0];
+    }
+
     function collectLatestSceneSnapshot() {
+        const directLatest = collectNewestDomMessageRecord();
         const visible = collectVisibleChatLines();
 
-        if (visible.length) {
-            const last = visible[visible.length - 1];
+        if (directLatest) {
+            const pickedIndex = visible.findIndex(item => item.id === directLatest.id);
+            const index = pickedIndex >= 0 ? pickedIndex : visible.length - 1;
+            const nearby = visible.length
+                ? visible
+                    .slice(Math.max(0, index - 2), index + 1)
+                    .map(item => formatContextMessage(item.role, item.text))
+                    .join('\n\n')
+                : formatContextMessage(directLatest.role, directLatest.text);
+
             return {
-                text: last.text || '',
-                source: '현재 화면의 실제 마지막 메시지',
-                role: last.role || 'unknown'
+                text: directLatest.text || '',
+                nearby,
+                source: Number.isFinite(directLatest.turnNumber)
+                    ? '화면에서 확인한 가장 큰 턴 번호 · 턴 ' + directLatest.turnNumber
+                    : '실제 채팅 목록 최신 메시지',
+                role: directLatest.role || 'unknown',
+                id: directLatest.id || '',
+                turnNumber: directLatest.turnNumber
+            };
+        }
+
+        if (visible.length) {
+            const picked = visible[visible.length - 1];
+            return {
+                text: picked.text || '',
+                nearby: visible
+                    .slice(-3)
+                    .map(item => formatContextMessage(item.role, item.text))
+                    .join('\n\n'),
+                source: '현재 DOM 최종 메시지 보조 판정',
+                role: picked.role || 'unknown',
+                id: picked.id || '',
+                turnNumber: picked.turnNumber
             };
         }
 
@@ -848,12 +1123,15 @@
         if (story.length) {
             return {
                 text: story[story.length - 1],
+                nearby: '',
                 source: '첫 시작 장면',
-                role: 'assistant'
+                role: 'assistant',
+                id: '',
+                turnNumber: null
             };
         }
 
-        return { text: '', source: '판별 실패', role: 'unknown' };
+        return { text: '', nearby: '', source: '판별 실패', role: 'unknown', id: '', turnNumber: null };
     }
 
     function extractSceneKeywords(text) {
@@ -900,6 +1178,76 @@
         if (!keywords.length) return false;
 
         return keywords.some(word => normalized.includes(word));
+    }
+
+
+    /* =========================
+     * 지문 이탤릭 형식 보정
+     * ========================= */
+    function isDialogueParagraph(text) {
+        const value = String(text || '').trim();
+        if (!value) return false;
+
+        /* 대사는 반드시 따옴표로 출력하도록 프롬프트에서 요구한다.
+         * 혹시 앞에 화자명이나 대시가 붙어도 대사로 인식한다. */
+        return (
+            /^(?:[-–—]\s*)?["“‘「『]/.test(value) ||
+            /^(?:[^\n:：]{1,24}\s*[:：]\s*)["“‘「『]/.test(value)
+        );
+    }
+
+    function stripOuterAsterisks(text) {
+        let value = String(text || '').trim();
+
+        /* **굵게**, ***혼합*** 등 잘못 붙은 외곽 별표도 제거한 뒤
+         * 지문에는 정확히 한 쌍만 다시 붙인다. */
+        value = value
+            .replace(/^\*{1,3}\s*/, '')
+            .replace(/\s*\*{1,3}$/, '')
+            .trim();
+
+        return value;
+    }
+
+    function normalizeRoleplayItalics(text) {
+        const source = String(text || '')
+            .replace(/^```(?:markdown|md|txt)?\s*/i, '')
+            .replace(/\s*```$/, '')
+            .replace(/\r/g, '')
+            .trim();
+
+        if (!source) return '';
+
+        const paragraphs = source
+            .split(/\n\s*\n+/)
+            .map(item => item.trim())
+            .filter(Boolean);
+
+        const normalized = [];
+
+        for (const paragraph of paragraphs) {
+            /* 한 문단 안에 대사와 지문이 줄바꿈으로 섞여 나온 경우도
+             * 줄 단위로 분리해 각각 정확한 형식으로 맞춘다. */
+            const lines = paragraph
+                .split('\n')
+                .map(line => line.trim())
+                .filter(Boolean);
+
+            for (const line of lines) {
+                if (isDialogueParagraph(line)) {
+                    /* 대사는 이탤릭 밖에 둔다. */
+                    normalized.push(stripOuterAsterisks(line));
+                    continue;
+                }
+
+                const narration = stripOuterAsterisks(line);
+                if (!narration) continue;
+
+                normalized.push('*' + narration + '*');
+            }
+        }
+
+        return normalized.join('\n\n');
     }
 
     function findChatRoot() {
@@ -1080,7 +1428,7 @@
             priorContext.forEach(item => lines.push('· ' + item));
         }
 
-        if (context && context.length) {
+        if ((context && context.length) || latestAssistant) {
             lines.push('');
             lines.push('[문맥 판정 규칙]');
             lines.push('- 먼저 현재 장면에서 장소, 함께 있는 인물, 제삼자의 질문이나 의심, 서로의 자세, 신체 접촉, 거리, 시선, 감정과 위기를 내부적으로 판정한다.');
@@ -1099,6 +1447,7 @@
             lines.push('- 과거 상태와 현재 장면이 충돌하면 현재 장면의 상태가 사실이다.');
             lines.push('- [유저]와 [상대 캐릭터]의 역할을 절대 뒤바꾸지 않는다.');
             lines.push('- 상대 캐릭터의 다음 행동이나 반응을 대신 진행하지 않는다.');
+            lines.push('- 완성문에는 직전 상대 캐릭터 메시지의 구체적인 상황·행동·감정·질문 중 최소 하나가 자연스럽게 드러나야 한다. 어느 장면에도 붙일 수 있는 일반적인 답변만 쓰지 않는다.');
             lines.push('- 맥락을 요약하거나 그대로 재진술하지 않는다.');
         }
 
@@ -1120,9 +1469,13 @@
         lines.push('');
         lines.push('[대사와 행동 처리]');
         lines.push('- 대사 입력은 완성본이 아니라 상황에 맞게 고쳐 쓸 수 있는 초안으로 취급한다. 핵심 의도는 살리되 직전 장면과 충돌하는 표현은 자연스럽게 바꾼다.');
-        lines.push('- 행동 입력도 초안으로 취급하며, 직전 장면의 자세·접촉·거리와 모순되지 않게 *별표* 안에 이어 쓴다.');
+        lines.push('- 행동 입력도 초안으로 취급하며, 직전 장면의 자세·접촉·거리와 모순되지 않게 이어 쓴다.');
+        lines.push('- 모든 행동·표정·감각·내면·상황 서술은 문단 전체의 맨 앞과 맨 뒤에 별표를 정확히 하나씩 붙여 반드시 *지문* 형식으로 출력한다.');
+        lines.push('- 대사는 반드시 큰따옴표로 감싸고 별표 밖에 둔다. 예: "괜찮아."');
+        lines.push('- 지문 예시: *나는 잠시 시선을 피한 채 손끝을 말아 쥐었다.*');
+        lines.push('- **굵게**, ***굵은 이탤릭***, 밑줄 이탤릭은 쓰지 않는다. 지문에는 오직 단일 별표 한 쌍만 사용한다.');
+        lines.push('- 한 문단 안에 대사와 지문을 섞지 않는다. 대사 문단과 지문 문단을 서로 다른 줄에 쓰고 사이에 빈 줄을 넣는다.');
         lines.push('- 진행형/상태형 행동은 이미 진행 중인 현재 순간부터 이어 쓴다.');
-        lines.push('- 대사와 서술 묶음은 서로 다른 줄에 쓰고 사이에 빈 줄을 넣는다.');
         lines.push('- 같은 표현, 같은 감정, 같은 행동을 반복하지 않는다.');
         lines.push('- 설명, 머리말, 코드블록 없이 완성된 본문만 출력한다.');
         lines.push('- 길이: ' + (LENGTHS[length] || LENGTHS.medium).guide);
@@ -1130,6 +1483,9 @@
         const user = [
             '[현재 장면의 기준 — ' + (latestSceneSource || '판별 실패') + ']',
             latestAssistant || '(현재 장면을 찾지 못함)',
+            '',
+            '[직전 장면 바로 앞뒤 맥락]',
+            String(latestSnapshot && latestSnapshot.nearby || '').trim() || '(없음)',
             '',
             '[직전 장면의 최근 대화]',
             sceneFocus.recentDialogue.length
@@ -1906,6 +2262,82 @@
             line-height: 1.45;
         }
 
+        #se-persona-featured {
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+            padding: 9px;
+            border: 1px solid rgba(138,92,255,.55);
+            border-radius: 12px;
+            background: rgba(108,123,255,.08);
+        }
+
+        #se-persona-featured-title {
+            color: #fff;
+            font-size: 13px;
+            font-weight: 850;
+        }
+
+        #se-persona-result {
+            border: 1px solid rgba(148,163,184,.22);
+            border-radius: 10px;
+            background: rgba(0,0,0,.10);
+            overflow: hidden;
+        }
+
+        #se-persona-result > summary {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            list-style: none;
+            padding: 8px 9px;
+            cursor: pointer;
+            color: #f4f5fa;
+            font-size: 11px;
+            font-weight: 800;
+        }
+
+        #se-persona-result > summary::-webkit-details-marker {
+            display: none;
+        }
+
+        #se-persona-result > summary::after {
+            content: "보기";
+            color: #aeb3c5;
+            font-size: 10px;
+        }
+
+        #se-persona-result[open] > summary::after {
+            content: "접기";
+        }
+
+        #se-persona-result-body {
+            padding: 0 7px 7px;
+        }
+
+        #se-persona-text-0 {
+            min-height: 120px !important;
+            height: 150px !important;
+            max-height: 180px !important;
+            overflow-y: auto !important;
+            resize: vertical;
+            line-height: 1.55;
+        }
+
+        #se-persona-hint {
+            min-height: 64px !important;
+        }
+
+        #se-persona-suggest {
+            flex: none;
+            width: 100%;
+            min-height: 42px;
+            border-color: rgba(138,92,255,.75);
+            background: linear-gradient(135deg,#6c7bff,#8a5cff);
+            color: #fff;
+            font-size: 12px;
+        }
+
         details.se-section {
             border: 1px solid rgba(148,163,184,.22);
             border-radius: 11px;
@@ -2043,6 +2475,19 @@
                 min-height: 44px;
                 max-height: 105px;
             }
+
+            #se-persona-text-0 {
+                min-height: 110px !important;
+                height: 140px !important;
+                max-height: 165px !important;
+                overflow-y: auto !important;
+            }
+
+            #se-settings {
+                overscroll-behavior: contain;
+                touch-action: pan-y;
+                padding-bottom: 18px;
+            }
         }
     `;
 
@@ -2084,12 +2529,38 @@
         return html;
     }
 
+    function slotHTMLRange(type, start, end, label) {
+        let html = '';
+
+        for (let i = start; i < end; i++) {
+            html += `
+                <div class="se-slot">
+                    <div class="se-slot-head">
+                        <input type="checkbox" id="se-${type}-on-${i}">
+                        <input
+                            class="se-slot-name"
+                            id="se-${type}-name-${i}"
+                            type="text"
+                            placeholder="${label} ${i + 1} 이름"
+                        >
+                    </div>
+                    <textarea
+                        id="se-${type}-text-${i}"
+                        placeholder="${label} 내용을 입력하세요"
+                    ></textarea>
+                </div>
+            `;
+        }
+
+        return html;
+    }
+
     function buildUI() {
         const panel = document.createElement('div');
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.30</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.42</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -2127,38 +2598,50 @@
             </div>
 
             <div id="se-settings">
+                <div id="se-persona-featured">
+                    <div id="se-persona-featured-title">🎭 추천 페르소나 · 맨 위 고정</div>
+
+                    <textarea
+                        id="se-persona-hint"
+                        placeholder="추천 키워드 예: 여자 검사, 무뚝뚝, 책임감 강함"
+                    ></textarea>
+
+                    <button
+                        id="se-persona-suggest"
+                        class="se-secondary"
+                        type="button"
+                    >✨ 현재 설정으로 페르소나 추천</button>
+
+                    <div id="se-persona-status"></div>
+
+                    <details id="se-persona-result">
+                        <summary>추천 결과 / 직접 편집</summary>
+                        <div id="se-persona-result-body">
+                            <div class="se-slot">
+                                <div class="se-slot-head">
+                                    <input type="checkbox" id="se-persona-on-0">
+                                    <input
+                                        class="se-slot-name"
+                                        id="se-persona-name-0"
+                                        type="text"
+                                        placeholder="추천 페르소나 이름"
+                                    >
+                                </div>
+                                <textarea
+                                    id="se-persona-text-0"
+                                    placeholder="추천 결과가 여기에 표시돼요. 내부에서 스크롤하거나 직접 수정할 수 있습니다."
+                                ></textarea>
+                            </div>
+                        </div>
+                    </details>
+                </div>
+
                 <details class="se-section" open>
-                    <summary>🎭 페르소나 / 자동추천</summary>
-                    <div class="se-section-body">
-                        <textarea
-                            id="se-persona-hint"
-                            placeholder="추천 키워드 예: 여자 검사, 무뚝뚝, 책임감 강함"
-                        ></textarea>
-
-                        <button
-                            id="se-persona-suggest"
-                            class="se-secondary"
-                            type="button"
-                        >✨ 현재 설정으로 페르소나 추천</button>
-
-                        <div id="se-persona-status"></div>
-                        ${slotHTML('persona', PERSONA_SLOTS, '페르소나')}
-                    </div>
-                </details>
-
-                <details class="se-section">
-                    <summary>✍️ 문체 규칙</summary>
-                    <div class="se-section-body">
-                        ${slotHTML('style', STYLE_SLOTS, '문체')}
-                    </div>
-                </details>
-
-                <details class="se-section">
-                    <summary>💬 최근 대화 맥락</summary>
+                    <summary>💬 최근 대화 맥락 · 항상 참고</summary>
                     <div class="se-section-body">
                         <div class="se-inline">
-                            <input id="se-ctx-on" type="checkbox">
-                            <span>맥락 참고 · 최근</span>
+                            <input id="se-ctx-on" type="checkbox" checked disabled>
+                            <span>직전 상대 채팅 + 최근</span>
                             <input
                                 id="se-ctx-n"
                                 class="se-inline-number"
@@ -2170,12 +2653,28 @@
                             <span>개</span>
                         </div>
 
+                        <div class="se-label">직전 상대 캐릭터 채팅은 항상 읽고, 위 숫자만큼 이전 대화도 함께 참고해요.</div>
+
                         <div class="se-btn-row">
-                            <button id="se-ctx-preview" type="button">🔍 맥락 미리보기</button>
+                            <button id="se-ctx-preview" type="button">🔍 실제로 읽힌 맥락 보기</button>
                             <button id="se-ctx-clear" type="button">🧹 이 채팅방 캐시 지우기</button>
                         </div>
 
                         <div id="se-ctx-status"></div>
+                    </div>
+                </details>
+
+                <details class="se-section">
+                    <summary>🎭 추가 페르소나 2·3번</summary>
+                    <div class="se-section-body">
+                        ${slotHTMLRange('persona', 1, PERSONA_SLOTS, '페르소나')}
+                    </div>
+                </details>
+
+                <details class="se-section">
+                    <summary>✍️ 문체 규칙</summary>
+                    <div class="se-section-body">
+                        ${slotHTML('style', STYLE_SLOTS, '문체')}
                     </div>
                 </details>
 
@@ -2565,7 +3064,9 @@
         nameInput.value = GM_getValue(K_NAME, '');
         personaHint.value = GM_getValue(K_PERSONA_HINT, '');
 
-        ctxOn.checked = GM_getValue(K_CTX_ON, false);
+        ctxOn.checked = true;
+        ctxOn.disabled = true;
+        GM_setValue(K_CTX_ON, true);
         ctxN.value = GM_getValue(K_CTX_N, 6);
 
         costOn.checked = GM_getValue(K_COST_ON, true);
@@ -2632,7 +3133,9 @@
                 GM_setValue(K_OPEN, true);
 
                 requestAnimationFrame(() => {
-                    clampElementToViewport(panel, K_POS, true);
+                    if (!isSoftKeyboardOpen()) {
+                        clampElementToViewport(panel, K_POS, true);
+                    }
                 });
             }
         }
@@ -2649,10 +3152,21 @@
             settings.classList.toggle('show', opening);
             body.classList.toggle('hide', opening);
 
-            if (opening) settings.scrollTop = 0;
+            if (opening) {
+                settings.scrollTop = 0;
+                const resultDetails = $('#se-persona-result');
+                const personaResult = $('#se-persona-text-0');
+
+                /* 결과가 있어도 설정 전체를 가리지 않도록 기본은 접힌 상태로 연다. */
+                if (resultDetails && personaResult && personaResult.value.trim()) {
+                    resultDetails.open = false;
+                }
+            }
 
             requestAnimationFrame(() => {
-                clampElementToViewport(panel, null, true);
+                if (!isSoftKeyboardOpen()) {
+                    clampElementToViewport(panel, null, true);
+                }
             });
         });
 
@@ -2661,7 +3175,7 @@
             GM_setValue(K_APIKEY, keyInput.value.trim());
             GM_setValue(K_NAME, nameInput.value.trim());
             GM_setValue(K_PERSONA_HINT, personaHint.value.trim());
-            GM_setValue(K_CTX_ON, ctxOn.checked);
+            GM_setValue(K_CTX_ON, true);
             GM_setValue(
                 K_CTX_N,
                 clamp(parseInt(ctxN.value, 10) || 6, 1, 30)
@@ -2763,14 +3277,18 @@
                         '페르소나'
                     );
 
-                    let index = slots.findIndex(item => item.on);
-                    if (index < 0) {
-                        index = slots.findIndex(item => !item.text.trim());
-                    }
-                    if (index < 0) index = 0;
+                    /* 추천 결과는 항상 맨 위 1번 칸에 넣는다.
+                     * 기존에는 켜져 있는 2·3번 칸에 들어가 결과가 아래로 숨어버릴 수 있었다. */
+                    const index = 0;
+                    const resultTextarea = $('#se-persona-text-0');
 
-                    $('#se-persona-on-' + index).checked = true;
-                    $('#se-persona-text-' + index).value = text;
+                    $('#se-persona-on-0').checked = true;
+                    resultTextarea.value = text;
+
+                    /* 결과는 접이식 영역 안에서 제한된 높이로 보여 하단 설정을 가리지 않는다. */
+                    const resultDetails = $('#se-persona-result');
+                    if (resultDetails) resultDetails.open = true;
+                    resultTextarea.style.height = '';
 
                     const nameInput = $('#se-persona-name-' + index);
                     if (
@@ -2786,12 +3304,21 @@
                     button.disabled = false;
                     setInfo(
                         personaStatus,
-                        '페르소나 ' +
-                            (index + 1) +
-                            '번 칸에 넣었어요 ✅' +
+                        '추천 결과를 맨 위 1번 칸에 넣었어요 ✅' +
                             (costInfo ? '\n' + costInfo.message : ''),
                         false
                     );
+
+                    requestAnimationFrame(() => {
+                        const resultDetails = $('#se-persona-result');
+                        if (resultDetails && resultDetails.scrollIntoView) {
+                            resultDetails.scrollIntoView({
+                                behavior: 'smooth',
+                                block: 'nearest'
+                            });
+                        }
+                        resultTextarea.scrollTop = 0;
+                    });
                 },
                 error => {
                     button.disabled = false;
@@ -2801,8 +3328,10 @@
         });
 
         /* 맥락 */
+        /* 직전 채팅 맥락은 항상 사용한다. */
         ctxOn.addEventListener('change', () => {
-            GM_setValue(K_CTX_ON, ctxOn.checked);
+            ctxOn.checked = true;
+            GM_setValue(K_CTX_ON, true);
         });
 
         $('#se-ctx-preview').addEventListener('click', () => {
@@ -2812,46 +3341,53 @@
             const visible = collectVisibleChatLines();
             rememberCtxLines(visible);
 
-            const context = collectChatContext(n);
+            const records = (visible.length ? visible : getCtxCache()).slice(-n);
             const latestSnapshot = collectLatestSceneSnapshot();
-            const sceneFocus = extractSceneFocus(latestSnapshot.text);
 
-            if (!context.length && !latestSnapshot.text) {
+            if (!records.length && !latestSnapshot.text) {
                 setInfo(
                     ctxStatus,
-                    '대화를 못 잡았어요. 시작 카드와 채팅이 보이는 상태에서 다시 눌러보세요.',
+                    '대화를 못 잡았어요. 채팅이 보이는 상태에서 다시 눌러보세요.',
                     true
                 );
                 return;
             }
 
+            const loaded = records.map((item, index) => {
+                const roleLabel = item.role === 'user'
+                    ? '유저'
+                    : item.role === 'assistant'
+                        ? '상대 캐릭터'
+                        : '역할 미확인';
+                const turnLabel = Number.isFinite(item.turnNumber)
+                    ? '턴 ' + item.turnNumber + ' · '
+                    : '';
+                const preview = String(item.text || '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+
+                return (
+                    (index + 1) + '. [' + turnLabel + roleLabel + ']\n' +
+                    (preview.length > 220 ? preview.slice(0, 220) + '…' : preview)
+                );
+            }).join('\n\n');
+
+            const liveGroups = getLiveMessageGroupsNewestFirst();
+            const liveTurns = liveGroups
+                .map(group => extractTurnNumber(getRawNodeText(group)))
+                .filter(Number.isFinite);
+
             setInfo(
                 ctxStatus,
-                '실제 생성 기준: ' +
-                    (latestSnapshot.source || '판별 실패') + '\n' +
-                    '최근 대화 흐름: ' +
-                    (sceneFocus.recentDialogue.length ? sceneFocus.recentDialogue.join(' / ') : '(직접 발화 없음)') + '\n' +
-                    '장면 참고 단서: ' +
-                    (sceneFocus.keywords.join(', ') || '(없음)') + '\n\n' +
-                    context.length +
-                    '개 참고 예정 (요청 ' +
-                    n +
-                    '개) / 화면 후보 ' +
-                    visible.length +
-                    '개 / 누적 캐시 ' +
-                    getCtxCache().length +
-                    '개\n' +
-                    context.map((item, index) => {
-                        return (
-                            (index + 1) +
-                            '. ' +
-                            (
-                                item.length > 260
-                                    ? item.slice(0, 260) + '…'
-                                    : item
-                            )
-                        );
-                    }).join('\n'),
+                '직전 턴: ' +
+                    (Number.isFinite(latestSnapshot.turnNumber)
+                        ? '턴 ' + latestSnapshot.turnNumber
+                        : (latestSnapshot.source || '판별 실패')) +
+                    '\n감지한 메시지: ' + liveGroups.length +
+                    '개 · 감지한 턴: ' +
+                    (liveTurns.length ? liveTurns.join(' → ') : '(없음)') +
+                    '\n읽은 순서: 과거 → 최신\n\n' +
+                    loaded,
                 false
             );
         });
@@ -3013,7 +3549,9 @@
             resultButtons.classList.add('show');
 
             requestAnimationFrame(() => {
-                clampElementToViewport(panel, null, true);
+                if (!isSoftKeyboardOpen()) {
+                    clampElementToViewport(panel, null, true);
+                }
             });
         }
 
@@ -3030,14 +3568,10 @@
             GM_setValue(K_MODEL, modelSelect.value);
             saveSlots();
 
-            const context = ctxOn.checked
-                ? collectChatContext(
-                    clamp(parseInt(ctxN.value, 10) || 6, 1, 30)
-                )
-                : [];
-            const latestSnapshot = ctxOn.checked
-                ? collectLatestSceneSnapshot()
-                : { text: '', source: '맥락 참고 꺼짐', role: 'unknown' };
+            const context = collectChatContext(
+                clamp(parseInt(ctxN.value, 10) || 6, 1, 30)
+            );
+            const latestSnapshot = collectLatestSceneSnapshot();
             const sceneFocus = extractSceneFocus(latestSnapshot.text);
             const prompt = buildPrompt(d, a, context, latestSnapshot);
 
@@ -3052,9 +3586,11 @@
                 prompt.user,
                 '문장 부풀리기',
                 (text, costInfo) => {
+                    const formattedText = normalizeRoleplayItalics(text);
+
                     if (
-                        ctxOn.checked &&
-                        !isContextGroundedOutput(text, sceneFocus)
+                        latestSnapshot.text &&
+                        !isContextGroundedOutput(formattedText, sceneFocus)
                     ) {
                         flash('문맥과 동떨어진 일반론을 감지해 자동으로 다시 맞추는 중…');
 
@@ -3063,7 +3599,7 @@
                             '',
                             '[재교정 요청]',
                             '아래 첫 출력은 어느 장면에도 붙일 수 있는 범용 복종문에 치우쳤다.',
-                            '첫 출력: ' + text,
+                            '첫 출력: ' + formattedText,
                             '직전 장면의 최근 흐름: ' + (sceneFocus.tail || latestSnapshot.text || '(없음)'),
                             '장면 전체 참고 단서: ' + (sceneFocus.keywords.join(', ') || '(없음)'),
                             '마지막 문장 하나를 복창하지 말고 직전 장면 전체의 사건·감정·관계 변화 중 가장 자연스러운 지점에 반응하는 본문으로 다시 작성해.'
@@ -3074,7 +3610,8 @@
                             repairUser,
                             '문장 부풀리기 자동 재교정',
                             (repaired, repairCost) => {
-                                renderResult(repaired);
+                                const formattedRepair = normalizeRoleplayItalics(repaired);
+                                renderResult(formattedRepair);
                                 refreshCost(repairCost || costInfo);
                                 goButton.disabled = false;
                                 flash(
@@ -3084,7 +3621,7 @@
                                 );
                             },
                             error => {
-                                renderResult(text);
+                                renderResult(formattedText);
                                 refreshCost(costInfo);
                                 goButton.disabled = false;
                                 flash('자동 재교정은 실패했지만 첫 결과를 표시했어요: ' + error, true);
@@ -3093,7 +3630,7 @@
                         return;
                     }
 
-                    renderResult(text);
+                    renderResult(formattedText);
                     refreshCost(costInfo);
                     goButton.disabled = false;
                     flash(costInfo ? costInfo.message : '');
@@ -3167,16 +3704,13 @@
         );
 
         /* 모바일 화면 변화 복구
-         * 소프트 키보드가 열리면 visualViewport 높이가 줄어드는데,
-         * 이때 FAB을 보정하면 토글이 키보드 위로 튀어 오른다.
-         * 키보드가 열린 동안에는 FAB 위치를 그대로 유지한다.
+         * 소프트 키보드가 열린 동안에는 visualViewport의 크기와 오프셋이
+         * 계속 바뀔 수 있으므로 패널과 FAB의 저장 좌표를 아예 건드리지 않는다.
          */
         const repair = () => {
-            const keyboardOpen = isSoftKeyboardOpen();
+            if (isSoftKeyboardOpen()) return;
 
-            if (!keyboardOpen) {
-                clampElementToViewport(fab, null, false);
-            }
+            clampElementToViewport(fab, null, false);
 
             if (getComputedStyle(panel).display !== 'none') {
                 clampElementToViewport(panel, null, true);
@@ -3190,22 +3724,26 @@
                     stableViewportHeight = window.visualViewport
                         ? window.visualViewport.height
                         : window.innerHeight;
-                }
 
-                repair();
+                    repair();
+                }
             }, 350);
         }, { passive: true });
 
         if (window.visualViewport) {
             window.visualViewport.addEventListener(
                 'resize',
-                repair,
+                () => {
+                    if (!isSoftKeyboardOpen()) repair();
+                },
                 { passive: true }
             );
 
             window.visualViewport.addEventListener(
                 'scroll',
-                repair,
+                () => {
+                    if (!isSoftKeyboardOpen()) repair();
+                },
                 { passive: true }
             );
         }
@@ -3239,9 +3777,9 @@
                     const panel = document.getElementById(PANEL_ID);
                     const fab = document.getElementById(FAB_ID);
 
-                    if (!isSoftKeyboardOpen()) {
-                        clampElementToViewport(fab, null, false);
-                    }
+                    if (isSoftKeyboardOpen()) return;
+
+                    clampElementToViewport(fab, null, false);
 
                     if (
                         panel &&
