@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.35
+// @version      6.12.36
 // @author       me
-// @description  추천 페르소나 영역을 모바일에서 작게 정리하고, 역할 오판과 무관하게 실제 마지막 채팅을 직전 턴으로 고정하며, 모바일 키보드 위치를 고정한 단일 실행판.
+// @description  크랙의 최신순 DOM을 역순으로 읽어 실제 직전 채팅을 정확히 잡고, 추천 페르소나와 모바일 키보드 위치를 정리한 단일 실행판.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -39,7 +39,7 @@
 
     const K_CTX_ON = 'se_ctx_on';
     const K_CTX_N = 'se_ctx_n';
-    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v5';
+    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v6';
     const K_STORY_BOOTSTRAP_BASE = 'se_ctx_story_bootstrap_v4';
 
     const K_COST_ON = 'se_cost_on';
@@ -646,12 +646,12 @@
                 });
         }
 
-        /* querySelectorAll의 DOM 순서가 실제 채팅 시간순이다.
-         * 모바일 스크롤/키보드가 열리면 rect.top 값이 튀므로 화면 좌표로
-         * 정렬하면 최신 메시지가 과거 메시지 앞에 끼어들 수 있다. */
+        /* 크랙 채팅 DOM은 최신 메시지가 먼저 오는 역시간순으로 배치된다.
+         * 따라서 DOM 인덱스를 역순으로 뒤집어 [과거 → 최신] 순서로 통일한다.
+         * rect.top은 모바일 스크롤/키보드에서 흔들리므로 순서 판정에 쓰지 않는다. */
         entries.sort((a, b) => {
-            if (a.domIndex !== b.domIndex) return a.domIndex - b.domIndex;
-            return a.top - b.top;
+            if (a.domIndex !== b.domIndex) return b.domIndex - a.domIndex;
+            return b.top - a.top;
         });
 
         /* 역할 표지가 하나도 없으면 채팅 입력창 직전의 마지막 출력은 상대
@@ -878,7 +878,7 @@
             /* 역할 판별을 절대 사용하지 않는다.
              * 크랙이 최신 캐릭터 메시지를 user/unknown으로 잘못 표시하는 경우가 있어
              * assistant만 역검색하면 2~3턴 전 메시지까지 건너뛰는 문제가 생긴다.
-             * DOM 시간순의 실제 마지막 메시지를 무조건 직전 장면으로 사용한다. */
+             * 최신순 DOM을 역순 정렬한 뒤 마지막 메시지를 직전 장면으로 사용한다. */
             const picked = visible[visible.length - 1];
             const nearby = visible
                 .slice(Math.max(0, visible.length - 3))
