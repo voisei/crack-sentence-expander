@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.37
+// @version      6.12.38
 // @author       me
 // @description  화면의 턴 번호를 우선 읽고 입력창에 가장 가까운 메시지를 직전 턴으로 잡으며, 추천 페르소나와 모바일 키보드 위치를 정리한 단일 실행판.
 // @match        https://crack.wrtn.ai/*
@@ -39,7 +39,7 @@
 
     const K_CTX_ON = 'se_ctx_on';
     const K_CTX_N = 'se_ctx_n';
-    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v7';
+    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v8';
     const K_STORY_BOOTSTRAP_BASE = 'se_ctx_story_bootstrap_v4';
 
     const K_COST_ON = 'se_cost_on';
@@ -664,8 +664,13 @@
         const inputTop = input ? input.getBoundingClientRect().top : window.innerHeight;
         const entries = [];
 
-        const groups = Array.from(document.querySelectorAll('[data-message-group-id]'))
-            .filter(group => !panel || !panel.contains(group));
+        const groups = Array.from(document.querySelectorAll('main [data-message-group-id], [data-message-group-id]'))
+            .filter(group => {
+                if (panel && panel.contains(group)) return false;
+                if (!isVisible(group)) return false;
+                if (group.parentElement && group.parentElement.closest('[data-message-group-id]')) return false;
+                return true;
+            });
 
         groups.forEach((group, index) => {
             const contentEl = getBestMessageNode(group);
@@ -939,16 +944,76 @@
         return getUnifiedContext(maxN);
     }
 
+    /* 크랙의 실제 메시지 목록은 화면상 최신 메시지를 DOM 첫 번째 자식으로 둔다.
+     * CSS/가상 스크롤 때문에 화면 좌표, 배열 마지막, reverse()를 기준으로 잡으면
+     * 턴 5처럼 오래된 메시지가 선택될 수 있다. 생성용 직전 장면만큼은
+     * data-message-group-id의 첫 번째 유효 그룹을 직접 읽는다. */
+    function collectNewestDomMessageRecord() {
+        const panel = document.getElementById(PANEL_ID);
+        const groups = Array.from(document.querySelectorAll('main [data-message-group-id], [data-message-group-id]'))
+            .filter(group => {
+                if (panel && panel.contains(group)) return false;
+                if (!isVisible(group)) return false;
+                if (group.parentElement && group.parentElement.closest('[data-message-group-id]')) return false;
+                return true;
+            });
+
+        for (let index = 0; index < groups.length; index++) {
+            const group = groups[index];
+            const contentEl = getBestMessageNode(group);
+            const rawGroupText = group.innerText || group.textContent || '';
+            const rawContentText = contentEl.innerText || contentEl.textContent || '';
+            const cleaned = cleanContextLine(rawContentText);
+
+            if (isBadContextLine(cleaned)) continue;
+
+            const rect = group.getBoundingClientRect();
+            const rawId = group.getAttribute('data-message-group-id') || '';
+
+            return normalizeContextRecord({
+                id: rawId || ('dom-newest-' + hashContextId(cleaned)),
+                text: cleaned,
+                turnNumber: extractTurnNumber(rawGroupText) ?? extractTurnNumber(rawContentText),
+                role: detectMessageRole(group, contentEl),
+                top: Number.isFinite(rect.top) ? rect.top : 0,
+                bottom: Number.isFinite(rect.bottom) ? rect.bottom : 0,
+                distanceToInput: 0,
+                domIndex: index,
+                nearInput: true
+            });
+        }
+
+        return null;
+    }
+
     /* 실제 생성에 사용할 직전 장면은 캐시 역할 판별에 맡기지 않고
-     * 현재 화면의 마지막 메시지에서 직접 고정한다. 사용자가 부풀리기 버튼을
-     * 누르는 시점에는 마지막 채팅 메시지가 상대 캐릭터 출력이라는 전제다. */
+     * 현재 DOM의 최신순 첫 메시지 그룹에서 직접 고정한다. */
     function collectLatestSceneSnapshot() {
+        const directLatest = collectNewestDomMessageRecord();
         const visible = collectVisibleChatLines();
 
+        if (directLatest) {
+            const pickedIndex = Math.max(0, visible.findIndex(item => item.id === directLatest.id));
+            const nearby = pickedIndex >= 0 && visible.length
+                ? visible
+                    .slice(Math.max(0, pickedIndex - 2), pickedIndex + 1)
+                    .map(item => formatContextMessage(item.role, item.text))
+                    .join('\n\n')
+                : formatContextMessage(directLatest.role, directLatest.text);
+
+            return {
+                text: directLatest.text || '',
+                nearby,
+                source: Number.isFinite(directLatest.turnNumber)
+                    ? 'DOM 최신순 첫 메시지 · 턴 ' + directLatest.turnNumber
+                    : 'DOM 최신순 첫 메시지',
+                role: directLatest.role || 'unknown',
+                id: directLatest.id || '',
+                turnNumber: directLatest.turnNumber
+            };
+        }
+
         if (visible.length) {
-            /* DOM 배열의 첫/마지막 위치를 믿지 않는다.
-             * 1순위: 화면에 표시된 가장 큰 턴 번호
-             * 2순위: 채팅 입력창과 실제로 가장 가까운 메시지 */
             const picked = pickLatestContextRecord(visible);
             const pickedIndex = Math.max(0, visible.findIndex(item => item.id === picked.id));
             const nearby = visible
@@ -960,8 +1025,8 @@
                 text: picked.text || '',
                 nearby,
                 source: Number.isFinite(picked.turnNumber)
-                    ? '화면의 가장 최신 턴 ' + picked.turnNumber
-                    : '채팅 입력창에 가장 가까운 실제 메시지',
+                    ? '화면 턴 번호 보조 판정 · 턴 ' + picked.turnNumber
+                    : '화면 위치 보조 판정',
                 role: picked.role || 'unknown',
                 id: picked.id || '',
                 turnNumber: picked.turnNumber
@@ -2429,7 +2494,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.35</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.38</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
