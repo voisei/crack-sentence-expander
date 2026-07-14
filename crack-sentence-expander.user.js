@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.31
+// @version      6.12.32
 // @author       me
-// @description  직전 턴 전체 흐름을 균형 있게 읽고 마지막 문장에 기계적으로 집착하지 않으며, 모바일 키보드가 열릴 때 패널과 플로팅 토글 위치를 재계산하지 않는 단일 실행판.
+// @description  직전 턴 전체 흐름을 균형 있게 읽고 마지막 문장에 기계적으로 집착하지 않으며, 모바일 키보드 위치를 고정하고, 생성 결과의 지문을 *이탤릭체* 형식으로 자동 보정하는 단일 실행판.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -907,6 +907,76 @@
         return keywords.some(word => normalized.includes(word));
     }
 
+
+    /* =========================
+     * 지문 이탤릭 형식 보정
+     * ========================= */
+    function isDialogueParagraph(text) {
+        const value = String(text || '').trim();
+        if (!value) return false;
+
+        /* 대사는 반드시 따옴표로 출력하도록 프롬프트에서 요구한다.
+         * 혹시 앞에 화자명이나 대시가 붙어도 대사로 인식한다. */
+        return (
+            /^(?:[-–—]\s*)?["“‘「『]/.test(value) ||
+            /^(?:[^\n:：]{1,24}\s*[:：]\s*)["“‘「『]/.test(value)
+        );
+    }
+
+    function stripOuterAsterisks(text) {
+        let value = String(text || '').trim();
+
+        /* **굵게**, ***혼합*** 등 잘못 붙은 외곽 별표도 제거한 뒤
+         * 지문에는 정확히 한 쌍만 다시 붙인다. */
+        value = value
+            .replace(/^\*{1,3}\s*/, '')
+            .replace(/\s*\*{1,3}$/, '')
+            .trim();
+
+        return value;
+    }
+
+    function normalizeRoleplayItalics(text) {
+        const source = String(text || '')
+            .replace(/^```(?:markdown|md|txt)?\s*/i, '')
+            .replace(/\s*```$/, '')
+            .replace(/\r/g, '')
+            .trim();
+
+        if (!source) return '';
+
+        const paragraphs = source
+            .split(/\n\s*\n+/)
+            .map(item => item.trim())
+            .filter(Boolean);
+
+        const normalized = [];
+
+        for (const paragraph of paragraphs) {
+            /* 한 문단 안에 대사와 지문이 줄바꿈으로 섞여 나온 경우도
+             * 줄 단위로 분리해 각각 정확한 형식으로 맞춘다. */
+            const lines = paragraph
+                .split('\n')
+                .map(line => line.trim())
+                .filter(Boolean);
+
+            for (const line of lines) {
+                if (isDialogueParagraph(line)) {
+                    /* 대사는 이탤릭 밖에 둔다. */
+                    normalized.push(stripOuterAsterisks(line));
+                    continue;
+                }
+
+                const narration = stripOuterAsterisks(line);
+                if (!narration) continue;
+
+                normalized.push('*' + narration + '*');
+            }
+        }
+
+        return normalized.join('\n\n');
+    }
+
     function findChatRoot() {
         const firstGroup = document.querySelector('[data-message-group-id]');
 
@@ -1125,9 +1195,13 @@
         lines.push('');
         lines.push('[대사와 행동 처리]');
         lines.push('- 대사 입력은 완성본이 아니라 상황에 맞게 고쳐 쓸 수 있는 초안으로 취급한다. 핵심 의도는 살리되 직전 장면과 충돌하는 표현은 자연스럽게 바꾼다.');
-        lines.push('- 행동 입력도 초안으로 취급하며, 직전 장면의 자세·접촉·거리와 모순되지 않게 *별표* 안에 이어 쓴다.');
+        lines.push('- 행동 입력도 초안으로 취급하며, 직전 장면의 자세·접촉·거리와 모순되지 않게 이어 쓴다.');
+        lines.push('- 모든 행동·표정·감각·내면·상황 서술은 문단 전체의 맨 앞과 맨 뒤에 별표를 정확히 하나씩 붙여 반드시 *지문* 형식으로 출력한다.');
+        lines.push('- 대사는 반드시 큰따옴표로 감싸고 별표 밖에 둔다. 예: "괜찮아."');
+        lines.push('- 지문 예시: *나는 잠시 시선을 피한 채 손끝을 말아 쥐었다.*');
+        lines.push('- **굵게**, ***굵은 이탤릭***, 밑줄 이탤릭은 쓰지 않는다. 지문에는 오직 단일 별표 한 쌍만 사용한다.');
+        lines.push('- 한 문단 안에 대사와 지문을 섞지 않는다. 대사 문단과 지문 문단을 서로 다른 줄에 쓰고 사이에 빈 줄을 넣는다.');
         lines.push('- 진행형/상태형 행동은 이미 진행 중인 현재 순간부터 이어 쓴다.');
-        lines.push('- 대사와 서술 묶음은 서로 다른 줄에 쓰고 사이에 빈 줄을 넣는다.');
         lines.push('- 같은 표현, 같은 감정, 같은 행동을 반복하지 않는다.');
         lines.push('- 설명, 머리말, 코드블록 없이 완성된 본문만 출력한다.');
         lines.push('- 길이: ' + (LENGTHS[length] || LENGTHS.medium).guide);
@@ -2094,7 +2168,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.31</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.32</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -3063,9 +3137,11 @@
                 prompt.user,
                 '문장 부풀리기',
                 (text, costInfo) => {
+                    const formattedText = normalizeRoleplayItalics(text);
+
                     if (
                         ctxOn.checked &&
-                        !isContextGroundedOutput(text, sceneFocus)
+                        !isContextGroundedOutput(formattedText, sceneFocus)
                     ) {
                         flash('문맥과 동떨어진 일반론을 감지해 자동으로 다시 맞추는 중…');
 
@@ -3074,7 +3150,7 @@
                             '',
                             '[재교정 요청]',
                             '아래 첫 출력은 어느 장면에도 붙일 수 있는 범용 복종문에 치우쳤다.',
-                            '첫 출력: ' + text,
+                            '첫 출력: ' + formattedText,
                             '직전 장면의 최근 흐름: ' + (sceneFocus.tail || latestSnapshot.text || '(없음)'),
                             '장면 전체 참고 단서: ' + (sceneFocus.keywords.join(', ') || '(없음)'),
                             '마지막 문장 하나를 복창하지 말고 직전 장면 전체의 사건·감정·관계 변화 중 가장 자연스러운 지점에 반응하는 본문으로 다시 작성해.'
@@ -3085,7 +3161,8 @@
                             repairUser,
                             '문장 부풀리기 자동 재교정',
                             (repaired, repairCost) => {
-                                renderResult(repaired);
+                                const formattedRepair = normalizeRoleplayItalics(repaired);
+                                renderResult(formattedRepair);
                                 refreshCost(repairCost || costInfo);
                                 goButton.disabled = false;
                                 flash(
@@ -3095,7 +3172,7 @@
                                 );
                             },
                             error => {
-                                renderResult(text);
+                                renderResult(formattedText);
                                 refreshCost(costInfo);
                                 goButton.disabled = false;
                                 flash('자동 재교정은 실패했지만 첫 결과를 표시했어요: ' + error, true);
@@ -3104,7 +3181,7 @@
                         return;
                     }
 
-                    renderResult(text);
+                    renderResult(formattedText);
                     refreshCost(costInfo);
                     goButton.disabled = false;
                     flash(costInfo ? costInfo.message : '');
