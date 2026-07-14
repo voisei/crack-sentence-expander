@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.34
+// @version      6.12.35
 // @author       me
-// @description  추천 페르소나 영역을 모바일에서 작게 정리하고, 직전 상대 채팅과 최근 대화 맥락을 항상 반영하며, 모바일 키보드 위치를 고정한 단일 실행판.
+// @description  추천 페르소나 영역을 모바일에서 작게 정리하고, 역할 오판과 무관하게 실제 마지막 채팅을 직전 턴으로 고정하며, 모바일 키보드 위치를 고정한 단일 실행판.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -39,7 +39,7 @@
 
     const K_CTX_ON = 'se_ctx_on';
     const K_CTX_N = 'se_ctx_n';
-    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v4';
+    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v5';
     const K_STORY_BOOTSTRAP_BASE = 'se_ctx_story_bootstrap_v4';
 
     const K_COST_ON = 'se_cost_on';
@@ -335,7 +335,13 @@
                 ? record.role
                 : 'unknown',
             text,
-            nearInput: !!record.nearInput
+            nearInput: !!record.nearInput,
+            domIndex: Number.isFinite(record.domIndex) ? record.domIndex : -1,
+            top: Number.isFinite(record.top) ? record.top : 0,
+            bottom: Number.isFinite(record.bottom) ? record.bottom : 0,
+            distanceToInput: Number.isFinite(record.distanceToInput)
+                ? record.distanceToInput
+                : Number.POSITIVE_INFINITY
         };
     }
 
@@ -609,8 +615,12 @@
                 text,
                 role: detectMessageRole(group, contentEl),
                 top: Number.isFinite(rect.top) ? rect.top : index,
+                bottom: Number.isFinite(rect.bottom) ? rect.bottom : index,
+                distanceToInput: Number.isFinite(rect.bottom)
+                    ? Math.abs(inputTop - rect.bottom)
+                    : Number.POSITIVE_INFINITY,
                 domIndex: index,
-                nearInput: rect.bottom <= inputTop + 100 && rect.bottom >= inputTop - 1800
+                nearInput: rect.bottom <= inputTop + 100 && rect.bottom >= inputTop - 2200
             });
         });
 
@@ -626,15 +636,22 @@
                         text,
                         role: detectMessageRole(el.parentElement || el, el),
                         top: Number.isFinite(rect.top) ? rect.top : index,
+                        bottom: Number.isFinite(rect.bottom) ? rect.bottom : index,
+                        distanceToInput: Number.isFinite(rect.bottom)
+                            ? Math.abs(inputTop - rect.bottom)
+                            : Number.POSITIVE_INFINITY,
                         domIndex: index,
-                        nearInput: rect.bottom <= inputTop + 100 && rect.bottom >= inputTop - 1800
+                        nearInput: rect.bottom <= inputTop + 100 && rect.bottom >= inputTop - 2200
                     });
                 });
         }
 
+        /* querySelectorAll의 DOM 순서가 실제 채팅 시간순이다.
+         * 모바일 스크롤/키보드가 열리면 rect.top 값이 튀므로 화면 좌표로
+         * 정렬하면 최신 메시지가 과거 메시지 앞에 끼어들 수 있다. */
         entries.sort((a, b) => {
-            if (a.top !== b.top) return a.top - b.top;
-            return a.domIndex - b.domIndex;
+            if (a.domIndex !== b.domIndex) return a.domIndex - b.domIndex;
+            return a.top - b.top;
         });
 
         /* 역할 표지가 하나도 없으면 채팅 입력창 직전의 마지막 출력은 상대
@@ -818,7 +835,24 @@
         rememberCtxLines(visibleRecords);
 
         const cache = getCtxCache();
-        const records = cache.length ? cache : visibleRecords;
+        let records = cache.length ? cache : visibleRecords;
+
+        /* 현재 DOM에 잡힌 마지막 메시지가 캐시 끝과 다르면 현재 화면 순서를 우선한다.
+         * 생성 직전 새 응답이 MutationObserver 캐시에 아직 반영되지 않은 짧은 순간에도
+         * 2~3턴 전 캐시를 쓰지 않도록 한다. */
+        if (visibleRecords.length) {
+            const latestVisible = visibleRecords[visibleRecords.length - 1];
+            const latestCached = records.length ? records[records.length - 1] : null;
+
+            if (!latestCached || latestCached.id !== latestVisible.id) {
+                const visibleIds = new Set(visibleRecords.map(item => item.id));
+                records = [
+                    ...records.filter(item => !visibleIds.has(item.id)),
+                    ...visibleRecords
+                ];
+            }
+        }
+
         const recent = records
             .slice(-n)
             .map(item => formatContextMessage(item.role, item.text));
@@ -841,41 +875,40 @@
         const visible = collectVisibleChatLines();
 
         if (visible.length) {
-            /* 마지막 항목이 유저 메시지로 잘못 잡히거나 아직 화면에 남아 있어도,
-             * 가장 가까운 상대 캐릭터 출력을 우선한다. */
-            const latestAssistant = [...visible]
-                .reverse()
-                .find(item => item.role === 'assistant' && item.text);
-
-            const picked = latestAssistant || visible[visible.length - 1];
-            const pickedIndex = visible.findIndex(item => item.id === picked.id);
+            /* 역할 판별을 절대 사용하지 않는다.
+             * 크랙이 최신 캐릭터 메시지를 user/unknown으로 잘못 표시하는 경우가 있어
+             * assistant만 역검색하면 2~3턴 전 메시지까지 건너뛰는 문제가 생긴다.
+             * DOM 시간순의 실제 마지막 메시지를 무조건 직전 장면으로 사용한다. */
+            const picked = visible[visible.length - 1];
             const nearby = visible
-                .slice(Math.max(0, pickedIndex - 2), pickedIndex + 1)
+                .slice(Math.max(0, visible.length - 3))
                 .map(item => formatContextMessage(item.role, item.text))
                 .join('\n\n');
 
             return {
                 text: picked.text || '',
                 nearby,
-                source: latestAssistant
-                    ? '현재 화면의 직전 상대 캐릭터 메시지'
-                    : '현재 화면의 실제 마지막 메시지',
-                role: picked.role || 'unknown'
+                source: '현재 채팅 DOM의 실제 마지막 메시지',
+                role: picked.role || 'unknown',
+                id: picked.id || ''
             };
         }
 
         const cache = getCtxCache();
         if (cache.length) {
-            const cachedAssistant = [...cache]
-                .reverse()
-                .find(item => item.role === 'assistant' && item.text);
-            const picked = cachedAssistant || cache[cache.length - 1];
+            /* 캐시에서도 역할이 아니라 저장 순서의 마지막 항목을 사용한다. */
+            const picked = cache[cache.length - 1];
+            const nearby = cache
+                .slice(Math.max(0, cache.length - 3))
+                .map(item => formatContextMessage(item.role, item.text))
+                .join('\n\n');
 
             return {
                 text: picked.text || '',
-                nearby: formatContextMessage(picked.role, picked.text),
-                source: '현재 채팅방 저장 캐시의 직전 메시지',
-                role: picked.role || 'unknown'
+                nearby,
+                source: '현재 채팅방 캐시의 실제 마지막 메시지',
+                role: picked.role || 'unknown',
+                id: picked.id || ''
             };
         }
 
@@ -885,11 +918,12 @@
                 text: story[story.length - 1],
                 nearby: '[시작 상황/플레이 가이드]\n' + story[story.length - 1],
                 source: '첫 시작 장면',
-                role: 'assistant'
+                role: 'assistant',
+                id: ''
             };
         }
 
-        return { text: '', nearby: '', source: '판별 실패', role: 'unknown' };
+        return { text: '', nearby: '', source: '판별 실패', role: 'unknown', id: '' };
     }
 
     function extractSceneKeywords(text) {
@@ -2318,7 +2352,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.34</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.35</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
