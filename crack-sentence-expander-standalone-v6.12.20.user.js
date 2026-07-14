@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.43
+// @version      6.12.44
 // @author       me
 // @description  실제 메시지 그룹 전체에서 가장 큰 턴 번호를 직전 턴으로 고정하고, 읽은 채팅만 시간순으로 보여주는 단일 실행판.
 // @match        https://crack.wrtn.ai/*
@@ -2560,7 +2560,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.43</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.44</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -3350,7 +3350,11 @@
                 return;
             }
 
-            const loaded = records.map((item, index) => {
+            /* 미리보기만 최신 → 과거 순서로 보여준다.
+             * records 원본은 건드리지 않으므로 Gemini 전달 순서는 계속 과거 → 최신이다. */
+            const previewRecords = records.slice().reverse();
+
+            const loaded = previewRecords.map((item, index) => {
                 const roleLabel = item.role === 'user'
                     ? '유저'
                     : item.role === 'assistant'
@@ -3383,7 +3387,8 @@
                     '\n감지한 메시지: ' + liveGroups.length +
                     '개 · 감지한 턴: ' +
                     (liveTurns.length ? liveTurns.join(' → ') : '(없음)') +
-                    '\n읽은 순서: 과거 → 최신\n\n' +
+                    '\n미리보기 순서: 최신 → 과거\n' +
+                    'Gemini 전달 순서: 과거 → 최신\n\n' +
                     loaded,
                 false
             );
