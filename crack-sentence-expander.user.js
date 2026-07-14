@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.33
+// @version      6.12.34
 // @author       me
-// @description  직전 턴 전체 흐름을 균형 있게 읽고 마지막 문장에 기계적으로 집착하지 않으며, 모바일 키보드 위치를 고정하고, 생성 결과의 지문을 *이탤릭체* 형식으로 자동 보정하는 단일 실행판.
+// @description  추천 페르소나 영역을 모바일에서 작게 정리하고, 직전 상대 채팅과 최근 대화 맥락을 항상 반영하며, 모바일 키보드 위치를 고정한 단일 실행판.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -824,7 +824,7 @@
             .map(item => formatContextMessage(item.role, item.text));
 
         const story = getStoryBootstrap()
-            .slice(-4)
+            .slice(-2)
             .map(text => '[시작 상황/플레이 가이드]\n' + text);
 
         return [...story, ...recent];
@@ -841,11 +841,41 @@
         const visible = collectVisibleChatLines();
 
         if (visible.length) {
-            const last = visible[visible.length - 1];
+            /* 마지막 항목이 유저 메시지로 잘못 잡히거나 아직 화면에 남아 있어도,
+             * 가장 가까운 상대 캐릭터 출력을 우선한다. */
+            const latestAssistant = [...visible]
+                .reverse()
+                .find(item => item.role === 'assistant' && item.text);
+
+            const picked = latestAssistant || visible[visible.length - 1];
+            const pickedIndex = visible.findIndex(item => item.id === picked.id);
+            const nearby = visible
+                .slice(Math.max(0, pickedIndex - 2), pickedIndex + 1)
+                .map(item => formatContextMessage(item.role, item.text))
+                .join('\n\n');
+
             return {
-                text: last.text || '',
-                source: '현재 화면의 실제 마지막 메시지',
-                role: last.role || 'unknown'
+                text: picked.text || '',
+                nearby,
+                source: latestAssistant
+                    ? '현재 화면의 직전 상대 캐릭터 메시지'
+                    : '현재 화면의 실제 마지막 메시지',
+                role: picked.role || 'unknown'
+            };
+        }
+
+        const cache = getCtxCache();
+        if (cache.length) {
+            const cachedAssistant = [...cache]
+                .reverse()
+                .find(item => item.role === 'assistant' && item.text);
+            const picked = cachedAssistant || cache[cache.length - 1];
+
+            return {
+                text: picked.text || '',
+                nearby: formatContextMessage(picked.role, picked.text),
+                source: '현재 채팅방 저장 캐시의 직전 메시지',
+                role: picked.role || 'unknown'
             };
         }
 
@@ -853,12 +883,13 @@
         if (story.length) {
             return {
                 text: story[story.length - 1],
+                nearby: '[시작 상황/플레이 가이드]\n' + story[story.length - 1],
                 source: '첫 시작 장면',
                 role: 'assistant'
             };
         }
 
-        return { text: '', source: '판별 실패', role: 'unknown' };
+        return { text: '', nearby: '', source: '판별 실패', role: 'unknown' };
     }
 
     function extractSceneKeywords(text) {
@@ -1155,7 +1186,7 @@
             priorContext.forEach(item => lines.push('· ' + item));
         }
 
-        if (context && context.length) {
+        if ((context && context.length) || latestAssistant) {
             lines.push('');
             lines.push('[문맥 판정 규칙]');
             lines.push('- 먼저 현재 장면에서 장소, 함께 있는 인물, 제삼자의 질문이나 의심, 서로의 자세, 신체 접촉, 거리, 시선, 감정과 위기를 내부적으로 판정한다.');
@@ -1174,6 +1205,7 @@
             lines.push('- 과거 상태와 현재 장면이 충돌하면 현재 장면의 상태가 사실이다.');
             lines.push('- [유저]와 [상대 캐릭터]의 역할을 절대 뒤바꾸지 않는다.');
             lines.push('- 상대 캐릭터의 다음 행동이나 반응을 대신 진행하지 않는다.');
+            lines.push('- 완성문에는 직전 상대 캐릭터 메시지의 구체적인 상황·행동·감정·질문 중 최소 하나가 자연스럽게 드러나야 한다. 어느 장면에도 붙일 수 있는 일반적인 답변만 쓰지 않는다.');
             lines.push('- 맥락을 요약하거나 그대로 재진술하지 않는다.');
         }
 
@@ -1209,6 +1241,9 @@
         const user = [
             '[현재 장면의 기준 — ' + (latestSceneSource || '판별 실패') + ']',
             latestAssistant || '(현재 장면을 찾지 못함)',
+            '',
+            '[직전 장면 바로 앞뒤 맥락]',
+            String(latestSnapshot && latestSnapshot.nearby || '').trim() || '(없음)',
             '',
             '[직전 장면의 최근 대화]',
             sceneFocus.recentDialogue.length
@@ -2001,11 +2036,50 @@
             font-weight: 850;
         }
 
+        #se-persona-result {
+            border: 1px solid rgba(148,163,184,.22);
+            border-radius: 10px;
+            background: rgba(0,0,0,.10);
+            overflow: hidden;
+        }
+
+        #se-persona-result > summary {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            list-style: none;
+            padding: 8px 9px;
+            cursor: pointer;
+            color: #f4f5fa;
+            font-size: 11px;
+            font-weight: 800;
+        }
+
+        #se-persona-result > summary::-webkit-details-marker {
+            display: none;
+        }
+
+        #se-persona-result > summary::after {
+            content: "보기";
+            color: #aeb3c5;
+            font-size: 10px;
+        }
+
+        #se-persona-result[open] > summary::after {
+            content: "접기";
+        }
+
+        #se-persona-result-body {
+            padding: 0 7px 7px;
+        }
+
         #se-persona-text-0 {
-            min-height: 220px !important;
-            max-height: none !important;
+            min-height: 120px !important;
+            height: 150px !important;
+            max-height: 180px !important;
+            overflow-y: auto !important;
             resize: vertical;
-            line-height: 1.6;
+            line-height: 1.55;
         }
 
         #se-persona-hint {
@@ -2161,8 +2235,16 @@
             }
 
             #se-persona-text-0 {
-                min-height: 240px !important;
-                max-height: none !important;
+                min-height: 110px !important;
+                height: 140px !important;
+                max-height: 165px !important;
+                overflow-y: auto !important;
+            }
+
+            #se-settings {
+                overscroll-behavior: contain;
+                touch-action: pan-y;
+                padding-bottom: 18px;
             }
         }
     `;
@@ -2236,7 +2318,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.33</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.34</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -2290,22 +2372,55 @@
 
                     <div id="se-persona-status"></div>
 
-                    <div class="se-slot">
-                        <div class="se-slot-head">
-                            <input type="checkbox" id="se-persona-on-0">
-                            <input
-                                class="se-slot-name"
-                                id="se-persona-name-0"
-                                type="text"
-                                placeholder="추천 페르소나 이름"
-                            >
+                    <details id="se-persona-result">
+                        <summary>추천 결과 / 직접 편집</summary>
+                        <div id="se-persona-result-body">
+                            <div class="se-slot">
+                                <div class="se-slot-head">
+                                    <input type="checkbox" id="se-persona-on-0">
+                                    <input
+                                        class="se-slot-name"
+                                        id="se-persona-name-0"
+                                        type="text"
+                                        placeholder="추천 페르소나 이름"
+                                    >
+                                </div>
+                                <textarea
+                                    id="se-persona-text-0"
+                                    placeholder="추천 결과가 여기에 표시돼요. 내부에서 스크롤하거나 직접 수정할 수 있습니다."
+                                ></textarea>
+                            </div>
                         </div>
-                        <textarea
-                            id="se-persona-text-0"
-                            placeholder="추천 결과가 여기에 크게 표시돼요. 직접 수정해도 됩니다."
-                        ></textarea>
-                    </div>
+                    </details>
                 </div>
+
+                <details class="se-section" open>
+                    <summary>💬 최근 대화 맥락 · 항상 참고</summary>
+                    <div class="se-section-body">
+                        <div class="se-inline">
+                            <input id="se-ctx-on" type="checkbox" checked disabled>
+                            <span>직전 상대 채팅 + 최근</span>
+                            <input
+                                id="se-ctx-n"
+                                class="se-inline-number"
+                                type="number"
+                                min="1"
+                                max="30"
+                                value="6"
+                            >
+                            <span>개</span>
+                        </div>
+
+                        <div class="se-label">직전 상대 캐릭터 채팅은 항상 읽고, 위 숫자만큼 이전 대화도 함께 참고해요.</div>
+
+                        <div class="se-btn-row">
+                            <button id="se-ctx-preview" type="button">🔍 실제로 읽힌 맥락 보기</button>
+                            <button id="se-ctx-clear" type="button">🧹 이 채팅방 캐시 지우기</button>
+                        </div>
+
+                        <div id="se-ctx-status"></div>
+                    </div>
+                </details>
 
                 <details class="se-section">
                     <summary>🎭 추가 페르소나 2·3번</summary>
@@ -2318,32 +2433,6 @@
                     <summary>✍️ 문체 규칙</summary>
                     <div class="se-section-body">
                         ${slotHTML('style', STYLE_SLOTS, '문체')}
-                    </div>
-                </details>
-
-                <details class="se-section">
-                    <summary>💬 최근 대화 맥락</summary>
-                    <div class="se-section-body">
-                        <div class="se-inline">
-                            <input id="se-ctx-on" type="checkbox">
-                            <span>맥락 참고 · 최근</span>
-                            <input
-                                id="se-ctx-n"
-                                class="se-inline-number"
-                                type="number"
-                                min="1"
-                                max="30"
-                                value="6"
-                            >
-                            <span>개</span>
-                        </div>
-
-                        <div class="se-btn-row">
-                            <button id="se-ctx-preview" type="button">🔍 맥락 미리보기</button>
-                            <button id="se-ctx-clear" type="button">🧹 이 채팅방 캐시 지우기</button>
-                        </div>
-
-                        <div id="se-ctx-status"></div>
                     </div>
                 </details>
 
@@ -2733,7 +2822,9 @@
         nameInput.value = GM_getValue(K_NAME, '');
         personaHint.value = GM_getValue(K_PERSONA_HINT, '');
 
-        ctxOn.checked = GM_getValue(K_CTX_ON, false);
+        ctxOn.checked = true;
+        ctxOn.disabled = true;
+        GM_setValue(K_CTX_ON, true);
         ctxN.value = GM_getValue(K_CTX_N, 6);
 
         costOn.checked = GM_getValue(K_COST_ON, true);
@@ -2821,13 +2912,12 @@
 
             if (opening) {
                 settings.scrollTop = 0;
+                const resultDetails = $('#se-persona-result');
                 const personaResult = $('#se-persona-text-0');
-                if (personaResult && personaResult.value.trim()) {
-                    personaResult.style.height = 'auto';
-                    personaResult.style.height = Math.min(
-                        Math.max(personaResult.scrollHeight + 8, 240),
-                        Math.max(window.innerHeight * 0.62, 320)
-                    ) + 'px';
+
+                /* 결과가 있어도 설정 전체를 가리지 않도록 기본은 접힌 상태로 연다. */
+                if (resultDetails && personaResult && personaResult.value.trim()) {
+                    resultDetails.open = false;
                 }
             }
 
@@ -2843,7 +2933,7 @@
             GM_setValue(K_APIKEY, keyInput.value.trim());
             GM_setValue(K_NAME, nameInput.value.trim());
             GM_setValue(K_PERSONA_HINT, personaHint.value.trim());
-            GM_setValue(K_CTX_ON, ctxOn.checked);
+            GM_setValue(K_CTX_ON, true);
             GM_setValue(
                 K_CTX_N,
                 clamp(parseInt(ctxN.value, 10) || 6, 1, 30)
@@ -2953,12 +3043,10 @@
                     $('#se-persona-on-0').checked = true;
                     resultTextarea.value = text;
 
-                    /* 모바일에서도 작은 내부 스크롤창이 되지 않도록 내용만큼 펼친다. */
-                    resultTextarea.style.height = 'auto';
-                    resultTextarea.style.height = Math.min(
-                        Math.max(resultTextarea.scrollHeight + 8, 240),
-                        Math.max(window.innerHeight * 0.62, 320)
-                    ) + 'px';
+                    /* 결과는 접이식 영역 안에서 제한된 높이로 보여 하단 설정을 가리지 않는다. */
+                    const resultDetails = $('#se-persona-result');
+                    if (resultDetails) resultDetails.open = true;
+                    resultTextarea.style.height = '';
 
                     const nameInput = $('#se-persona-name-' + index);
                     if (
@@ -2980,15 +3068,14 @@
                     );
 
                     requestAnimationFrame(() => {
-                        const featured = $('#se-persona-featured');
-                        if (featured && featured.scrollIntoView) {
-                            featured.scrollIntoView({
+                        const resultDetails = $('#se-persona-result');
+                        if (resultDetails && resultDetails.scrollIntoView) {
+                            resultDetails.scrollIntoView({
                                 behavior: 'smooth',
-                                block: 'start'
+                                block: 'nearest'
                             });
                         }
-                        resultTextarea.focus({ preventScroll: true });
-                        resultTextarea.setSelectionRange(0, 0);
+                        resultTextarea.scrollTop = 0;
                     });
                 },
                 error => {
@@ -2999,8 +3086,10 @@
         });
 
         /* 맥락 */
+        /* 직전 채팅 맥락은 항상 사용한다. */
         ctxOn.addEventListener('change', () => {
-            GM_setValue(K_CTX_ON, ctxOn.checked);
+            ctxOn.checked = true;
+            GM_setValue(K_CTX_ON, true);
         });
 
         $('#se-ctx-preview').addEventListener('click', () => {
@@ -3230,14 +3319,10 @@
             GM_setValue(K_MODEL, modelSelect.value);
             saveSlots();
 
-            const context = ctxOn.checked
-                ? collectChatContext(
-                    clamp(parseInt(ctxN.value, 10) || 6, 1, 30)
-                )
-                : [];
-            const latestSnapshot = ctxOn.checked
-                ? collectLatestSceneSnapshot()
-                : { text: '', source: '맥락 참고 꺼짐', role: 'unknown' };
+            const context = collectChatContext(
+                clamp(parseInt(ctxN.value, 10) || 6, 1, 30)
+            );
+            const latestSnapshot = collectLatestSceneSnapshot();
             const sceneFocus = extractSceneFocus(latestSnapshot.text);
             const prompt = buildPrompt(d, a, context, latestSnapshot);
 
@@ -3255,7 +3340,7 @@
                     const formattedText = normalizeRoleplayItalics(text);
 
                     if (
-                        ctxOn.checked &&
+                        latestSnapshot.text &&
                         !isContextGroundedOutput(formattedText, sceneFocus)
                     ) {
                         flash('문맥과 동떨어진 일반론을 감지해 자동으로 다시 맞추는 중…');
