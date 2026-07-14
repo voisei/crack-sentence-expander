@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.42
+// @version      6.12.43
 // @author       me
 // @description  실제 메시지 그룹 전체에서 가장 큰 턴 번호를 직전 턴으로 고정하고, 읽은 채팅만 시간순으로 보여주는 단일 실행판.
 // @match        https://crack.wrtn.ai/*
@@ -39,7 +39,7 @@
 
     const K_CTX_ON = 'se_ctx_on';
     const K_CTX_N = 'se_ctx_n';
-    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v12';
+    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v13';
     const K_STORY_BOOTSTRAP_BASE = 'se_ctx_story_bootstrap_v5';
 
     const K_COST_ON = 'se_cost_on';
@@ -1027,18 +1027,29 @@
         return getStoryBootstrap();
     }
 
-    function getUnifiedContext(maxN) {
+    function getRecentContextRecords(maxN) {
         const n = clamp(parseInt(maxN, 10) || 6, 1, 30);
+        const liveGroups = getLiveMessageGroupsNewestFirst();
+        const newestFirst = liveGroups
+            .map((group, index) => recordFromMessageGroup(group, index))
+            .filter(Boolean);
 
-        const visibleRecords = collectVisibleChatLines();
-        rememberCtxLines(visibleRecords);
+        if (newestFirst.length) {
+            /* 크랙 DOM은 최신→과거 순서다.
+             * 최신 n개를 먼저 자른 뒤, Gemini에는 과거→최신으로 전달한다. */
+            const recent = newestFirst.slice(0, n).reverse();
+            rememberCtxLines(recent);
+            return recent;
+        }
 
-        const records = visibleRecords.length ? visibleRecords : getCtxCache();
+        /* 화면 DOM을 못 잡았을 때만 과거→최신 캐시의 마지막 n개를 사용한다. */
+        return getCtxCache().slice(-n);
+    }
+
+    function getUnifiedContext(maxN) {
+        const records = getRecentContextRecords(maxN);
         const hasNumberedChat = records.some(item => Number.isFinite(item.turnNumber));
-
-        const recent = records
-            .slice(-n)
-            .map(item => formatContextMessage(item.role, item.text));
+        const recent = records.map(item => formatContextMessage(item.role, item.text));
 
         if (hasNumberedChat) return recent;
 
@@ -1054,56 +1065,45 @@
         return getUnifiedContext(maxN);
     }
 
-    /* 현재 DOM 전체에서 가장 큰 턴 번호가 실제 직전 턴이다. */
+    /* 실제 크랙 DOM의 첫 번째 메시지 그룹이 최신 상대 캐릭터 턴이다. */
     function collectNewestDomMessageRecord() {
         const groups = getLiveMessageGroupsNewestFirst();
-        const records = groups
-            .map((group, index) => recordFromMessageGroup(group, index))
-            .filter(Boolean);
 
-        if (!records.length) return null;
-
-        const numbered = records.filter(item => Number.isFinite(item.turnNumber));
-        if (numbered.length) {
-            const maxTurn = Math.max(...numbered.map(item => item.turnNumber));
-            const sameTurn = numbered.filter(item => item.turnNumber === maxTurn);
-
-            return sameTurn.reduce((best, item) => {
-                if (!best) return item;
-                if (item.distanceToInput < best.distanceToInput) return item;
-                return best;
-            }, null);
+        for (let index = 0; index < groups.length; index++) {
+            const record = recordFromMessageGroup(groups[index], index);
+            if (record) return record;
         }
 
-        return records[0];
+        return null;
     }
 
     function collectLatestSceneSnapshot() {
-        const directLatest = collectNewestDomMessageRecord();
-        const visible = collectVisibleChatLines();
+        const liveGroups = getLiveMessageGroupsNewestFirst();
+        const newestFirst = liveGroups
+            .map((group, index) => recordFromMessageGroup(group, index))
+            .filter(Boolean);
+        const directLatest = newestFirst[0] || null;
 
         if (directLatest) {
-            const pickedIndex = visible.findIndex(item => item.id === directLatest.id);
-            const index = pickedIndex >= 0 ? pickedIndex : visible.length - 1;
-            const nearby = visible.length
-                ? visible
-                    .slice(Math.max(0, index - 2), index + 1)
-                    .map(item => formatContextMessage(item.role, item.text))
-                    .join('\n\n')
-                : formatContextMessage(directLatest.role, directLatest.text);
+            const nearby = newestFirst
+                .slice(0, 3)
+                .reverse()
+                .map(item => formatContextMessage(item.role, item.text))
+                .join('\n\n');
 
             return {
                 text: directLatest.text || '',
                 nearby,
                 source: Number.isFinite(directLatest.turnNumber)
-                    ? '화면에서 확인한 가장 큰 턴 번호 · 턴 ' + directLatest.turnNumber
-                    : '실제 채팅 목록 최신 메시지',
+                    ? '실제 채팅 DOM 첫 메시지 · 턴 ' + directLatest.turnNumber
+                    : '실제 채팅 DOM 첫 메시지',
                 role: directLatest.role || 'unknown',
                 id: directLatest.id || '',
                 turnNumber: directLatest.turnNumber
             };
         }
 
+        const visible = collectVisibleChatLines();
         if (visible.length) {
             const picked = visible[visible.length - 1];
             return {
@@ -2560,7 +2560,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.42</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.43</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -3338,10 +3338,7 @@
             const n = clamp(parseInt(ctxN.value, 10) || 6, 1, 30);
             GM_setValue(K_CTX_N, n);
 
-            const visible = collectVisibleChatLines();
-            rememberCtxLines(visible);
-
-            const records = (visible.length ? visible : getCtxCache()).slice(-n);
+            const records = getRecentContextRecords(n);
             const latestSnapshot = collectLatestSceneSnapshot();
 
             if (!records.length && !latestSnapshot.text) {
