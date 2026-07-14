@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.44
+// @version      6.12.45
 // @author       me
 // @description  실제 메시지 그룹 전체에서 가장 큰 턴 번호를 직전 턴으로 고정하고, 읽은 채팅만 시간순으로 보여주는 단일 실행판.
 // @match        https://crack.wrtn.ai/*
@@ -839,7 +839,14 @@
         const contentEl = getBestMessageNode(group);
         const rawGroupText = getRawNodeText(group);
         const rawContentText = getRawNodeText(contentEl);
-        const text = cleanContextLine(rawContentText);
+
+        /* 최신 턴은 아직 스트리밍 중이거나 content-visibility가 걸려
+         * 내부 후보 노드의 textContent가 비어 있을 수 있다.
+         * 이때 해당 턴을 통째로 버리지 말고 메시지 그룹 전체 텍스트로 복구한다. */
+        let text = cleanContextLine(rawContentText);
+        if (isBadContextLine(text)) {
+            text = cleanContextLine(rawGroupText);
+        }
         if (isBadContextLine(text)) return null;
 
         const input = findChatInput();
@@ -1035,9 +1042,26 @@
             .filter(Boolean);
 
         if (newestFirst.length) {
-            /* 크랙 DOM은 최신→과거 순서다.
-             * 최신 n개를 먼저 자른 뒤, Gemini에는 과거→최신으로 전달한다. */
-            const recent = newestFirst.slice(0, n).reverse();
+            /* 설정값은 메시지 개수가 아니라 실제 턴 개수다.
+             * 최신 턴부터 세어 n개 턴이 포함될 때까지 유저 메시지도 함께 담는다. */
+            const picked = [];
+            const seenTurns = new Set();
+
+            for (const item of newestFirst) {
+                picked.push(item);
+
+                if (Number.isFinite(item.turnNumber)) {
+                    seenTurns.add(item.turnNumber);
+                    if (seenTurns.size >= n) break;
+                }
+            }
+
+            /* 번호가 없는 구조에서는 기존처럼 메시지 n개를 사용한다. */
+            const recentNewestFirst = seenTurns.size
+                ? picked
+                : newestFirst.slice(0, n);
+
+            const recent = recentNewestFirst.reverse();
             rememberCtxLines(recent);
             return recent;
         }
@@ -1082,11 +1106,20 @@
         const newestFirst = liveGroups
             .map((group, index) => recordFromMessageGroup(group, index))
             .filter(Boolean);
-        const directLatest = newestFirst[0] || null;
+
+        /* DOM 첫 항목을 무조건 믿지 않는다.
+         * 가상 스크롤·스트리밍 때문에 첫 유효 레코드가 과거 턴일 수 있으므로
+         * 감지된 레코드 전체에서 가장 큰 턴 번호를 직전 턴으로 고정한다. */
+        const directLatest = pickLatestContextRecord(newestFirst);
 
         if (directLatest) {
+            const latestIndex = newestFirst.findIndex(item =>
+                item === directLatest ||
+                (item.id && directLatest.id && item.id === directLatest.id)
+            );
+            const start = latestIndex >= 0 ? latestIndex : 0;
             const nearby = newestFirst
-                .slice(0, 3)
+                .slice(start, start + 3)
                 .reverse()
                 .map(item => formatContextMessage(item.role, item.text))
                 .join('\n\n');
@@ -1095,8 +1128,8 @@
                 text: directLatest.text || '',
                 nearby,
                 source: Number.isFinite(directLatest.turnNumber)
-                    ? '실제 채팅 DOM 첫 메시지 · 턴 ' + directLatest.turnNumber
-                    : '실제 채팅 DOM 첫 메시지',
+                    ? '감지된 최대 턴 번호 · 턴 ' + directLatest.turnNumber
+                    : '현재 채팅에서 가장 최신 메시지',
                 role: directLatest.role || 'unknown',
                 id: directLatest.id || '',
                 turnNumber: directLatest.turnNumber
@@ -2560,7 +2593,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.44</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.45</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
