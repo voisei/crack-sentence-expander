@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.32
+// @version      6.12.33
 // @author       me
 // @description  직전 턴 전체 흐름을 균형 있게 읽고 마지막 문장에 기계적으로 집착하지 않으며, 모바일 키보드 위치를 고정하고, 생성 결과의 지문을 *이탤릭체* 형식으로 자동 보정하는 단일 실행판.
 // @match        https://crack.wrtn.ai/*
@@ -1985,6 +1985,43 @@
             line-height: 1.45;
         }
 
+        #se-persona-featured {
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+            padding: 9px;
+            border: 1px solid rgba(138,92,255,.55);
+            border-radius: 12px;
+            background: rgba(108,123,255,.08);
+        }
+
+        #se-persona-featured-title {
+            color: #fff;
+            font-size: 13px;
+            font-weight: 850;
+        }
+
+        #se-persona-text-0 {
+            min-height: 220px !important;
+            max-height: none !important;
+            resize: vertical;
+            line-height: 1.6;
+        }
+
+        #se-persona-hint {
+            min-height: 64px !important;
+        }
+
+        #se-persona-suggest {
+            flex: none;
+            width: 100%;
+            min-height: 42px;
+            border-color: rgba(138,92,255,.75);
+            background: linear-gradient(135deg,#6c7bff,#8a5cff);
+            color: #fff;
+            font-size: 12px;
+        }
+
         details.se-section {
             border: 1px solid rgba(148,163,184,.22);
             border-radius: 11px;
@@ -2122,6 +2159,11 @@
                 min-height: 44px;
                 max-height: 105px;
             }
+
+            #se-persona-text-0 {
+                min-height: 240px !important;
+                max-height: none !important;
+            }
         }
     `;
 
@@ -2163,12 +2205,38 @@
         return html;
     }
 
+    function slotHTMLRange(type, start, end, label) {
+        let html = '';
+
+        for (let i = start; i < end; i++) {
+            html += `
+                <div class="se-slot">
+                    <div class="se-slot-head">
+                        <input type="checkbox" id="se-${type}-on-${i}">
+                        <input
+                            class="se-slot-name"
+                            id="se-${type}-name-${i}"
+                            type="text"
+                            placeholder="${label} ${i + 1} 이름"
+                        >
+                    </div>
+                    <textarea
+                        id="se-${type}-text-${i}"
+                        placeholder="${label} 내용을 입력하세요"
+                    ></textarea>
+                </div>
+            `;
+        }
+
+        return html;
+    }
+
     function buildUI() {
         const panel = document.createElement('div');
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.32</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.33</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -2206,22 +2274,43 @@
             </div>
 
             <div id="se-settings">
-                <details class="se-section" open>
-                    <summary>🎭 페르소나 / 자동추천</summary>
-                    <div class="se-section-body">
+                <div id="se-persona-featured">
+                    <div id="se-persona-featured-title">🎭 추천 페르소나 · 맨 위 고정</div>
+
+                    <textarea
+                        id="se-persona-hint"
+                        placeholder="추천 키워드 예: 여자 검사, 무뚝뚝, 책임감 강함"
+                    ></textarea>
+
+                    <button
+                        id="se-persona-suggest"
+                        class="se-secondary"
+                        type="button"
+                    >✨ 현재 설정으로 페르소나 추천</button>
+
+                    <div id="se-persona-status"></div>
+
+                    <div class="se-slot">
+                        <div class="se-slot-head">
+                            <input type="checkbox" id="se-persona-on-0">
+                            <input
+                                class="se-slot-name"
+                                id="se-persona-name-0"
+                                type="text"
+                                placeholder="추천 페르소나 이름"
+                            >
+                        </div>
                         <textarea
-                            id="se-persona-hint"
-                            placeholder="추천 키워드 예: 여자 검사, 무뚝뚝, 책임감 강함"
+                            id="se-persona-text-0"
+                            placeholder="추천 결과가 여기에 크게 표시돼요. 직접 수정해도 됩니다."
                         ></textarea>
+                    </div>
+                </div>
 
-                        <button
-                            id="se-persona-suggest"
-                            class="se-secondary"
-                            type="button"
-                        >✨ 현재 설정으로 페르소나 추천</button>
-
-                        <div id="se-persona-status"></div>
-                        ${slotHTML('persona', PERSONA_SLOTS, '페르소나')}
+                <details class="se-section">
+                    <summary>🎭 추가 페르소나 2·3번</summary>
+                    <div class="se-section-body">
+                        ${slotHTMLRange('persona', 1, PERSONA_SLOTS, '페르소나')}
                     </div>
                 </details>
 
@@ -2730,7 +2819,17 @@
             settings.classList.toggle('show', opening);
             body.classList.toggle('hide', opening);
 
-            if (opening) settings.scrollTop = 0;
+            if (opening) {
+                settings.scrollTop = 0;
+                const personaResult = $('#se-persona-text-0');
+                if (personaResult && personaResult.value.trim()) {
+                    personaResult.style.height = 'auto';
+                    personaResult.style.height = Math.min(
+                        Math.max(personaResult.scrollHeight + 8, 240),
+                        Math.max(window.innerHeight * 0.62, 320)
+                    ) + 'px';
+                }
+            }
 
             requestAnimationFrame(() => {
                 if (!isSoftKeyboardOpen()) {
@@ -2846,14 +2945,20 @@
                         '페르소나'
                     );
 
-                    let index = slots.findIndex(item => item.on);
-                    if (index < 0) {
-                        index = slots.findIndex(item => !item.text.trim());
-                    }
-                    if (index < 0) index = 0;
+                    /* 추천 결과는 항상 맨 위 1번 칸에 넣는다.
+                     * 기존에는 켜져 있는 2·3번 칸에 들어가 결과가 아래로 숨어버릴 수 있었다. */
+                    const index = 0;
+                    const resultTextarea = $('#se-persona-text-0');
 
-                    $('#se-persona-on-' + index).checked = true;
-                    $('#se-persona-text-' + index).value = text;
+                    $('#se-persona-on-0').checked = true;
+                    resultTextarea.value = text;
+
+                    /* 모바일에서도 작은 내부 스크롤창이 되지 않도록 내용만큼 펼친다. */
+                    resultTextarea.style.height = 'auto';
+                    resultTextarea.style.height = Math.min(
+                        Math.max(resultTextarea.scrollHeight + 8, 240),
+                        Math.max(window.innerHeight * 0.62, 320)
+                    ) + 'px';
 
                     const nameInput = $('#se-persona-name-' + index);
                     if (
@@ -2869,12 +2974,22 @@
                     button.disabled = false;
                     setInfo(
                         personaStatus,
-                        '페르소나 ' +
-                            (index + 1) +
-                            '번 칸에 넣었어요 ✅' +
+                        '추천 결과를 맨 위 1번 칸에 넣었어요 ✅' +
                             (costInfo ? '\n' + costInfo.message : ''),
                         false
                     );
+
+                    requestAnimationFrame(() => {
+                        const featured = $('#se-persona-featured');
+                        if (featured && featured.scrollIntoView) {
+                            featured.scrollIntoView({
+                                behavior: 'smooth',
+                                block: 'start'
+                            });
+                        }
+                        resultTextarea.focus({ preventScroll: true });
+                        resultTextarea.setSelectionRange(0, 0);
+                    });
                 },
                 error => {
                     button.disabled = false;
