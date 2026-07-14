@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.39
+// @version      6.12.40
 // @author       me
-// @description  실제 채팅 입력창과 연결된 메시지 목록을 찾아 최신순 DOM을 역순으로 읽고, 첫 그룹을 직전 턴으로 강제하는 단일 실행판.
+// @description  실제 메시지 그룹 전체에서 가장 큰 턴 번호를 직전 턴으로 고정하고, 읽은 채팅만 시간순으로 보여주는 단일 실행판.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -39,8 +39,8 @@
 
     const K_CTX_ON = 'se_ctx_on';
     const K_CTX_N = 'se_ctx_n';
-    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v9';
-    const K_STORY_BOOTSTRAP_BASE = 'se_ctx_story_bootstrap_v4';
+    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v10';
+    const K_STORY_BOOTSTRAP_BASE = 'se_ctx_story_bootstrap_v5';
 
     const K_COST_ON = 'se_cost_on';
     const K_COST_USDKRW = 'se_cost_usdkrw';
@@ -327,7 +327,9 @@
     function extractTurnNumber(value) {
         const text = String(value || '');
         const matches = [];
-        const pattern = /(?:^|\n)\s*\[?\s*턴\s*#?\s*(\d+)\b[^\n\]]*\]?/gim;
+
+        /* [턴7 | ...], [턴 7|...], 턴#7, 턴: 7을 모두 인식한다. */
+        const pattern = /(?:^|[\n\r\[【(])\s*턴\s*(?:#|:|-)?\s*(\d{1,6})(?=\s|[|｜\]】)>,.:;!?/\\-]|$)/gim;
         let match;
 
         while ((match = pattern.exec(text))) {
@@ -671,10 +673,13 @@
 
         const all = Array.from(document.querySelectorAll('[data-message-group-id]'))
             .filter(group => {
-                if (!group || (panel && panel.contains(group))) return false;
+                if (!group || !group.isConnected) return false;
+                if (panel && panel.contains(group)) return false;
                 if (group.parentElement && group.parentElement.closest('[data-message-group-id]')) return false;
-                const text = cleanContextLine(group.innerText || group.textContent || '');
-                return text && !isBadContextLine(text);
+
+                const raw = group.innerText || group.textContent || '';
+                const cleaned = cleanContextLine(raw);
+                return cleaned && !isBadContextLine(cleaned);
             });
 
         if (!all.length) return [];
@@ -688,31 +693,66 @@
         }
 
         let best = null;
+
         for (const [parent, groups] of byParent.entries()) {
-            const visible = groups.filter(isVisible);
-            if (!visible.length) continue;
-
-            const parentRect = parent.getBoundingClientRect();
-            const lastBottom = Math.max(...visible.map(group => {
+            const records = groups.map((group, index) => {
+                const raw = group.innerText || group.textContent || '';
                 const rect = group.getBoundingClientRect();
-                return Number.isFinite(rect.bottom) ? rect.bottom : 0;
-            }));
-            const distance = Math.abs(inputTop - lastBottom);
+                return {
+                    group,
+                    index,
+                    turn: extractTurnNumber(raw),
+                    visible: isVisible(group),
+                    bottom: Number.isFinite(rect.bottom) ? rect.bottom : 0
+                };
+            });
 
-            /* 메시지 수가 가장 중요하고, 동률이면 입력창과 가까운 목록을 선택한다. */
-            const score = visible.length * 100000 - Math.min(distance, 100000) - Math.abs(parentRect.left) * 0.01;
+            const numbered = records.filter(item => Number.isFinite(item.turn));
+            const maxTurn = numbered.length
+                ? Math.max(...numbered.map(item => item.turn))
+                : -1;
+            const distinctTurns = new Set(numbered.map(item => item.turn)).size;
+            const visibleCount = records.filter(item => item.visible).length;
+            const nearestBottom = records.length
+                ? Math.max(...records.map(item => item.bottom))
+                : 0;
+            const distance = Math.abs(inputTop - nearestBottom);
+
+            /* 턴 번호가 가장 큰 실제 채팅 목록을 무조건 우선한다.
+             * 그 다음 서로 다른 턴 수, 메시지 수, 입력창과의 거리를 본다. */
+            const score =
+                maxTurn * 1_000_000_000 +
+                distinctTurns * 10_000_000 +
+                groups.length * 100_000 +
+                visibleCount * 1_000 -
+                Math.min(distance, 100_000);
+
             if (!best || score > best.score) {
-                best = { parent, groups, visible, score };
+                best = { parent, groups, records, maxTurn, score };
             }
         }
 
         const picked = best ? best.groups : all;
 
-        /* 크랙의 이 목록은 DOM 첫 번째가 최신, 뒤로 갈수록 과거다. */
-        return picked.filter(group => {
-            const text = cleanContextLine(group.innerText || group.textContent || '');
-            return text && !isBadContextLine(text);
+        /* DOM 방향은 고정이라고 가정하지 않는다.
+         * 실제 번호가 첫쪽에서 더 크면 최신→과거, 반대면 과거→최신이다. */
+        const numberedInDom = picked
+            .map(group => extractTurnNumber(group.innerText || group.textContent || ''))
+            .filter(Number.isFinite);
+
+        let newestFirst = true;
+        if (numberedInDom.length >= 2) {
+            newestFirst = numberedInDom[0] > numberedInDom[numberedInDom.length - 1];
+        }
+
+        const cleanPicked = picked.filter(group => {
+            const raw = group.innerText || group.textContent || '';
+            const cleaned = cleanContextLine(raw);
+            return cleaned && !isBadContextLine(cleaned);
         });
+
+        if (!newestFirst) cleanPicked.reverse();
+        return cleanPicked;
     }
 
     function recordFromMessageGroup(group, index) {
@@ -761,9 +801,9 @@
                         id: 'markdown-' + hashContextId(text),
                         text,
                         turnNumber: extractTurnNumber(
-                            el.parentElement
-                                ? (el.parentElement.innerText || el.parentElement.textContent || '')
-                                : text
+                            el.closest('[data-message-group-id]')
+                                ? (el.closest('[data-message-group-id]').innerText || el.closest('[data-message-group-id]').textContent || '')
+                                : (el.parentElement ? (el.parentElement.innerText || el.parentElement.textContent || '') : text)
                         ),
                         role: detectMessageRole(el.parentElement || el, el),
                         top: Number.isFinite(rect.top) ? rect.top : index,
@@ -775,10 +815,9 @@
                 })
                 .filter(Boolean);
 
-            /* 보조 선택자는 화면 위→아래가 과거→최신인 경우가 많다. */
             entries.sort(compareContextOrder);
         } else {
-            /* 실제 목록은 최신→과거이므로 프롬프트용으로 과거→최신으로 뒤집는다. */
+            /* getLiveMessageGroupsNewestFirst()는 최신→과거로 반환한다. */
             entries.reverse();
         }
 
@@ -867,22 +906,23 @@
 
     function collectStoryBootstrap() {
         const panel = document.getElementById(PANEL_ID);
-        const root = document.querySelector('main') || document.body;
         const found = [];
 
+        /* 채팅 턴이 이미 존재하면 시작 카드 수집을 중단한다.
+         * 사이드바의 채팅방 설정/유저 노트 같은 UI가 시작 상황으로 섞이는 것을 막는다. */
+        const hasChatTurn = Array.from(document.querySelectorAll('[data-message-group-id]'))
+            .some(group => Number.isFinite(extractTurnNumber(group.innerText || group.textContent || '')));
+
+        if (hasChatTurn) return getStoryBootstrap();
+
         const selectors = [
-            '#story-detail-scroll',
-            '[id*="story-detail"]',
-            '[data-testid*="story-detail"]',
-            '[class*="story-detail"]',
-            '[data-testid*="prologue"]',
-            '[data-testid*="scenario"]',
-            '[class*="prologue"]',
-            '[class*="scenario"]',
-            '[data-testid*="play-guide"]',
-            '[class*="play-guide"]',
-            '[data-testid*="status"]',
-            '[class*="status-window"]'
+            '#story-detail-scroll .wrtn-markdown',
+            '[data-testid*="prologue"] .wrtn-markdown',
+            '[data-testid*="scenario"] .wrtn-markdown',
+            '[data-testid*="play-guide"] .wrtn-markdown',
+            '[class*="prologue"] .wrtn-markdown',
+            '[class*="scenario"] .wrtn-markdown',
+            '[class*="play-guide"] .wrtn-markdown'
         ];
 
         for (const selector of selectors) {
@@ -899,53 +939,11 @@
                 if (!isVisible(el)) continue;
 
                 const text = cleanContextLine(el.innerText || el.textContent || '');
-                if (text.length >= 20 && text.length <= 14000 && !isBadContextLine(text)) {
-                    found.push(text);
-                }
+                if (text.length < 20 || text.length > 14000 || isBadContextLine(text)) continue;
+                if (/채팅방 설정|플레이 가이드|대화 프로필|유저 노트|키보드 단축키|전체 설정|업데이트 정보|시작설정|기본 설정|나의 크래커/.test(text)) continue;
+                found.push(text);
             }
         }
-
-        /* 전용 선택자가 없는 시작 카드용 보조 수집. 실제 채팅 그룹은 제외한다. */
-        const candidates = [];
-        for (const el of root.querySelectorAll('article, section, [role="article"], div')) {
-            if (!el || el === root) continue;
-            if (panel && panel.contains(el)) continue;
-            if (el.closest('[data-message-group-id]')) continue;
-            if (el.querySelector('[data-message-group-id]')) continue;
-            if (el.closest('nav, header, footer, aside, button, textarea, input, select, script, style')) continue;
-            if (!isVisible(el)) continue;
-
-            const rect = el.getBoundingClientRect();
-            if (rect.width < Math.min(220, window.innerWidth * 0.45)) continue;
-            if (rect.height < 70) continue;
-
-            const text = cleanContextLine(el.innerText || el.textContent || '');
-            if (text.length < 60 || text.length > 14000 || isBadContextLine(text)) continue;
-
-            const noisy = [
-                '문장 부풀리기', 'API 비용 추정', '설정 동기화',
-                '저장하고 닫기', '채팅창에 바로 넣기'
-            ].filter(word => text.includes(word)).length;
-            if (noisy >= 2) continue;
-
-            const childEquivalent = Array.from(el.children || []).some(child => {
-                const childText = cleanContextLine(child.innerText || child.textContent || '');
-                return childText.length >= Math.max(50, text.length * 0.82);
-            });
-            if (childEquivalent) continue;
-
-            candidates.push({
-                text,
-                top: rect.top,
-                score: Math.min(text.length, 8000) / 10 + Math.min(rect.height, 1400) / 6
-            });
-        }
-
-        candidates
-            .sort((a, b) => b.score - a.score)
-            .slice(0, 5)
-            .sort((a, b) => a.top - b.top)
-            .forEach(item => found.push(item.text));
 
         saveStoryBootstrap(found);
         return getStoryBootstrap();
@@ -954,19 +952,19 @@
     function getUnifiedContext(maxN) {
         const n = clamp(parseInt(maxN, 10) || 6, 1, 30);
 
-        collectStoryBootstrap();
-
         const visibleRecords = collectVisibleChatLines();
         rememberCtxLines(visibleRecords);
 
-        /* 현재 DOM이 하나라도 잡히면 캐시보다 무조건 우선한다.
-         * 캐시는 화면에서 메시지를 전혀 읽지 못했을 때만 비상용으로 사용한다. */
         const records = visibleRecords.length ? visibleRecords : getCtxCache();
+        const hasNumberedChat = records.some(item => Number.isFinite(item.turnNumber));
 
         const recent = records
             .slice(-n)
             .map(item => formatContextMessage(item.role, item.text));
 
+        if (hasNumberedChat) return recent;
+
+        collectStoryBootstrap();
         const story = getStoryBootstrap()
             .slice(-2)
             .map(text => '[시작 상황/플레이 가이드]\n' + text);
@@ -978,14 +976,28 @@
         return getUnifiedContext(maxN);
     }
 
-    /* 실제 채팅 목록의 첫 번째 그룹이 최신 턴이다. */
+    /* 현재 DOM 전체에서 가장 큰 턴 번호가 실제 직전 턴이다. */
     function collectNewestDomMessageRecord() {
         const groups = getLiveMessageGroupsNewestFirst();
-        for (let index = 0; index < groups.length; index++) {
-            const record = recordFromMessageGroup(groups[index], index);
-            if (record) return record;
+        const records = groups
+            .map((group, index) => recordFromMessageGroup(group, index))
+            .filter(Boolean);
+
+        if (!records.length) return null;
+
+        const numbered = records.filter(item => Number.isFinite(item.turnNumber));
+        if (numbered.length) {
+            const maxTurn = Math.max(...numbered.map(item => item.turnNumber));
+            const sameTurn = numbered.filter(item => item.turnNumber === maxTurn);
+
+            return sameTurn.reduce((best, item) => {
+                if (!best) return item;
+                if (item.distanceToInput < best.distanceToInput) return item;
+                return best;
+            }, null);
         }
-        return null;
+
+        return records[0];
     }
 
     function collectLatestSceneSnapshot() {
@@ -993,7 +1005,6 @@
         const visible = collectVisibleChatLines();
 
         if (directLatest) {
-            /* visible은 과거→최신 순서다. 최신 턴 직전의 맥락 두 개만 함께 제공한다. */
             const pickedIndex = visible.findIndex(item => item.id === directLatest.id);
             const index = pickedIndex >= 0 ? pickedIndex : visible.length - 1;
             const nearby = visible.length
@@ -1007,8 +1018,8 @@
                 text: directLatest.text || '',
                 nearby,
                 source: Number.isFinite(directLatest.turnNumber)
-                    ? '실제 채팅 목록 최신 첫 그룹 · 턴 ' + directLatest.turnNumber
-                    : '실제 채팅 목록 최신 첫 그룹',
+                    ? '화면에서 확인한 가장 큰 턴 번호 · 턴 ' + directLatest.turnNumber
+                    : '실제 채팅 목록 최신 메시지',
                 role: directLatest.role || 'unknown',
                 id: directLatest.id || '',
                 turnNumber: directLatest.turnNumber
@@ -2471,7 +2482,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.39</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.12.40</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -3252,46 +3263,45 @@
             const visible = collectVisibleChatLines();
             rememberCtxLines(visible);
 
-            const context = collectChatContext(n);
+            const records = (visible.length ? visible : getCtxCache()).slice(-n);
             const latestSnapshot = collectLatestSceneSnapshot();
-            const sceneFocus = extractSceneFocus(latestSnapshot.text);
 
-            if (!context.length && !latestSnapshot.text) {
+            if (!records.length && !latestSnapshot.text) {
                 setInfo(
                     ctxStatus,
-                    '대화를 못 잡았어요. 시작 카드와 채팅이 보이는 상태에서 다시 눌러보세요.',
+                    '대화를 못 잡았어요. 채팅이 보이는 상태에서 다시 눌러보세요.',
                     true
                 );
                 return;
             }
 
+            const loaded = records.map((item, index) => {
+                const roleLabel = item.role === 'user'
+                    ? '유저'
+                    : item.role === 'assistant'
+                        ? '상대 캐릭터'
+                        : '역할 미확인';
+                const turnLabel = Number.isFinite(item.turnNumber)
+                    ? '턴 ' + item.turnNumber + ' · '
+                    : '';
+                const preview = String(item.text || '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+
+                return (
+                    (index + 1) + '. [' + turnLabel + roleLabel + ']\n' +
+                    (preview.length > 220 ? preview.slice(0, 220) + '…' : preview)
+                );
+            }).join('\n\n');
+
             setInfo(
                 ctxStatus,
-                '실제 생성 기준: ' +
-                    (latestSnapshot.source || '판별 실패') + '\n' +
-                    '최근 대화 흐름: ' +
-                    (sceneFocus.recentDialogue.length ? sceneFocus.recentDialogue.join(' / ') : '(직접 발화 없음)') + '\n' +
-                    '장면 참고 단서: ' +
-                    (sceneFocus.keywords.join(', ') || '(없음)') + '\n\n' +
-                    context.length +
-                    '개 참고 예정 (요청 ' +
-                    n +
-                    '개) / 화면 후보 ' +
-                    visible.length +
-                    '개 / 누적 캐시 ' +
-                    getCtxCache().length +
-                    '개\n' +
-                    context.map((item, index) => {
-                        return (
-                            (index + 1) +
-                            '. ' +
-                            (
-                                item.length > 260
-                                    ? item.slice(0, 260) + '…'
-                                    : item
-                            )
-                        );
-                    }).join('\n'),
+                '직전 턴: ' +
+                    (Number.isFinite(latestSnapshot.turnNumber)
+                        ? '턴 ' + latestSnapshot.turnNumber
+                        : (latestSnapshot.source || '판별 실패')) +
+                    '\n읽은 순서: 과거 → 최신\n\n' +
+                    loaded,
                 false
             );
         });
