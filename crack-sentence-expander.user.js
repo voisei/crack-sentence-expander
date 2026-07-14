@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.36
+// @version      6.12.37
 // @author       me
-// @description  크랙의 최신순 DOM을 역순으로 읽어 실제 직전 채팅을 정확히 잡고, 추천 페르소나와 모바일 키보드 위치를 정리한 단일 실행판.
+// @description  화면의 턴 번호를 우선 읽고 입력창에 가장 가까운 메시지를 직전 턴으로 잡으며, 추천 페르소나와 모바일 키보드 위치를 정리한 단일 실행판.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -39,7 +39,7 @@
 
     const K_CTX_ON = 'se_ctx_on';
     const K_CTX_N = 'se_ctx_n';
-    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v6';
+    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v7';
     const K_STORY_BOOTSTRAP_BASE = 'se_ctx_story_bootstrap_v4';
 
     const K_COST_ON = 'se_cost_on';
@@ -324,6 +324,66 @@
         return (hash >>> 0).toString(36);
     }
 
+    function extractTurnNumber(value) {
+        const text = String(value || '');
+        const matches = [];
+        const pattern = /(?:^|\n)\s*\[?\s*턴\s*#?\s*(\d+)\b[^\n\]]*\]?/gim;
+        let match;
+
+        while ((match = pattern.exec(text))) {
+            const number = parseInt(match[1], 10);
+            if (Number.isFinite(number)) matches.push(number);
+        }
+
+        return matches.length ? Math.max(...matches) : null;
+    }
+
+    function compareContextOrder(a, b) {
+        const aTurn = Number.isFinite(a && a.turnNumber) ? a.turnNumber : null;
+        const bTurn = Number.isFinite(b && b.turnNumber) ? b.turnNumber : null;
+
+        if (aTurn !== null && bTurn !== null && aTurn !== bTurn) {
+            return aTurn - bTurn;
+        }
+
+        if (aTurn !== null && bTurn === null) return 1;
+        if (aTurn === null && bTurn !== null) return -1;
+
+        const aTop = Number.isFinite(a && a.top) ? a.top : 0;
+        const bTop = Number.isFinite(b && b.top) ? b.top : 0;
+        if (aTop !== bTop) return aTop - bTop;
+
+        const aDom = Number.isFinite(a && a.domIndex) ? a.domIndex : -1;
+        const bDom = Number.isFinite(b && b.domIndex) ? b.domIndex : -1;
+        return aDom - bDom;
+    }
+
+    function pickLatestContextRecord(records) {
+        const list = (Array.isArray(records) ? records : []).filter(Boolean);
+        if (!list.length) return null;
+
+        const numbered = list.filter(item => Number.isFinite(item.turnNumber));
+        if (numbered.length) {
+            return numbered.reduce((latest, item) => {
+                if (!latest || item.turnNumber > latest.turnNumber) return item;
+                if (item.turnNumber === latest.turnNumber && item.distanceToInput < latest.distanceToInput) {
+                    return item;
+                }
+                return latest;
+            }, null);
+        }
+
+        const aboveInput = list.filter(item => item.nearInput || item.distanceToInput < 2600);
+        const candidates = aboveInput.length ? aboveInput : list;
+
+        return candidates.reduce((latest, item) => {
+            if (!latest) return item;
+            if (item.distanceToInput < latest.distanceToInput) return item;
+            if (item.distanceToInput === latest.distanceToInput && item.top > latest.top) return item;
+            return latest;
+        }, null);
+    }
+
     function normalizeContextRecord(record) {
         if (!record || typeof record !== 'object') return null;
         const text = cleanContextLine(record.text);
@@ -335,6 +395,9 @@
                 ? record.role
                 : 'unknown',
             text,
+            turnNumber: Number.isFinite(record.turnNumber)
+                ? record.turnNumber
+                : null,
             nearInput: !!record.nearInput,
             domIndex: Number.isFinite(record.domIndex) ? record.domIndex : -1,
             top: Number.isFinite(record.top) ? record.top : 0,
@@ -412,6 +475,7 @@
             if (inserted) cacheIds.add(item.id);
         }
 
+        cache.sort(compareContextOrder);
         saveCtxCache(cache);
     }
 
@@ -605,14 +669,18 @@
 
         groups.forEach((group, index) => {
             const contentEl = getBestMessageNode(group);
-            const text = cleanContextLine(contentEl.innerText || contentEl.textContent || '');
+            const rawGroupText = group.innerText || group.textContent || '';
+            const rawContentText = contentEl.innerText || contentEl.textContent || '';
+            const text = cleanContextLine(rawContentText);
             if (isBadContextLine(text)) return;
 
             const rect = group.getBoundingClientRect();
             const rawId = group.getAttribute('data-message-group-id') || '';
+            const turnNumber = extractTurnNumber(rawGroupText) ?? extractTurnNumber(rawContentText);
             entries.push({
                 id: rawId || ('group-' + hashContextId(text + '|' + index)),
                 text,
+                turnNumber,
                 role: detectMessageRole(group, contentEl),
                 top: Number.isFinite(rect.top) ? rect.top : index,
                 bottom: Number.isFinite(rect.bottom) ? rect.bottom : index,
@@ -628,12 +696,17 @@
             Array.from(document.querySelectorAll('.wrtn-markdown'))
                 .filter(el => !el.closest('#' + PANEL_ID))
                 .forEach((el, index) => {
-                    const text = cleanContextLine(el.innerText || el.textContent || '');
+                    const rawText = el.innerText || el.textContent || '';
+                    const parentText = el.parentElement
+                        ? (el.parentElement.innerText || el.parentElement.textContent || '')
+                        : '';
+                    const text = cleanContextLine(rawText);
                     if (isBadContextLine(text)) return;
                     const rect = el.getBoundingClientRect();
                     entries.push({
                         id: 'markdown-' + hashContextId(text),
                         text,
+                        turnNumber: extractTurnNumber(parentText) ?? extractTurnNumber(rawText),
                         role: detectMessageRole(el.parentElement || el, el),
                         top: Number.isFinite(rect.top) ? rect.top : index,
                         bottom: Number.isFinite(rect.bottom) ? rect.bottom : index,
@@ -646,13 +719,11 @@
                 });
         }
 
-        /* 크랙 채팅 DOM은 최신 메시지가 먼저 오는 역시간순으로 배치된다.
-         * 따라서 DOM 인덱스를 역순으로 뒤집어 [과거 → 최신] 순서로 통일한다.
-         * rect.top은 모바일 스크롤/키보드에서 흔들리므로 순서 판정에 쓰지 않는다. */
-        entries.sort((a, b) => {
-            if (a.domIndex !== b.domIndex) return b.domIndex - a.domIndex;
-            return b.top - a.top;
-        });
+        /* DOM 순서를 무조건 뒤집지 않는다. 크랙 모바일은 일부 채팅 노드를
+         * 재활용해서 DOM 인덱스와 실제 턴 순서가 어긋날 수 있다.
+         * 화면에 턴 번호가 있으면 그 번호를 최우선으로 과거 → 최신 정렬하고,
+         * 번호가 없을 때만 실제 화면의 위 → 아래 위치를 사용한다. */
+        entries.sort(compareContextOrder);
 
         /* 역할 표지가 하나도 없으면 채팅 입력창 직전의 마지막 출력은 상대
          * 캐릭터라고 보고 아래에서부터 유저/캐릭터를 교대로 복원한다. */
@@ -875,40 +946,46 @@
         const visible = collectVisibleChatLines();
 
         if (visible.length) {
-            /* 역할 판별을 절대 사용하지 않는다.
-             * 크랙이 최신 캐릭터 메시지를 user/unknown으로 잘못 표시하는 경우가 있어
-             * assistant만 역검색하면 2~3턴 전 메시지까지 건너뛰는 문제가 생긴다.
-             * 최신순 DOM을 역순 정렬한 뒤 마지막 메시지를 직전 장면으로 사용한다. */
-            const picked = visible[visible.length - 1];
+            /* DOM 배열의 첫/마지막 위치를 믿지 않는다.
+             * 1순위: 화면에 표시된 가장 큰 턴 번호
+             * 2순위: 채팅 입력창과 실제로 가장 가까운 메시지 */
+            const picked = pickLatestContextRecord(visible);
+            const pickedIndex = Math.max(0, visible.findIndex(item => item.id === picked.id));
             const nearby = visible
-                .slice(Math.max(0, visible.length - 3))
+                .slice(Math.max(0, pickedIndex - 2), pickedIndex + 1)
                 .map(item => formatContextMessage(item.role, item.text))
                 .join('\n\n');
 
             return {
                 text: picked.text || '',
                 nearby,
-                source: '현재 채팅 DOM의 실제 마지막 메시지',
+                source: Number.isFinite(picked.turnNumber)
+                    ? '화면의 가장 최신 턴 ' + picked.turnNumber
+                    : '채팅 입력창에 가장 가까운 실제 메시지',
                 role: picked.role || 'unknown',
-                id: picked.id || ''
+                id: picked.id || '',
+                turnNumber: picked.turnNumber
             };
         }
 
         const cache = getCtxCache();
         if (cache.length) {
-            /* 캐시에서도 역할이 아니라 저장 순서의 마지막 항목을 사용한다. */
-            const picked = cache[cache.length - 1];
+            const picked = pickLatestContextRecord(cache);
+            const pickedIndex = Math.max(0, cache.findIndex(item => item.id === picked.id));
             const nearby = cache
-                .slice(Math.max(0, cache.length - 3))
+                .slice(Math.max(0, pickedIndex - 2), pickedIndex + 1)
                 .map(item => formatContextMessage(item.role, item.text))
                 .join('\n\n');
 
             return {
                 text: picked.text || '',
                 nearby,
-                source: '현재 채팅방 캐시의 실제 마지막 메시지',
+                source: Number.isFinite(picked.turnNumber)
+                    ? '캐시의 가장 최신 턴 ' + picked.turnNumber
+                    : '입력창 근접도 기준 최신 캐시',
                 role: picked.role || 'unknown',
-                id: picked.id || ''
+                id: picked.id || '',
+                turnNumber: picked.turnNumber
             };
         }
 
