@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.14.0
+// @version      6.15.0
 // @author       me
-// @description  크랙 서버에서 최신 턴부터 거꾸로 정확히 불러오고, 채팅방별 장기기억(관계 변화·내 상태·할 일·있었던 일)을 자동 정리해 문장 부풀리기에 반영하는 경량판.
+// @description  크랙 서버에서 최신 턴부터 거꾸로 정확히 불러오고, 채팅방별 장기기억(관계 변화·내 상태·할 일·있었던 일)을 자동 정리해 문장 부풀리기에 반영하는 경량판. Gemini 무료 키를 먼저 쓰고 한도를 다 쓰면 유료 키로 전환.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -22,6 +22,10 @@
     'use strict';
 
     /*
+     * v6.15.0
+     * - 🆓 무료 키를 먼저 쓰고, 그 모델의 하루 무료 한도를 다 쓰면 💳 유료 키로 자동 전환한다.
+     *   분당 한도는 잠깐 기다렸다 무료로 다시 시도한다. 무료 요청은 비용 ₩0으로 기록한다.
+     *
      * v6.14.0
      * - 턴 불러오기: 크랙 서버에서 최신 메시지부터 거꾸로(역순) 페이지를 넘기며
      *   "유저 메시지 N개 = N턴"을 정확히 맞춰 가져온다. 첫 턴 바로 앞 캐릭터 메시지도 함께.
@@ -45,7 +49,9 @@
     /* =========================
      * 저장 키
      * ========================= */
-    const K_APIKEY = 'se_gemini_key';
+    const K_APIKEY = 'se_gemini_key';            /* 💳 유료(또는 기본) 키 */
+    const K_APIKEY_FREE = 'se_gemini_key_free';  /* 🆓 무료 키 · 먼저 사용 */
+    const K_FREE_STATE = 'se_free_state_v1';
     const K_MODEL = 'se_gemini_model';
     const K_MODELLIST = 'se_model_list';
 
@@ -86,6 +92,8 @@
     const STORY_BOOTSTRAP_LIMIT = 6;
     const TURN_SAMPLE = 8;
     const CTX_MAX_TURNS = 100;
+    const FREE_RECHECK_MS = 30 * 60 * 1000;
+    const FREE_MINUTE_WAIT_MAX = 20;
 
     /* 크랙 서버 / 장기기억 */
     const CRACK_API_BASE = 'https://crack-api.wrtn.ai/crack-gen/v3/chats';
@@ -2467,10 +2475,194 @@
     }
 
     /* =========================
+     * 무료 키 우선 사용
+     * - 무료 등급 한도는 "프로젝트 · 모델" 단위이고, 하루 한도는 미국 태평양 시간 자정에 다시 채워진다.
+     * - 무료 키(결제 연결 안 된 프로젝트)를 먼저 쓰고, 하루 한도를 다 쓰면 유료 키로 넘어간다.
+     * - 분당 한도에 걸리면 잠깐 기다렸다가 무료 키로 한 번 더 시도한다.
+     * ========================= */
+    function getFreeKey() {
+        return String(GM_getValue(K_APIKEY_FREE, '') || '').trim();
+    }
+
+    function getPaidKey() {
+        return String(GM_getValue(K_APIKEY, '') || '').trim();
+    }
+
+    function getCurrentModel() {
+        return String(
+            GM_getValue(K_MODEL, DEFAULT_MODELS[0].id) ||
+            DEFAULT_MODELS[0].id
+        ).trim();
+    }
+
+    function pacificDate(time) {
+        const when = new Date(Number.isFinite(time) ? time : Date.now());
+        try {
+            return new Intl.DateTimeFormat('en-CA', {
+                timeZone: 'America/Los_Angeles',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit'
+            }).format(when);
+        } catch (_) {
+            return new Date(when.getTime() - 8 * 3600000).toISOString().slice(0, 10);
+        }
+    }
+
+    /* 다음 충전 시각(태평양 자정)을 사용자 시간대로 보여준다. 한국은 오후 4시 또는 5시. */
+    function nextFreeResetText() {
+        const now = Date.now();
+        const today = pacificDate(now);
+        let low = now;
+        let high = now + 26 * 3600000;
+
+        for (let i = 0; i < 26; i++) {
+            const mid = (low + high) / 2;
+            if (pacificDate(mid) === today) low = mid;
+            else high = mid;
+        }
+
+        /* high는 자정 직후 몇 ms 이내라서 가장 가까운 분으로 반올림한다. */
+        const reset = new Date(Math.round(high / 60000) * 60000);
+        try {
+            return reset.toLocaleTimeString('ko-KR', { hour: 'numeric', minute: '2-digit' });
+        } catch (_) {
+            return reset.getHours() + ':' + String(reset.getMinutes()).padStart(2, '0');
+        }
+    }
+
+    function getFreeState() {
+        const today = pacificDate();
+        const saved = GM_getValue(K_FREE_STATE, null);
+
+        if (!saved || typeof saved !== 'object' || saved.date !== today) {
+            return { date: today, exhausted: {}, used: {} };
+        }
+
+        return {
+            date: today,
+            exhausted: saved.exhausted && typeof saved.exhausted === 'object' ? saved.exhausted : {},
+            used: saved.used && typeof saved.used === 'object' ? saved.used : {}
+        };
+    }
+
+    function saveFreeState(state) {
+        GM_setValue(K_FREE_STATE, state);
+    }
+
+    /* 소진 표시는 30분마다 한 번씩 다시 확인한다.
+     * 분당 한도를 하루 한도로 잘못 읽었을 때 하루 종일 유료로 새는 것을 막기 위해서다. */
+    function isFreeExhausted(model) {
+        const markedAt = getFreeState().exhausted[model];
+        return Number.isFinite(markedAt) && Date.now() - markedAt < FREE_RECHECK_MS;
+    }
+
+    function markFreeExhausted(model) {
+        const state = getFreeState();
+        state.exhausted[model] = Date.now();
+        saveFreeState(state);
+    }
+
+    function noteFreeSuccess(model) {
+        const state = getFreeState();
+        delete state.exhausted[model];
+        state.used[model] = (parseInt(state.used[model], 10) || 0) + 1;
+        saveFreeState(state);
+        return state.used[model];
+    }
+
+    function freeUsedToday() {
+        return Object.values(getFreeState().used)
+            .reduce((sum, value) => sum + (parseInt(value, 10) || 0), 0);
+    }
+
+    /* 지금 요청을 보낼 수 있는 키가 있는지(자동 기억 정리 전에 확인). */
+    function canRequestGemini() {
+        const free = getFreeKey();
+        return !!getPaidKey() || (!!free && !isFreeExhausted(getCurrentModel()));
+    }
+
+    function parseGeminiError(response) {
+        let parsed = null;
+        try {
+            parsed = JSON.parse(response.responseText || '{}');
+        } catch (_) {}
+
+        const error = parsed && parsed.error ? parsed.error : {};
+        const details = Array.isArray(error.details) ? error.details : [];
+        let quota = null;
+        let retrySec = null;
+        let freeTier = false;
+
+        details.forEach(detail => {
+            const type = String(detail && detail['@type'] || '');
+
+            if (type.includes('QuotaFailure') && Array.isArray(detail.violations)) {
+                detail.violations.forEach(violation => {
+                    const id = String(violation.quotaId || '') + ' ' + String(violation.quotaMetric || '');
+                    if (/free_?tier/i.test(id)) freeTier = true;
+                    if (/PerDay/i.test(id)) quota = 'day';
+                    else if (/PerMinute/i.test(id) && quota !== 'day') quota = 'minute';
+                });
+            }
+
+            if (type.includes('RetryInfo') && detail.retryDelay) {
+                const seconds = parseFloat(String(detail.retryDelay));
+                if (Number.isFinite(seconds)) retrySec = seconds;
+            }
+        });
+
+        if (!freeTier && /free[_ ]?tier/i.test(String(error.message || ''))) freeTier = true;
+
+        return {
+            status: response.status,
+            quota,
+            retrySec,
+            freeTier,
+            message: 'API 오류 (' + response.status + ')' + (error.message ? ': ' + error.message : '')
+        };
+    }
+
+    function geminiPost(apiKey, model, body, handlers) {
+        GM_xmlhttpRequest({
+            method: 'POST',
+            url:
+                'https://generativelanguage.googleapis.com/v1beta/models/' +
+                encodeURIComponent(model) +
+                ':generateContent?key=' +
+                encodeURIComponent(apiKey),
+            headers: { 'Content-Type': 'application/json' },
+            data: body,
+            timeout: 60000,
+            onload(response) {
+                if (response.status < 200 || response.status >= 300) {
+                    handlers.fail(parseGeminiError(response));
+                    return;
+                }
+
+                let data;
+                try {
+                    data = JSON.parse(response.responseText);
+                } catch (_) {
+                    handlers.fail({ status: 0, message: 'API 응답을 읽지 못했어요.' });
+                    return;
+                }
+                handlers.ok(data);
+            },
+            onerror() {
+                handlers.fail({ status: 0, message: '네트워크 오류예요.' });
+            },
+            ontimeout() {
+                handlers.fail({ status: 0, message: '요청 시간이 초과됐어요.' });
+            }
+        });
+    }
+
+    /* =========================
      * Gemini / 모델
      * ========================= */
     function fetchModels(onDone, onError) {
-        const apiKey = String(GM_getValue(K_APIKEY, '') || '').trim();
+        const apiKey = getFreeKey() || getPaidKey();
 
         if (!apiKey) {
             onError('API 키를 먼저 저장해 주세요.');
@@ -2524,98 +2716,140 @@
         });
     }
 
+    /* options.json: JSON으로 받기, options.onNotice(문구): 키 전환·대기 안내 */
     function requestGemini(system, user, label, onDone, onError, options) {
-        const apiKey = String(GM_getValue(K_APIKEY, '') || '').trim();
-        const model = String(
-            GM_getValue(K_MODEL, DEFAULT_MODELS[0].id) ||
-            DEFAULT_MODELS[0].id
-        ).trim();
+        const freeKey = getFreeKey();
+        const paidKey = getPaidKey();
+        const model = getCurrentModel();
+        const notice = options && typeof options.onNotice === 'function'
+            ? options.onNotice
+            : () => {};
 
-        if (!apiKey) {
+        if (!freeKey && !paidKey) {
             onError('API 키가 없어요. ⚙️ 설정에서 먼저 저장해 주세요.');
             return;
         }
 
-        const endpoint =
-            'https://generativelanguage.googleapis.com/v1beta/models/' +
-            encodeURIComponent(model) +
-            ':generateContent?key=' +
-            encodeURIComponent(apiKey);
-
-        GM_xmlhttpRequest({
-            method: 'POST',
-            url: endpoint,
-            headers: {
-                'Content-Type': 'application/json'
+        const body = JSON.stringify({
+            system_instruction: {
+                parts: [{ text: system }]
             },
-            data: JSON.stringify({
-                system_instruction: {
-                    parts: [{ text: system }]
-                },
-                contents: [{
-                    role: 'user',
-                    parts: [{ text: user }]
-                }],
-                generationConfig: options && options.json
-                    ? { maxOutputTokens: 8192, responseMimeType: 'application/json' }
-                    : { maxOutputTokens: 8192 }
-            }),
-            timeout: 60000,
-            onload(response) {
-                if (response.status < 200 || response.status >= 300) {
-                    let message = 'API 오류 (' + response.status + ')';
+            contents: [{
+                role: 'user',
+                parts: [{ text: user }]
+            }],
+            generationConfig: options && options.json
+                ? { maxOutputTokens: 8192, responseMimeType: 'application/json' }
+                : { maxOutputTokens: 8192 }
+        });
 
-                    try {
-                        const parsed = JSON.parse(response.responseText);
-                        if (parsed.error && parsed.error.message) {
-                            message += ': ' + parsed.error.message;
-                        }
-                    } catch (_) {}
+        let switchedFromFree = false;
 
-                    onError(message);
-                    return;
+        const freeLimitMessage = () =>
+            '🆓 오늘 이 모델(' + model + ')의 무료 한도를 다 썼어요.\n' +
+            nextFreeResetText() + '에 다시 채워져요. 💳 유료 키를 넣으면 그동안 이어서 쓸 수 있어요.';
+
+        const handleSuccess = (data, keyType) => {
+            const candidate = data.candidates && data.candidates[0];
+            const output = candidate &&
+                candidate.content &&
+                Array.isArray(candidate.content.parts)
+                ? candidate.content.parts
+                    .map(part => part.text || '')
+                    .join('')
+                    .trim()
+                : '';
+
+            if (!output) {
+                const reason =
+                    (candidate && candidate.finishReason) ||
+                    (data.promptFeedback && data.promptFeedback.blockReason) ||
+                    '알 수 없음';
+
+                onError('응답이 비어 있어요 (사유: ' + reason + ').');
+                return;
+            }
+
+            const free = keyType === 'free';
+            const freeCount = free ? noteFreeSuccess(model) : 0;
+            const cost = recordCostUsage(model, data.usageMetadata, label, free);
+
+            if (cost) {
+                if (free) {
+                    cost.message = '🆓 무료 키로 처리 (₩0) · 오늘 무료 ' + freeCount + '회 · 누적 약 ₩' +
+                        formatMoney(cost.totalKrw);
+                } else if (switchedFromFree) {
+                    cost.message = '💳 무료 한도를 다 써서 유료 키로 처리 · ' + cost.message.replace('💸 ', '');
                 }
+            }
 
-                try {
-                    const data = JSON.parse(response.responseText);
-                    const candidate = data.candidates && data.candidates[0];
-                    const output = candidate &&
-                        candidate.content &&
-                        Array.isArray(candidate.content.parts)
-                        ? candidate.content.parts
-                            .map(part => part.text || '')
-                            .join('')
-                            .trim()
-                        : '';
+            onDone(output, cost);
+        };
 
-                    if (!output) {
-                        const reason =
-                            (candidate && candidate.finishReason) ||
-                            (data.promptFeedback && data.promptFeedback.blockReason) ||
-                            '알 수 없음';
+        const attempt = (keyType, retriedFree) => {
+            const apiKey = keyType === 'free' ? freeKey : paidKey;
 
-                        onError('응답이 비어 있어요 (사유: ' + reason + ').');
+            geminiPost(apiKey, model, body, {
+                ok: data => handleSuccess(data, keyType),
+                fail: info => {
+                    if (keyType === 'free') {
+                        if (info.status === 429) {
+                            /* 분당 한도: 잠깐 기다렸다가 무료로 한 번 더 */
+                            const waitSec = Number.isFinite(info.retrySec) ? info.retrySec : 10;
+                            if (info.quota === 'minute' && !retriedFree && waitSec <= FREE_MINUTE_WAIT_MAX) {
+                                notice('🆓 무료 분당 한도에 걸려서 ' + Math.ceil(waitSec) + '초 뒤 다시 시도할게요…');
+                                setTimeout(() => attempt('free', true), (Math.ceil(waitSec) + 1) * 1000);
+                                return;
+                            }
+
+                            if (info.quota !== 'minute') markFreeExhausted(model);
+
+                            if (paidKey) {
+                                switchedFromFree = true;
+                                notice('🆓 무료 한도를 다 써서 💳 유료 키로 이어서 할게요…');
+                                attempt('paid', true);
+                                return;
+                            }
+
+                            onError(info.quota === 'minute'
+                                ? '🆓 무료 분당 한도에 걸렸어요. ' + Math.ceil(waitSec) + '초쯤 뒤에 다시 눌러주세요.'
+                                : freeLimitMessage());
+                            return;
+                        }
+
+                        /* 구글 서버가 바쁠 때(5xx)는 유료 키로 넘긴다. */
+                        if ((info.status >= 500 || info.status === 0) && paidKey) {
+                            switchedFromFree = true;
+                            notice('🆓 무료 키 응답이 불안정해서 💳 유료 키로 시도할게요…');
+                            attempt('paid', true);
+                            return;
+                        }
+
+                        onError('🆓 무료 키 오류 · ' + info.message);
                         return;
                     }
 
-                    const cost = recordCostUsage(
-                        model,
-                        data.usageMetadata,
-                        label
-                    );
+                    if (info.status === 429 && info.freeTier) {
+                        onError(
+                            '💳 유료 키 칸의 키가 무료 등급(결제 미연결)으로 보여요.\n' +
+                            freeLimitMessage()
+                        );
+                        return;
+                    }
 
-                    onDone(output, cost);
-                } catch (error) {
-                    onError('API 응답을 읽지 못했어요.');
+                    onError(info.message);
                 }
-            },
-            onerror() {
-                onError('네트워크 오류예요.');
-            },
-            ontimeout() {
-                onError('요청 시간이 초과됐어요.');
-            }
-        });
+            });
+        };
+
+        if (freeKey && !isFreeExhausted(model)) {
+            attempt('free', false);
+        } else if (paidKey) {
+            switchedFromFree = !!freeKey;
+            attempt('paid', true);
+        } else {
+            onError(freeLimitMessage());
+        }
     }
 
     /* =========================
@@ -2688,14 +2922,16 @@
         return Array.isArray(value) ? value : [];
     }
 
-    function recordCostUsage(modelId, usage, label) {
+    function recordCostUsage(modelId, usage, label, free) {
         const tokens = getUsageTokens(usage);
 
         if (!tokens.input && !tokens.output) return null;
 
         const rates = getModelCostRates(modelId, tokens.input);
-        const usd =
-            (
+        /* 무료 키로 처리한 요청은 요금이 없으므로 ₩0으로 기록한다. */
+        const usd = free
+            ? 0
+            : (
                 tokens.input * rates.input +
                 tokens.output * rates.output
             ) / 1000000;
@@ -2727,9 +2963,10 @@
 
         const entry = {
             at: new Date().toLocaleString('ko-KR'),
-            label: label || '요청',
+            label: (label || '요청') + (free ? ' 🆓' : ''),
             model: modelId,
-            modelLabel: rates.label,
+            modelLabel: free ? rates.label + ' · 무료' : rates.label,
+            free: !!free,
             input: tokens.input,
             output: tokens.output,
             usd,
@@ -2798,6 +3035,17 @@
                 last.label +
                 ' · 약 ₩' +
                 formatMoney(last.krw)
+            );
+        }
+
+        if (getFreeKey()) {
+            const model = getCurrentModel();
+            lines.push(
+                '🆓 오늘 무료 ' + freeUsedToday() + '회' +
+                    (isFreeExhausted(model)
+                        ? ' · 이 모델 무료 다 씀 → ' + (getPaidKey() ? '💳 유료 키 사용 중' : '충전 대기')
+                        : ' · 무료 먼저 사용 중') +
+                    ' · ' + nextFreeResetText() + ' 충전'
             );
         }
 
@@ -3551,7 +3799,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.14.0</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.15.0</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -3733,8 +3981,15 @@
                         <div class="se-label">캐릭터 이름 (3인칭용)</div>
                         <input id="se-name" type="text" placeholder="예: 서지훈">
 
-                        <div class="se-label">Gemini API 키</div>
+                        <div class="se-label">🆓 무료 키 · 먼저 사용 (결제를 연결하지 않은 프로젝트의 키)</div>
+                        <input id="se-key-free" type="password" placeholder="AIza... (비워두면 아래 키만 사용)">
+
+                        <div class="se-label">💳 유료 키 · 무료 한도를 다 쓰면 자동 전환 (비워두면 무료만 사용)</div>
                         <input id="se-key" type="password" placeholder="AIza...">
+
+                        <button id="se-key-swap" class="se-secondary" type="button">⇅ 두 칸 서로 바꾸기</button>
+
+                        <div class="se-label" id="se-free-info">무료 한도는 프로젝트·모델마다 따로 있고, 매일 미국 태평양 시간 자정에 다시 채워져요. 결제를 연결한 프로젝트의 키를 무료 칸에 넣으면 ₩0으로 표시돼도 실제로는 요금이 나가요.</div>
 
                         <div class="se-label">모델 드롭다운</div>
                         <select id="se-model"></select>
@@ -3998,6 +4253,12 @@
         const goButton = $('#se-go');
 
         const keyInput = $('#se-key');
+        const freeKeyInput = $('#se-key-free');
+
+        function saveKeys() {
+            GM_setValue(K_APIKEY, keyInput.value.trim());
+            GM_setValue(K_APIKEY_FREE, freeKeyInput.value.trim());
+        }
         const modelSelect = $('#se-model');
         const nameInput = $('#se-name');
 
@@ -4124,6 +4385,7 @@
 
         /* 초기 값 */
         keyInput.value = GM_getValue(K_APIKEY, '');
+        freeKeyInput.value = GM_getValue(K_APIKEY_FREE, '');
         nameInput.value = GM_getValue(K_NAME, '');
         personaHint.value = GM_getValue(K_PERSONA_HINT, '');
 
@@ -4236,7 +4498,7 @@
 
         /* 저장 */
         $('#se-save').addEventListener('click', () => {
-            GM_setValue(K_APIKEY, keyInput.value.trim());
+            saveKeys();
             GM_setValue(K_NAME, nameInput.value.trim());
             GM_setValue(K_PERSONA_HINT, personaHint.value.trim());
             GM_setValue(K_CTX_ON, true);
@@ -4272,7 +4534,7 @@
             const button = $('#se-fetch');
             const fetchStatus = $('#se-fetch-status');
 
-            GM_setValue(K_APIKEY, keyInput.value.trim());
+            saveKeys();
 
             button.disabled = true;
             setInfo(fetchStatus, '불러오는 중…', false);
@@ -4297,6 +4559,24 @@
 
         modelSelect.addEventListener('change', () => {
             GM_setValue(K_MODEL, modelSelect.value);
+            refreshCost();
+        });
+
+        /* 🆓 무료 키 / 💳 유료 키 */
+        [keyInput, freeKeyInput].forEach(input => {
+            input.addEventListener('change', () => {
+                saveKeys();
+                refreshCost();
+            });
+        });
+
+        $('#se-key-swap').addEventListener('click', () => {
+            const free = freeKeyInput.value;
+            freeKeyInput.value = keyInput.value;
+            keyInput.value = free;
+            saveKeys();
+            refreshCost();
+            setInfo($('#se-fetch-status'), '두 칸을 서로 바꿨어요 ⇅', false);
         });
 
         /* 페르소나 자동추천 */
@@ -4305,7 +4585,7 @@
             if (button.disabled) return;
             const keywords = personaHint.value.trim();
 
-            GM_setValue(K_APIKEY, keyInput.value.trim());
+            saveKeys();
             GM_setValue(K_MODEL, modelSelect.value);
             GM_setValue(K_PERSONA_HINT, keywords);
 
@@ -4518,6 +4798,7 @@
         /* 설정 동기화 */
         const syncKeys = [
             K_APIKEY,
+            K_APIKEY_FREE,
             K_MODEL,
             K_MODELLIST,
             K_PERSONAS,
@@ -4810,7 +5091,7 @@
                 return Promise.resolve(null);
             }
 
-            GM_setValue(K_APIKEY, keyInput.value.trim());
+            saveKeys();
             if (modelSelect.value) GM_setValue(K_MODEL, modelSelect.value);
             closeMemoryEditor();
 
@@ -4838,6 +5119,8 @@
 
         function maybeAutoMemory() {
             if (!memAuto.checked || memoryBusy) return;
+            /* 무료 한도를 다 썼고 유료 키도 없으면 조용히 건너뛴다. */
+            if (!canRequestGemini()) return;
 
             startMemoryJob('auto', null, {
                 progress: '🧠 새 대화로 기억 정리 중…'
@@ -4980,7 +5263,7 @@
             if (runBusy) return;
             runBusy = true;
 
-            GM_setValue(K_APIKEY, keyInput.value.trim());
+            saveKeys();
             GM_setValue(K_MODEL, modelSelect.value);
             saveSlots();
 
@@ -5063,7 +5346,8 @@
                                 refreshCost(costInfo);
                                 releaseButton();
                                 flash('자동 재교정은 실패했지만 첫 결과를 표시했어요: ' + error, true);
-                            }
+                            },
+                            { onNotice: message => flash(message) }
                         );
                         return;
                     }
@@ -5076,7 +5360,8 @@
                 error => {
                     releaseButton();
                     flash(error, true);
-                }
+                },
+                { onNotice: message => flash(message) }
             );
         }
 
