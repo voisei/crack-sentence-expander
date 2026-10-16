@@ -1,14 +1,17 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.12.45
+// @version      6.14.0
 // @author       me
-// @description  실제 메시지 그룹 전체에서 가장 큰 턴 번호를 직전 턴으로 고정하고, 읽은 채팅만 시간순으로 보여주는 단일 실행판.
+// @description  크랙 서버에서 최신 턴부터 거꾸로 정확히 불러오고, 채팅방별 장기기억(관계 변화·내 상태·할 일·있었던 일)을 자동 정리해 문장 부풀리기에 반영하는 경량판.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
 // @grant        GM_xmlhttpRequest
 // @connect      generativelanguage.googleapis.com
+// @connect      crack-api.wrtn.ai
 // @homepageURL  https://github.com/voisei/crack-sentence-expander
 // @supportURL   https://github.com/voisei/crack-sentence-expander/issues
 // @license      MIT
@@ -17,6 +20,27 @@
 
 (function () {
     'use strict';
+
+    /*
+     * v6.14.0
+     * - 턴 불러오기: 크랙 서버에서 최신 메시지부터 거꾸로(역순) 페이지를 넘기며
+     *   "유저 메시지 N개 = N턴"을 정확히 맞춰 가져온다. 첫 턴 바로 앞 캐릭터 메시지도 함께.
+     *   서버에서 못 불러오면 화면(DOM)에서 읽는 기존 방식으로 자동 전환한다.
+     * - 장기기억: 채팅방마다 관계 변화 / 내 캐릭터의 현재 상태 / 해야 할 일 / 있었던 일을
+     *   저장하고, 새 대화가 일정 턴 쌓이면 ✨늘리기 뒤에 자동으로 정리한다.
+     *   정리된 기억은 프롬프트에 들어가 관계 단계·현재 상태에 맞게 문장이 바뀐다.
+     *   기본 페르소나 칸은 건드리지 않고, 기억이 페르소나보다 우선하도록 지시한다.
+     *
+     * v6.13.0 성능 개선 메모
+     * - 채팅 화면이 바뀔 때마다 "전체 메시지"를 다시 읽던 백그라운드 감시를 없앴다.
+     *   이제 ✨늘리기 / 🔍미리보기 / 페르소나 추천 버튼을 누를 때만 최신 턴 몇 개를 읽는다.
+     * - 턴 방향(최신이 위인지 아래인지) 판정은 목록 양 끝 일부만 표본으로 읽는다.
+     * - innerText(화면 배치를 강제로 다시 계산시킴) 대신 textContent를 쓴다.
+     * - 메시지마다 입력창을 다시 찾던 중복 계산을 없앴다.
+     * - 채팅방마다 최대 300개씩 쌓이던 맥락 캐시를 "현재 방 40개"로 줄이고,
+     *   예전 캐시는 한 번 정리한다.
+     * - 화면 크기 변화 대응은 프레임당 한 번만 실행하고, 위치가 같으면 스타일을 다시 쓰지 않는다.
+     */
 
     /* =========================
      * 저장 키
@@ -39,8 +63,11 @@
 
     const K_CTX_ON = 'se_ctx_on';
     const K_CTX_N = 'se_ctx_n';
-    const K_CTX_CACHE_BASE = 'se_ctx_cache_by_room_v13';
+    const K_CTX_LITE = 'se_ctx_lite_v1';
     const K_STORY_BOOTSTRAP_BASE = 'se_ctx_story_bootstrap_v5';
+    const K_CLEANUP = 'se_storage_cleanup_v1';
+    const LEGACY_CTX_PREFIX = 'se_ctx_cache';
+    const LEGACY_BOOTSTRAP_PREFIX = 'se_ctx_story_bootstrap';
 
     const K_COST_ON = 'se_cost_on';
     const K_COST_USDKRW = 'se_cost_usdkrw';
@@ -55,7 +82,29 @@
     const EDGE = 12;
     const PERSONA_SLOTS = 3;
     const STYLE_SLOTS = 3;
-    const CTX_CACHE_LIMIT = 300;
+    const CTX_CACHE_LIMIT = 40;
+    const STORY_BOOTSTRAP_LIMIT = 6;
+    const TURN_SAMPLE = 8;
+    const CTX_MAX_TURNS = 100;
+
+    /* 크랙 서버 / 장기기억 */
+    const CRACK_API_BASE = 'https://crack-api.wrtn.ai/crack-gen/v3/chats';
+    const K_MEM_BASE = 'se_mem_v1';
+    const K_MEM_AUTO = 'se_mem_auto';
+    const K_MEM_EVERY = 'se_mem_every';
+    const MEM_CHUNK_TURNS = 15;
+    const MEM_FIRST_TURNS = 20;
+    const MEM_AUTO_MAX_TURNS = 30;
+    const MEM_MANUAL_MAX_TURNS = 60;
+    const MEM_PROMPT_RECENT_EVENTS = 12;
+    const MEM_PROMPT_RELATED_EVENTS = 6;
+    const MEM_LIMITS = {
+        relationships: 15,
+        userState: 12,
+        todosOpen: 20,
+        todosDone: 5,
+        events: 120
+    };
 
     const DEFAULT_MODELS = [
         { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
@@ -82,10 +131,13 @@
         }
     };
 
-    let contextObserver = null;
-    let contextScanTimer = null;
+    let bootstrapObserver = null;
+    let bootstrapTimer = null;
     let routeTimer = null;
     let lastUrl = location.href;
+    let lastCtxSaveSig = '';
+    let memoryBusy = false;
+    let refreshMemoryUI = null;
 
     /* =========================
      * 공통 유틸
@@ -188,6 +240,50 @@
         return decodeURIComponent(escape(atob(value)));
     }
 
+    /* 긴 목록에서 앞쪽 size개 + 뒤쪽 size개의 인덱스만 고른다. */
+    function sampleIndexes(length, size) {
+        if (length <= 0) return [];
+        if (length <= size * 2) {
+            return Array.from({ length }, (_, index) => index);
+        }
+
+        const out = [];
+        for (let i = 0; i < size; i++) out.push(i);
+        for (let i = length - size; i < length; i++) out.push(i);
+        return out;
+    }
+
+    /* =========================
+     * 예전 저장소 정리 (한 번만)
+     * ========================= */
+    function cleanupLegacyStorage() {
+        try {
+            if (GM_getValue(K_CLEANUP, false)) return;
+            if (
+                typeof GM_listValues !== 'function' ||
+                typeof GM_deleteValue !== 'function'
+            ) {
+                return;
+            }
+
+            const keys = GM_listValues() || [];
+
+            for (const key of keys) {
+                const name = String(key);
+                const legacyCache = name.startsWith(LEGACY_CTX_PREFIX);
+                const legacyBootstrap =
+                    name.startsWith(LEGACY_BOOTSTRAP_PREFIX) &&
+                    !name.startsWith(K_STORY_BOOTSTRAP_BASE);
+
+                if (legacyCache || legacyBootstrap) {
+                    GM_deleteValue(name);
+                }
+            }
+
+            GM_setValue(K_CLEANUP, true);
+        } catch (_) {}
+    }
+
     /* =========================
      * 페르소나 / 문체 슬롯
      * ========================= */
@@ -244,20 +340,21 @@
     }
 
     /* =========================
-     * 맥락 수집 / 캐시
+     * 맥락 캐시 (현재 채팅방 1개만, 가볍게)
      * ========================= */
-    function getCurrentChatCacheKey() {
-        return K_CTX_CACHE_BASE + '::' +
-            (location.pathname || '') +
+    function getCurrentRoomKey() {
+        return (location.pathname || '') +
             (location.search || '') +
             (location.hash || '');
     }
 
     function getCtxCache() {
-        const value = GM_getValue(getCurrentChatCacheKey(), []);
-        if (!Array.isArray(value)) return [];
+        const stored = GM_getValue(K_CTX_LITE, null);
+        if (!stored || typeof stored !== 'object') return [];
+        if (stored.room !== getCurrentRoomKey()) return [];
+        if (!Array.isArray(stored.records)) return [];
 
-        return value.filter(item => {
+        return stored.records.filter(item => {
             return item && typeof item === 'object' &&
                 typeof item.id === 'string' &&
                 typeof item.text === 'string';
@@ -265,13 +362,23 @@
     }
 
     function saveCtxCache(records) {
-        const value = Array.isArray(records)
-            ? records.slice(-CTX_CACHE_LIMIT)
-            : [];
-        GM_setValue(getCurrentChatCacheKey(), value);
+        const list = (Array.isArray(records) ? records : [])
+            .slice(-CTX_CACHE_LIMIT)
+            .map(item => ({
+                id: String(item.id || ''),
+                role: item.role || 'unknown',
+                text: String(item.text || ''),
+                turnNumber: Number.isFinite(item.turnNumber) ? item.turnNumber : null
+            }));
+
+        GM_setValue(K_CTX_LITE, {
+            room: getCurrentRoomKey(),
+            records: list
+        });
     }
 
     function clearCtxCache() {
+        lastCtxSaveSig = '';
         saveCtxCache([]);
     }
 
@@ -310,7 +417,9 @@
         if (/Gemini API|API 키|사용 가능한 모델|페르소나 자동추천/.test(line)) return true;
         if (/최근 대화 맥락 참고|맥락 미리보기/.test(line)) return true;
         if (/설정 동기화|내보내기|가져오기/.test(line)) return true;
-        if (/^[\s\W_]+$/.test(line)) return true;
+        /* 글자·숫자가 하나도 없는 기호뿐인 줄만 버린다.
+         * (예전 /^[\s\W_]+$/는 한글을 기호로 취급해 숫자 없는 한글 메시지를 통째로 버렸다.) */
+        if (!/[\p{L}\p{N}]/u.test(line)) return true;
         return false;
     }
 
@@ -410,141 +519,19 @@
         };
     }
 
+    /* 버튼을 눌러 읽은 최신 맥락만 저장한다(과거→최신 순서).
+     * 예전처럼 화면이 바뀔 때마다 300개를 읽고 쓰지 않는다. */
     function rememberCtxLines(records) {
         const fresh = (Array.isArray(records) ? records : [])
-            .map(normalizeContextRecord)
-            .filter(Boolean);
+            .filter(item => item && typeof item.text === 'string' && item.text);
         if (!fresh.length) return;
 
-        let cache = getCtxCache().map(normalizeContextRecord).filter(Boolean);
-        if (!cache.length) {
-            saveCtxCache(fresh);
-            return;
-        }
+        const sig = getCurrentRoomKey() + '|' +
+            fresh.map(item => item.id + ':' + item.text.length).join(',');
+        if (sig === lastCtxSaveSig) return;
 
-        const byId = new Map(cache.map((item, index) => [item.id, index]));
-
-        /* 이미 본 메시지는 텍스트/역할만 갱신하고 위치는 절대 바꾸지 않는다.
-         * 23버전은 재스캔된 과거 메시지를 캐시 맨 뒤로 옮겨 과거를 최신으로
-         * 착각하게 만들었다. */
-        for (const item of fresh) {
-            if (byId.has(item.id)) {
-                const index = byId.get(item.id);
-                cache[index] = { ...cache[index], ...item };
-            }
-        }
-
-        const freshIds = fresh.map(item => item.id);
-        const cacheIds = new Set(cache.map(item => item.id));
-
-        for (let i = 0; i < fresh.length; i++) {
-            const item = fresh[i];
-            if (cacheIds.has(item.id)) continue;
-
-            let inserted = false;
-
-            /* 화면상 바로 앞 메시지를 기준으로 정확한 위치에 삽입 */
-            for (let p = i - 1; p >= 0; p--) {
-                const prevId = freshIds[p];
-                const prevIndex = cache.findIndex(entry => entry.id === prevId);
-                if (prevIndex >= 0) {
-                    cache.splice(prevIndex + 1, 0, item);
-                    inserted = true;
-                    break;
-                }
-            }
-
-            /* 앞 기준이 없으면 화면상 바로 뒤 메시지 앞에 삽입 */
-            if (!inserted) {
-                for (let n = i + 1; n < fresh.length; n++) {
-                    const nextId = freshIds[n];
-                    const nextIndex = cache.findIndex(entry => entry.id === nextId);
-                    if (nextIndex >= 0) {
-                        cache.splice(nextIndex, 0, item);
-                        inserted = true;
-                        break;
-                    }
-                }
-            }
-
-            /* 겹치는 메시지가 전혀 없는 별도 화면 조각은 입력창 근처일 때만
-             * 최신으로 추가한다. 과거로 스크롤했을 때 낡은 턴이 뒤에 붙는 것을 방지. */
-            if (!inserted && item.nearInput) {
-                cache.push(item);
-                inserted = true;
-            }
-
-            if (inserted) cacheIds.add(item.id);
-        }
-
-        cache.sort(compareContextOrder);
-        saveCtxCache(cache);
-    }
-
-    function collectScenarioCards() {
-        const panel = document.getElementById(PANEL_ID);
-        const input = findChatInput();
-
-        if (!input) return [];
-
-        const root = document.querySelector('main') || document.body;
-        const inputTop = input.getBoundingClientRect().top;
-        const candidates = [];
-
-        for (const el of root.querySelectorAll('article, section, [role="article"], div')) {
-            if (!el || el === root) continue;
-            if (panel && panel.contains(el)) continue;
-            if (el.contains(input)) continue;
-            if (el.closest('nav, header, footer, aside, button, textarea, input, select, script, style')) continue;
-            if (!isVisible(el)) continue;
-
-            const rect = el.getBoundingClientRect();
-
-            if (rect.top >= inputTop || rect.bottom > inputTop + 30) continue;
-            if (rect.width < Math.min(220, window.innerWidth * 0.48)) continue;
-            if (rect.height < 90) continue;
-
-            const text = cleanContextLine(getRawNodeText(el));
-
-            if (text.length < 120 || text.length > 14000) continue;
-
-            const noisy = [
-                '앱에서 더 편하게',
-                '다운로드',
-                'AI 요약',
-                '프로챗',
-                '문장 부풀리기',
-                'API 비용 추정',
-                '기본 설정'
-            ].filter(word => text.includes(word)).length;
-
-            if (noisy >= 2) continue;
-
-            const innerEquivalent = Array.from(el.children || []).some(child => {
-                const childText = cleanContextLine(
-                    child.innerText || child.textContent || ''
-                );
-
-                return childText.length >= Math.max(100, text.length * 0.72);
-            });
-
-            if (innerEquivalent) continue;
-
-            candidates.push({
-                text,
-                top: rect.top,
-                score:
-                    Math.min(text.length, 6000) / 10 +
-                    Math.min(rect.height, 1200) / 8 -
-                    Math.max(0, inputTop - rect.bottom) / 8
-            });
-        }
-
-        return candidates
-            .sort((a, b) => b.score - a.score)
-            .slice(0, 2)
-            .sort((a, b) => a.top - b.top)
-            .map(item => item.text);
+        lastCtxSaveSig = sig;
+        saveCtxCache(fresh);
     }
 
     function getMessageSignature(group, contentEl) {
@@ -611,27 +598,27 @@
         return 'unknown';
     }
 
+    const MESSAGE_NODE_SELECTORS = [
+        '[data-role="user"]', '[data-role="assistant"]',
+        '[data-message-role]', '[data-author]',
+        '[data-testid*="user"]', '[data-testid*="assistant"]',
+        '[data-testid*="message"]', '.wrtn-markdown',
+        '[class*="whitespace-pre-wrap"]', '[class*="break-words"]'
+    ].join(',');
+
     function getBestMessageNode(group) {
-        const selectors = [
-            '[data-role="user"]', '[data-role="assistant"]',
-            '[data-message-role]', '[data-author]',
-            '[data-testid*="user"]', '[data-testid*="assistant"]',
-            '[data-testid*="message"]', '.wrtn-markdown',
-            '[class*="whitespace-pre-wrap"]', '[class*="break-words"]'
-        ].join(',');
+        const panelSelector = '#' + PANEL_ID;
+        let best = null;
+        let bestScore = Number.NEGATIVE_INFINITY;
 
-        const candidates = Array.from(group.querySelectorAll(selectors))
-            .filter(el => {
-                if (el.closest('#' + PANEL_ID)) return false;
-                if (el.querySelector('textarea, input, select, button')) return false;
-                const text = cleanContextLine(getRawNodeText(el));
-                return text.length >= 1 && text.length <= 12000;
-            });
+        for (const el of group.querySelectorAll(MESSAGE_NODE_SELECTORS)) {
+            if (el.closest(panelSelector)) continue;
+            if (el.querySelector('textarea, input, select, button')) continue;
 
-        if (!candidates.length) return group;
-
-        const scored = candidates.map(el => {
+            /* 후보마다 텍스트 정리는 딱 한 번만 한다. */
             const text = cleanContextLine(getRawNodeText(el));
+            if (text.length < 1 || text.length > 12000) continue;
+
             let score = Math.min(text.length, 5000);
             if (el.hasAttribute('data-role')) score += 12000;
             if (el.hasAttribute('data-message-role')) score += 12000;
@@ -639,16 +626,24 @@
             if ((el.getAttribute('data-testid') || '').toLowerCase().includes('message')) score += 7000;
             if (el.classList.contains('wrtn-markdown')) score += 4000;
 
-            const equivalentChild = Array.from(el.children || []).some(child => {
-                const childText = cleanContextLine(child.innerText || child.textContent || '');
-                return childText && childText.length >= text.length * 0.88;
-            });
+            /* innerText는 화면 밖 메시지까지 배치 계산을 강제하므로 쓰지 않는다. */
+            let equivalentChild = false;
+            for (const child of el.children) {
+                const childText = cleanContextLine(getRawNodeText(child));
+                if (childText && childText.length >= text.length * 0.88) {
+                    equivalentChild = true;
+                    break;
+                }
+            }
             if (equivalentChild) score -= 8000;
-            return { el, score };
-        });
 
-        scored.sort((a, b) => b.score - a.score);
-        return scored[0].el;
+            if (score > bestScore) {
+                bestScore = score;
+                best = el;
+            }
+        }
+
+        return best || group;
     }
 
     function formatContextMessage(role, text) {
@@ -664,50 +659,13 @@
         if (!node) return '';
 
         /* 크랙은 화면 밖 메시지에 content-visibility를 사용하기 때문에
-         * innerText가 일부만 반환될 수 있다. 턴 판정에는 textContent를 우선한다. */
-        return String(node.textContent || node.innerText || '');
+         * innerText는 일부만 반환되거나 배치 계산을 강제한다. textContent만 쓴다. */
+        return String(node.textContent || '');
     }
 
-    function getTopLevelMessageGroups(root) {
-        const panel = document.getElementById(PANEL_ID);
-        const scope = root && root.querySelectorAll ? root : document;
-
-        return Array.from(scope.querySelectorAll('[data-message-group-id]'))
-            .filter(group => {
-                if (!group || !group.isConnected) return false;
-                if (panel && panel.contains(group)) return false;
-
-                const parentGroup = group.parentElement
-                    ? group.parentElement.closest('[data-message-group-id]')
-                    : null;
-                if (parentGroup && scope.contains(parentGroup)) return false;
-
-                const cleaned = cleanContextLine(getRawNodeText(group));
-                return cleaned && !isBadContextLine(cleaned);
-            });
-    }
-
-    function findNearestMessageListRoot(anchorGroup) {
-        if (!anchorGroup) return null;
-
-        let node = anchorGroup.parentElement;
-        let best = anchorGroup.parentElement;
-
-        for (let depth = 0; node && node !== document.body && depth < 12; depth++) {
-            const groups = getTopLevelMessageGroups(node);
-
-            if (groups.length >= 2) {
-                best = node;
-
-                /* 직전 턴을 포함하면서 실제 대화 여러 개가 모인 가장 가까운
-                 * 컨테이너를 우선한다. 너무 큰 main/body까지 올라가지 않는다. */
-                if (groups.length >= 4) break;
-            }
-
-            node = node.parentElement;
-        }
-
-        return best;
+    function getInputTop() {
+        const input = findChatInput();
+        return input ? input.getBoundingClientRect().top : window.innerHeight;
     }
 
     /* 실제 채팅 목록을 최신→과거 순서로 반환한다.
@@ -717,36 +675,60 @@
      *     <div data-message-group-id>유저</div>
      *     <div data-message-group-id>턴 6</div>
      *     ...
-     * 따라서 페이지 전체의 임의 후보나 캐시 순서를 쓰지 않고,
-     * 같은 부모의 직계 자식 메시지 그룹만 골라 DOM 방향을 판정한다. */
-    function getLiveMessageGroupsNewestFirst() {
+     * 같은 부모의 직계 자식 메시지 그룹만 골라 DOM 방향을 판정한다.
+     * 성능: 턴 번호는 목록 양 끝 TURN_SAMPLE개씩만 읽는다.
+     * 최신 턴은 항상 목록의 한쪽 끝에 있으므로 이것으로 충분하다. */
+    function getLiveMessageGroupsNewestFirst(inputTopHint) {
         const panel = document.getElementById(PANEL_ID);
-        const input = findChatInput();
-        const inputTop = input
-            ? input.getBoundingClientRect().top
-            : window.innerHeight;
 
         const allGroups = Array.from(
             document.querySelectorAll('[data-message-group-id]')
         ).filter(group => {
-            if (!group || !group.isConnected) return false;
+            if (!group || !group.isConnected || !group.parentElement) return false;
             if (panel && panel.contains(group)) return false;
-            return !!group.parentElement;
+            return true;
         });
 
         if (!allGroups.length) return [];
 
-        const parentMap = new Map();
+        const turnCache = new Map();
+        const turnOf = group => {
+            if (!turnCache.has(group)) {
+                turnCache.set(group, extractTurnNumber(getRawNodeText(group)));
+            }
+            return turnCache.get(group);
+        };
 
-        for (const group of allGroups) {
-            const parent = group.parentElement;
-            if (!parentMap.has(parent)) parentMap.set(parent, []);
-            parentMap.get(parent).push(group);
-        }
+        const readSampledTurns = groups => {
+            let numbered = sampleIndexes(groups.length, TURN_SAMPLE)
+                .map(index => ({
+                    group: groups[index],
+                    index,
+                    turn: turnOf(groups[index])
+                }))
+                .filter(item => Number.isFinite(item.turn));
 
+            /* 표본에서 번호를 2개 미만 찾으면 방향을 판정할 수 없으므로
+             * 그때만 전체를 읽는다(드문 경우). */
+            if (numbered.length < 2 && groups.length > TURN_SAMPLE * 2) {
+                numbered = groups
+                    .map((group, index) => ({ group, index, turn: turnOf(group) }))
+                    .filter(item => Number.isFinite(item.turn));
+            }
+
+            return numbered;
+        };
+
+        let inputTop = Number.isFinite(inputTopHint) ? inputTopHint : null;
+        const resolveInputTop = () => {
+            if (inputTop === null) inputTop = getInputTop();
+            return inputTop;
+        };
+
+        const parents = new Set(allGroups.map(group => group.parentElement));
         const candidates = [];
 
-        for (const [parent] of parentMap) {
+        for (const parent of parents) {
             /* querySelectorAll이 아니라 직계 자식만 사용한다.
              * 사이드바·숨은 복제 목록·중첩 그룹이 섞이는 것을 차단한다. */
             const groups = Array.from(parent.children || []).filter(child => {
@@ -758,42 +740,34 @@
 
             if (groups.length < 2) continue;
 
-            const numbered = groups.map((group, index) => ({
-                group,
-                index,
-                turn: extractTurnNumber(getRawNodeText(group))
-            })).filter(item => Number.isFinite(item.turn));
-
+            const numbered = readSampledTurns(groups);
             if (!numbered.length) continue;
 
-            const maxTurn = Math.max(...numbered.map(item => item.turn));
-            const minTurn = Math.min(...numbered.map(item => item.turn));
-            const maxItem = numbered.find(item => item.turn === maxTurn);
-            const minItem = numbered.find(item => item.turn === minTurn);
+            let maxItem = numbered[0];
+            let minItem = numbered[0];
+
+            for (const item of numbered) {
+                if (item.turn > maxItem.turn) maxItem = item;
+                if (item.turn < minItem.turn) minItem = item;
+            }
+
             const maxRect = maxItem.group.getBoundingClientRect();
-            const style = getComputedStyle(parent);
-            const flexReverse = style.flexDirection === 'column-reverse' ||
-                String(parent.className || '').includes('flex-col-reverse');
 
             candidates.push({
                 parent,
                 groups,
-                maxTurn,
-                minTurn,
+                maxTurn: maxItem.turn,
+                minTurn: minItem.turn,
                 maxIndex: maxItem.index,
                 minIndex: minItem.index,
-                distanceToInput: Math.abs(inputTop - maxRect.bottom),
-                flexReverse
+                distanceToInput: Math.abs(resolveInputTop() - maxRect.bottom)
             });
         }
 
         if (!candidates.length) {
             /* 구조가 바뀐 경우에만 전체 그룹을 보조값으로 쓴다. */
             const fallback = allGroups.slice();
-            const numbered = fallback.map((group, index) => ({
-                index,
-                turn: extractTurnNumber(getRawNodeText(group))
-            })).filter(item => Number.isFinite(item.turn));
+            const numbered = readSampledTurns(fallback);
 
             if (numbered.length >= 2) {
                 const maxItem = numbered.reduce((a, b) =>
@@ -819,38 +793,45 @@
         const picked = candidates[0];
         let groups = picked.groups.slice();
 
-        /* 제공된 실제 DOM에서는 maxIndex=0, minIndex=12이므로 그대로 최신→과거다.
-         * 향후 CSS/DOM 방향이 바뀌어도 턴 번호 위치로 자동 보정한다. */
+        /* 턴 번호 위치로 DOM 방향을 자동 보정한다. */
         const domIsNewestFirst = picked.maxIndex < picked.minIndex;
         if (!domIsNewestFirst) groups.reverse();
 
-        /* 최신 턴보다 앞에 광고·시스템 그룹이 끼어 있을 경우 제거한다. */
-        const latestIndex = groups.findIndex(group =>
-            extractTurnNumber(getRawNodeText(group)) === picked.maxTurn
-        );
+        /* 최신 턴보다 앞에 광고·시스템 그룹이 끼어 있을 경우 제거한다.
+         * 최신 턴은 앞쪽 표본 범위 안에 있으므로 그 범위만 찾는다. */
+        const searchLimit = Math.min(groups.length, TURN_SAMPLE * 2 + 2);
+        let latestIndex = -1;
+
+        for (let i = 0; i < searchLimit; i++) {
+            if (turnOf(groups[i]) === picked.maxTurn) {
+                latestIndex = i;
+                break;
+            }
+        }
+
         if (latestIndex > 0) groups = groups.slice(latestIndex);
 
         return groups;
     }
 
-    function recordFromMessageGroup(group, index) {
+    function recordFromMessageGroup(group, index, inputTop) {
         if (!group) return null;
 
         const contentEl = getBestMessageNode(group);
         const rawGroupText = getRawNodeText(group);
-        const rawContentText = getRawNodeText(contentEl);
+        const rawContentText = contentEl === group
+            ? rawGroupText
+            : getRawNodeText(contentEl);
 
-        /* 최신 턴은 아직 스트리밍 중이거나 content-visibility가 걸려
-         * 내부 후보 노드의 textContent가 비어 있을 수 있다.
+        /* 최신 턴은 아직 스트리밍 중이거나 내부 후보 노드가 비어 있을 수 있다.
          * 이때 해당 턴을 통째로 버리지 말고 메시지 그룹 전체 텍스트로 복구한다. */
         let text = cleanContextLine(rawContentText);
-        if (isBadContextLine(text)) {
+        if (isBadContextLine(text) && contentEl !== group) {
             text = cleanContextLine(rawGroupText);
         }
         if (isBadContextLine(text)) return null;
 
-        const input = findChatInput();
-        const inputTop = input ? input.getBoundingClientRect().top : window.innerHeight;
+        const baseTop = Number.isFinite(inputTop) ? inputTop : getInputTop();
         const rect = group.getBoundingClientRect();
         const rawId = group.getAttribute('data-message-group-id') || '';
 
@@ -862,50 +843,42 @@
             top: Number.isFinite(rect.top) ? rect.top : index,
             bottom: Number.isFinite(rect.bottom) ? rect.bottom : index,
             distanceToInput: Number.isFinite(rect.bottom)
-                ? Math.abs(inputTop - rect.bottom)
+                ? Math.abs(baseTop - rect.bottom)
                 : Number.POSITIVE_INFINITY,
             domIndex: index,
             nearInput: true
         });
     }
 
-    function collectVisibleChatLines() {
-        const newestFirstGroups = getLiveMessageGroupsNewestFirst();
-        let entries = newestFirstGroups
-            .map((group, index) => recordFromMessageGroup(group, index))
-            .filter(Boolean);
+    /* 최신 메시지부터 필요한 만큼만 읽는다.
+     * turnCount개의 턴과 minRecords개의 메시지를 모으면 즉시 멈춘다. */
+    function scanRecentRecords(turnCount, minRecords) {
+        const wantTurns = clamp(parseInt(turnCount, 10) || 6, 1, CTX_MAX_TURNS);
+        const wantRecords = Math.max(1, parseInt(minRecords, 10) || 1);
+        const inputTop = getInputTop();
+        const groups = getLiveMessageGroupsNewestFirst(inputTop);
+        const cap = Math.min(groups.length, wantTurns * 4 + 12);
+        const records = [];
+        const seenTurns = new Set();
 
-        if (!entries.length) {
-            entries = Array.from(document.querySelectorAll('.wrtn-markdown'))
-                .filter(el => !el.closest('#' + PANEL_ID))
-                .map((el, index) => {
-                    const text = cleanContextLine(getRawNodeText(el));
-                    if (isBadContextLine(text)) return null;
-                    const rect = el.getBoundingClientRect();
-                    return normalizeContextRecord({
-                        id: 'markdown-' + hashContextId(text),
-                        text,
-                        turnNumber: extractTurnNumber(
-                            el.closest('[data-message-group-id]')
-                                ? (el.closest('[data-message-group-id]').innerText || el.closest('[data-message-group-id]').textContent || '')
-                                : (el.parentElement ? (el.parentElement.innerText || el.parentElement.textContent || '') : text)
-                        ),
-                        role: detectMessageRole(el.parentElement || el, el),
-                        top: Number.isFinite(rect.top) ? rect.top : index,
-                        bottom: Number.isFinite(rect.bottom) ? rect.bottom : index,
-                        distanceToInput: Number.POSITIVE_INFINITY,
-                        domIndex: index,
-                        nearInput: true
-                    });
-                })
-                .filter(Boolean);
+        for (let i = 0; i < cap; i++) {
+            const record = recordFromMessageGroup(groups[i], i, inputTop);
+            if (!record) continue;
 
-            entries.sort(compareContextOrder);
-        } else {
-            /* getLiveMessageGroupsNewestFirst()는 최신→과거로 반환한다. */
-            entries.reverse();
+            records.push(record);
+
+            if (Number.isFinite(record.turnNumber)) {
+                seenTurns.add(record.turnNumber);
+            }
+
+            if (seenTurns.size >= wantTurns && records.length >= wantRecords) break;
         }
 
+        /* records는 최신→과거 순서 */
+        return { groups, records, inputTop };
+    }
+
+    function inferMissingRoles(entries) {
         const hasKnownRole = entries.some(item => item.role !== 'unknown');
         if (!hasKnownRole && entries.length) {
             let role = 'assistant';
@@ -913,22 +886,58 @@
                 entries[i].role = role;
                 role = role === 'assistant' ? 'user' : 'assistant';
             }
-        } else {
-            for (let i = entries.length - 1; i >= 0; i--) {
-                if (entries[i].role !== 'unknown') continue;
-                const next = i + 1 < entries.length ? entries[i + 1].role : 'unknown';
-                if (next === 'assistant') entries[i].role = 'user';
-                else if (next === 'user') entries[i].role = 'assistant';
-            }
-            for (let i = 0; i < entries.length; i++) {
-                if (entries[i].role !== 'unknown') continue;
-                const prev = i > 0 ? entries[i - 1].role : 'unknown';
-                if (prev === 'assistant') entries[i].role = 'user';
-                else if (prev === 'user') entries[i].role = 'assistant';
-            }
+            return entries;
+        }
+
+        for (let i = entries.length - 1; i >= 0; i--) {
+            if (entries[i].role !== 'unknown') continue;
+            const next = i + 1 < entries.length ? entries[i + 1].role : 'unknown';
+            if (next === 'assistant') entries[i].role = 'user';
+            else if (next === 'user') entries[i].role = 'assistant';
+        }
+        for (let i = 0; i < entries.length; i++) {
+            if (entries[i].role !== 'unknown') continue;
+            const prev = i > 0 ? entries[i - 1].role : 'unknown';
+            if (prev === 'assistant') entries[i].role = 'user';
+            else if (prev === 'user') entries[i].role = 'assistant';
         }
 
         return entries;
+    }
+
+    /* 메시지 그룹 구조를 못 찾았을 때만 쓰는 보조 경로.
+     * .wrtn-markdown 노드를 양 끝 일부만 읽어 과거→최신으로 정렬한다. */
+    function collectVisibleChatLines() {
+        const panelSelector = '#' + PANEL_ID;
+        const nodes = document.querySelectorAll('.wrtn-markdown');
+
+        const entries = sampleIndexes(nodes.length, 30)
+            .map(index => {
+                const el = nodes[index];
+                if (!el || el.closest(panelSelector)) return null;
+
+                const text = cleanContextLine(getRawNodeText(el));
+                if (isBadContextLine(text)) return null;
+
+                const owner = el.closest('[data-message-group-id]') || el.parentElement;
+                const rect = el.getBoundingClientRect();
+
+                return normalizeContextRecord({
+                    id: 'markdown-' + hashContextId(text),
+                    text,
+                    turnNumber: extractTurnNumber(owner ? getRawNodeText(owner) : text),
+                    role: detectMessageRole(el.parentElement || el, el),
+                    top: Number.isFinite(rect.top) ? rect.top : index,
+                    bottom: Number.isFinite(rect.bottom) ? rect.bottom : index,
+                    distanceToInput: Number.POSITIVE_INFINITY,
+                    domIndex: index,
+                    nearInput: true
+                });
+            })
+            .filter(Boolean);
+
+        entries.sort(compareContextOrder);
+        return inferMissingRoles(entries);
     }
 
     function getStoryId() {
@@ -986,19 +995,38 @@
             merged.push(text);
         }
 
-        GM_setValue(key, merged.slice(-12));
+        const next = merged.slice(-STORY_BOOTSTRAP_LIMIT);
+        const changed =
+            next.length !== old.length ||
+            next.some((text, index) => text !== old[index]);
+
+        /* 내용이 바뀌었을 때만 저장소에 쓴다. */
+        if (changed) GM_setValue(key, next);
+    }
+
+    /* 채팅 턴이 하나라도 있는지 양 끝 일부만 보고 판단한다. */
+    function hasAnyChatTurn() {
+        const groups = document.querySelectorAll('[data-message-group-id]');
+        if (!groups.length) return false;
+
+        for (const index of sampleIndexes(groups.length, 6)) {
+            if (Number.isFinite(extractTurnNumber(getRawNodeText(groups[index])))) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     function collectStoryBootstrap() {
-        const panel = document.getElementById(PANEL_ID);
-        const found = [];
+        if (!getStoryId()) return [];
 
         /* 채팅 턴이 이미 존재하면 시작 카드 수집을 중단한다.
          * 사이드바의 채팅방 설정/유저 노트 같은 UI가 시작 상황으로 섞이는 것을 막는다. */
-        const hasChatTurn = Array.from(document.querySelectorAll('[data-message-group-id]'))
-            .some(group => Number.isFinite(extractTurnNumber(getRawNodeText(group))));
+        if (hasAnyChatTurn()) return getStoryBootstrap();
 
-        if (hasChatTurn) return getStoryBootstrap();
+        const panel = document.getElementById(PANEL_ID);
+        const found = [];
 
         const selectors = [
             '#story-detail-scroll .wrtn-markdown',
@@ -1034,44 +1062,87 @@
         return getStoryBootstrap();
     }
 
-    function getRecentContextRecords(maxN) {
-        const n = clamp(parseInt(maxN, 10) || 6, 1, 30);
-        const liveGroups = getLiveMessageGroupsNewestFirst();
-        const newestFirst = liveGroups
-            .map((group, index) => recordFromMessageGroup(group, index))
-            .filter(Boolean);
+    /* 첫 턴 전(프롤로그만 있는 상태)에만 가볍게 지켜보고,
+     * 채팅 턴이 생기면 즉시 감시를 끈다. 긴 채팅에서는 아예 돌지 않는다. */
+    function stopBootstrapWatch() {
+        if (bootstrapObserver) {
+            bootstrapObserver.disconnect();
+            bootstrapObserver = null;
+        }
+        if (bootstrapTimer) {
+            clearTimeout(bootstrapTimer);
+            bootstrapTimer = null;
+        }
+    }
 
-        if (newestFirst.length) {
-            /* 설정값은 메시지 개수가 아니라 실제 턴 개수다.
-             * 최신 턴부터 세어 n개 턴이 포함될 때까지 유저 메시지도 함께 담는다. */
-            const picked = [];
-            const seenTurns = new Set();
+    function watchStoryBootstrap() {
+        stopBootstrapWatch();
 
-            for (const item of newestFirst) {
-                picked.push(item);
+        if (!getStoryId() || hasAnyChatTurn()) return;
 
-                if (Number.isFinite(item.turnNumber)) {
-                    seenTurns.add(item.turnNumber);
-                    if (seenTurns.size >= n) break;
+        collectStoryBootstrap();
+
+        bootstrapObserver = new MutationObserver(() => {
+            if (bootstrapTimer) return;
+
+            bootstrapTimer = setTimeout(() => {
+                bootstrapTimer = null;
+
+                if (!getStoryId() || hasAnyChatTurn()) {
+                    stopBootstrapWatch();
+                    return;
                 }
+
+                collectStoryBootstrap();
+            }, 1500);
+        });
+
+        bootstrapObserver.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+    }
+
+    function deriveContextRecords(newestFirst, maxN) {
+        const n = clamp(parseInt(maxN, 10) || 6, 1, CTX_MAX_TURNS);
+        const picked = [];
+        const seenTurns = new Set();
+
+        /* 설정값은 메시지 개수가 아니라 실제 턴 개수다.
+         * 최신 턴부터 세어 n개 턴이 포함될 때까지 유저 메시지도 함께 담는다. */
+        for (const item of newestFirst) {
+            picked.push(item);
+
+            if (Number.isFinite(item.turnNumber)) {
+                seenTurns.add(item.turnNumber);
+                if (seenTurns.size >= n) break;
             }
+        }
 
-            /* 번호가 없는 구조에서는 기존처럼 메시지 n개를 사용한다. */
-            const recentNewestFirst = seenTurns.size
-                ? picked
-                : newestFirst.slice(0, n);
+        /* 번호가 없는 구조에서는 메시지 n개를 사용한다. */
+        const recentNewestFirst = seenTurns.size
+            ? picked
+            : newestFirst.slice(0, n);
 
-            const recent = recentNewestFirst.reverse();
+        return recentNewestFirst.slice().reverse();
+    }
+
+    function getRecentContextRecords(maxN, scan) {
+        const n = clamp(parseInt(maxN, 10) || 6, 1, CTX_MAX_TURNS);
+        const result = scan || scanRecentRecords(n, 3);
+
+        if (result.records.length) {
+            const recent = deriveContextRecords(result.records, n);
             rememberCtxLines(recent);
             return recent;
         }
 
-        /* 화면 DOM을 못 잡았을 때만 과거→최신 캐시의 마지막 n개를 사용한다. */
+        /* 화면 DOM을 못 잡았을 때만 저장된 최근 맥락을 사용한다. */
         return getCtxCache().slice(-n);
     }
 
-    function getUnifiedContext(maxN) {
-        const records = getRecentContextRecords(maxN);
+    function getUnifiedContext(maxN, scan) {
+        const records = getRecentContextRecords(maxN, scan);
         const hasNumberedChat = records.some(item => Number.isFinite(item.turnNumber));
         const recent = records.map(item => formatContextMessage(item.role, item.text));
 
@@ -1085,31 +1156,16 @@
         return [...story, ...recent];
     }
 
-    function collectChatContext(maxN) {
-        return getUnifiedContext(maxN);
+    function collectChatContext(maxN, scan) {
+        return getUnifiedContext(maxN, scan);
     }
 
-    /* 실제 크랙 DOM의 첫 번째 메시지 그룹이 최신 상대 캐릭터 턴이다. */
-    function collectNewestDomMessageRecord() {
-        const groups = getLiveMessageGroupsNewestFirst();
-
-        for (let index = 0; index < groups.length; index++) {
-            const record = recordFromMessageGroup(groups[index], index);
-            if (record) return record;
-        }
-
-        return null;
-    }
-
-    function collectLatestSceneSnapshot() {
-        const liveGroups = getLiveMessageGroupsNewestFirst();
-        const newestFirst = liveGroups
-            .map((group, index) => recordFromMessageGroup(group, index))
-            .filter(Boolean);
+    function collectLatestSceneSnapshot(scan) {
+        const result = scan || scanRecentRecords(1, 3);
+        const newestFirst = result.records;
 
         /* DOM 첫 항목을 무조건 믿지 않는다.
-         * 가상 스크롤·스트리밍 때문에 첫 유효 레코드가 과거 턴일 수 있으므로
-         * 감지된 레코드 전체에서 가장 큰 턴 번호를 직전 턴으로 고정한다. */
+         * 읽은 레코드 중 가장 큰 턴 번호를 직전 턴으로 고정한다. */
         const directLatest = pickLatestContextRecord(newestFirst);
 
         if (directLatest) {
@@ -1283,58 +1339,844 @@
         return normalized.join('\n\n');
     }
 
-    function findChatRoot() {
-        const firstGroup = document.querySelector('[data-message-group-id]');
-
-        if (firstGroup) {
-            let root = firstGroup.parentElement;
-
-            for (let i = 0; root && root !== document.body && i < 8; i++) {
-                if (root.querySelectorAll('[data-message-group-id]').length >= 2) {
-                    return root;
-                }
-
-                root = root.parentElement;
-            }
-
-            return firstGroup.parentElement;
-        }
-
-        const markdown = Array.from(
-            document.querySelectorAll('.wrtn-markdown')
-        ).find(el => !el.closest('#' + PANEL_ID));
-
-        if (markdown) return markdown.parentElement;
-
-        return document.querySelector('main');
+    /* =========================
+     * 크랙 서버에서 대화 불러오기 (정확한 턴 수, 최신부터 역순)
+     * ========================= */
+    function getCrackChatId() {
+        const match = (location.pathname || '').match(/\/episodes\/([A-Za-z0-9_-]+)/);
+        return match ? match[1] : '';
     }
 
-    function attachContextObserver() {
-        if (contextObserver) {
-            contextObserver.disconnect();
-            contextObserver = null;
+    function getCrackToken() {
+        const match = String(document.cookie || '').match(/(?:^|;\s*)access_token=([^;]+)/);
+        return match ? match[1] : '';
+    }
+
+    function crackApiGet(path) {
+        const token = getCrackToken();
+        const chatId = getCrackChatId();
+
+        if (!token || !chatId) {
+            return Promise.reject(new Error('크랙 로그인 정보나 채팅방 주소를 찾지 못했어요.'));
         }
 
-        const root = findChatRoot();
-        if (!root) return;
+        const url = CRACK_API_BASE + '/' + encodeURIComponent(chatId) + path;
+        const headers = {
+            Authorization: 'Bearer ' + token,
+            'Content-Type': 'application/json'
+        };
 
-        contextObserver = new MutationObserver(() => {
-            if (contextScanTimer) clearTimeout(contextScanTimer);
+        /* 페이지 fetch가 막히는 환경(일부 모바일 확장)에서는 GM 요청으로 한 번 더 시도한다. */
+        const viaGM = () => new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                reject(new Error('크랙 서버에 연결하지 못했어요.'));
+                return;
+            }
 
-            contextScanTimer = setTimeout(() => {
-                rememberCtxLines(collectVisibleChatLines());
-                collectStoryBootstrap();
-            }, 1000);
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                headers,
+                timeout: 20000,
+                onload(response) {
+                    if (response.status < 200 || response.status >= 300) {
+                        reject(new Error('크랙 서버 오류 (' + response.status + ')'));
+                        return;
+                    }
+                    try {
+                        resolve(JSON.parse(response.responseText || '{}'));
+                    } catch (_) {
+                        reject(new Error('크랙 서버 응답을 읽지 못했어요.'));
+                    }
+                },
+                onerror() {
+                    reject(new Error('크랙 서버 네트워크 오류예요.'));
+                },
+                ontimeout() {
+                    reject(new Error('크랙 서버 응답 시간이 초과됐어요.'));
+                }
+            });
         });
 
-        contextObserver.observe(root, {
-            childList: true,
-            subtree: true,
-            characterData: true
+        if (typeof fetch !== 'function') return viaGM();
+
+        return fetch(url, { method: 'GET', headers })
+            .then(async response => {
+                const raw = await response.text();
+                if (!response.ok) {
+                    const error = new Error('크랙 서버 오류 (' + response.status + ')');
+                    error.httpStatus = response.status;
+                    throw error;
+                }
+                return raw ? JSON.parse(raw) : {};
+            })
+            .catch(error => {
+                if (error && error.httpStatus) throw error;
+                return viaGM();
+            });
+    }
+
+    function crackMessageId(message) {
+        return String((message && (message.id || message._id || message.messageId)) || '');
+    }
+
+    function crackMessageTime(message) {
+        const raw = message && (
+            message.createdAt || message.created_at || message.timestamp || message.sentAt
+        ) || '';
+        const value = Date.parse(raw);
+        return Number.isFinite(value) ? value : 0;
+    }
+
+    function crackRole(message) {
+        const role = String(message && message.role || '').toLowerCase();
+        if (role === 'user' || role === 'human') return 'user';
+        if (role === 'system') return 'system';
+        return 'assistant';
+    }
+
+    function dedupeCrackMessages(list) {
+        const out = [];
+        const seen = new Set();
+
+        for (const message of list) {
+            if (!message) continue;
+            const key = crackMessageId(message) || [
+                message.role || '',
+                message.createdAt || message.created_at || '',
+                String(message.content || '').slice(0, 200)
+            ].join('::');
+
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push(message);
+        }
+
+        return out;
+    }
+
+    /* 크랙 API는 최신 → 과거 순으로 준다. 시간 정보가 충분하면 시간순으로,
+     * 아니면 받은 순서를 뒤집어 과거 → 최신으로 맞춘다. */
+    function orderCrackMessages(list) {
+        const unique = dedupeCrackMessages(list);
+        const timed = unique.filter(message => crackMessageTime(message) > 0).length;
+
+        if (timed >= Math.max(2, Math.floor(unique.length * 0.6))) {
+            return unique
+                .map((message, index) => ({ message, index }))
+                .sort((a, b) =>
+                    (crackMessageTime(a.message) - crackMessageTime(b.message)) ||
+                    (b.index - a.index)
+                )
+                .map(item => item.message);
+        }
+
+        return unique.reverse();
+    }
+
+    /* 최신 페이지부터 거꾸로 넘기며 필요한 만큼만 가져온다.
+     * turns: 필요한 유저 턴 수(0 = 전체), stopAtId: 이 메시지를 만나면 멈춤. */
+    async function fetchCrackMessages(options) {
+        const wantTurns = Math.max(0, parseInt(options && options.turns, 10) || 0);
+        const stopAtId = String(options && options.stopAtId || '');
+        const all = [];
+        let cursor = null;
+
+        for (let page = 0; page < 400; page++) {
+            let path = '/messages?limit=50';
+            if (cursor) path += '&cursor=' + encodeURIComponent(cursor);
+
+            const response = await crackApiGet(path);
+            const data = response && response.data;
+            const list = data && Array.isArray(data.messages) ? data.messages : [];
+            if (!list.length) break;
+
+            all.push(...list);
+
+            if (stopAtId && list.some(message => crackMessageId(message) === stopAtId)) break;
+
+            if (wantTurns > 0) {
+                const users = dedupeCrackMessages(all)
+                    .filter(message => crackRole(message) === 'user').length;
+                /* 요청 턴보다 하나 더 모이면 멈춘다.
+                 * 첫 턴 바로 앞의 캐릭터 메시지(상황)까지 확보하기 위해서다. */
+                if (users > wantTurns) break;
+            }
+
+            if (data.hasNext && data.nextCursor) cursor = data.nextCursor;
+            else break;
+        }
+
+        return orderCrackMessages(all).filter(message => crackRole(message) !== 'system');
+    }
+
+    function crackMessagesToRecords(messages) {
+        const records = [];
+
+        messages.forEach((message, index) => {
+            const raw = String(message.content || message.text || message.message || '');
+            const record = normalizeContextRecord({
+                id: crackMessageId(message) || ('api-' + hashContextId(raw + '|' + index)),
+                role: crackRole(message),
+                text: raw.length > 11000 ? raw.slice(-11000) : raw,
+                turnNumber: extractTurnNumber(raw),
+                domIndex: index,
+                nearInput: true
+            });
+            if (record) records.push(record);
         });
 
-        rememberCtxLines(collectVisibleChatLines());
-        collectStoryBootstrap();
+        return records;
+    }
+
+    /* 과거→최신 목록에서 마지막 유저 메시지 N개(=N턴)를 정확히 자른다.
+     * 첫 턴 바로 앞이 캐릭터 메시지면 상황 파악용으로 함께 넣는다. */
+    function sliceLatestTurns(records, turns) {
+        if (!turns) return records.slice();
+
+        let found = 0;
+        let start = 0;
+
+        for (let i = records.length - 1; i >= 0; i--) {
+            if (records[i].role === 'user') {
+                found++;
+                if (found === turns) {
+                    start = i;
+                    break;
+                }
+            }
+        }
+
+        if (found < turns) start = 0;
+        if (start > 0 && records[start - 1].role !== 'user') start--;
+        return records.slice(start);
+    }
+
+    function countRecordTurns(records) {
+        const users = records.filter(item => item.role === 'user').length;
+        if (users) return users;
+        const numbered = new Set(
+            records.map(item => item.turnNumber).filter(Number.isFinite)
+        ).size;
+        return numbered || Math.ceil(records.length / 2);
+    }
+
+    /* 미리보기용 라벨: 최신 턴부터 거꾸로 센다. */
+    function turnAgoLabels(records) {
+        const labels = new Array(records.length).fill('');
+        const totalUsers = records.filter(item => item.role === 'user').length;
+        let turn = 1;
+
+        for (let i = records.length - 1; i >= 0; i--) {
+            const item = records[i];
+            if (Number.isFinite(item.turnNumber)) labels[i] = '턴 ' + item.turnNumber;
+            else if (!totalUsers) labels[i] = '';
+            else if (turn > totalUsers) labels[i] = '앞 장면';
+            else labels[i] = '최근 ' + turn + '번째 턴';
+
+            if (item.role === 'user') turn++;
+        }
+
+        return labels;
+    }
+
+    function snapshotFromRecords(records, sourceLabel) {
+        for (let i = records.length - 1; i >= 0; i--) {
+            if (records[i].role !== 'assistant') continue;
+
+            const latest = records[i];
+            return {
+                text: latest.text,
+                nearby: records
+                    .slice(Math.max(0, i - 2), i + 1)
+                    .map(item => formatContextMessage(item.role, item.text))
+                    .join('\n\n'),
+                source: sourceLabel +
+                    (Number.isFinite(latest.turnNumber) ? ' · 턴 ' + latest.turnNumber : ''),
+                role: 'assistant',
+                id: latest.id,
+                turnNumber: latest.turnNumber
+            };
+        }
+
+        return null;
+    }
+
+    /* 문장 부풀리기 / 미리보기 / 페르소나 추천이 함께 쓰는 대화 불러오기.
+     * 1순위 크랙 서버(정확한 턴 수), 실패하면 화면 읽기. */
+    async function loadRecentChat(turnCount) {
+        const n = clamp(parseInt(turnCount, 10) || 6, 1, CTX_MAX_TURNS);
+        let apiError = '';
+
+        if (getCrackChatId() && getCrackToken()) {
+            try {
+                const ordered = await fetchCrackMessages({ turns: n });
+                const records = sliceLatestTurns(crackMessagesToRecords(ordered), n);
+                const snapshot = snapshotFromRecords(records, '크랙 서버의 최신 캐릭터 메시지');
+
+                if (records.length && snapshot) {
+                    return {
+                        source: 'api',
+                        requested: n,
+                        actualTurns: records.filter(item => item.role === 'user').length,
+                        records,
+                        context: records.map(item => formatContextMessage(item.role, item.text)),
+                        snapshot
+                    };
+                }
+
+                apiError = '서버에 캐릭터 메시지가 없음';
+            } catch (error) {
+                apiError = error && error.message ? error.message : String(error);
+            }
+        } else {
+            apiError = '크랙 로그인 정보나 채팅방 주소를 찾지 못함';
+        }
+
+        const scan = scanRecentRecords(n, 3);
+        const records = getRecentContextRecords(n, scan);
+        const context = getUnifiedContext(n, scan);
+        const snapshot = collectLatestSceneSnapshot(scan);
+        const numberedTurns = new Set(
+            records.map(item => item.turnNumber).filter(Number.isFinite)
+        ).size;
+
+        return {
+            source: 'dom',
+            requested: n,
+            actualTurns: numberedTurns || records.filter(item => item.role === 'user').length,
+            records,
+            context,
+            snapshot,
+            apiError,
+            scan
+        };
+    }
+
+    /* =========================
+     * 장기기억 (채팅방별)
+     * - relationships: 관계와 최근 변화
+     * - userState: 내 캐릭터의 현재 상태(페르소나와 달라진 점)
+     * - todos: 해야 할 일 (시킨 사람, 기한, 완료 여부)
+     * - events: 있었던 일
+     * ========================= */
+    function getMemoryKey() {
+        return K_MEM_BASE + '::' + (getCrackChatId() || getCurrentRoomKey());
+    }
+
+    function cleanMemText(value, max) {
+        return String(value == null ? '' : value)
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, max || 300);
+    }
+
+    function memKey(value) {
+        return String(value || '').replace(/[\s.,!?·~'"“”‘’()\[\]-]+/g, '').toLowerCase();
+    }
+
+    function emptyMemory() {
+        return {
+            v: 1,
+            updatedAt: '',
+            lastMessageId: '',
+            processedTurns: 0,
+            relationships: [],
+            userState: [],
+            todos: [],
+            events: []
+        };
+    }
+
+    function sanitizeMemory(raw) {
+        const mem = emptyMemory();
+        if (!raw || typeof raw !== 'object') return mem;
+
+        mem.updatedAt = cleanMemText(raw.updatedAt, 60);
+        mem.lastMessageId = String(raw.lastMessageId || '');
+        mem.processedTurns = Math.max(0, parseInt(raw.processedTurns, 10) || 0);
+
+        const relationships = new Map();
+        (Array.isArray(raw.relationships) ? raw.relationships : []).forEach(item => {
+            if (!item || typeof item !== 'object') return;
+            const name = cleanMemText(item.name, 40);
+            if (!name) return;
+            relationships.delete(memKey(name));
+            relationships.set(memKey(name), {
+                name,
+                relation: cleanMemText(item.relation, 120),
+                change: cleanMemText(item.change, 200)
+            });
+        });
+        mem.relationships = Array.from(relationships.values()).slice(-MEM_LIMITS.relationships);
+
+        const states = [];
+        const stateKeys = new Set();
+        (Array.isArray(raw.userState) ? raw.userState : []).forEach(item => {
+            const text = cleanMemText(
+                typeof item === 'string' ? item : item && item.text,
+                200
+            );
+            if (!text || stateKeys.has(memKey(text))) return;
+            stateKeys.add(memKey(text));
+            states.push(text);
+        });
+        mem.userState = states.slice(-MEM_LIMITS.userState);
+
+        const todos = new Map();
+        (Array.isArray(raw.todos) ? raw.todos : []).forEach(item => {
+            if (!item) return;
+            const isText = typeof item === 'string';
+            const text = cleanMemText(isText ? item : item.text, 200);
+            if (!text) return;
+            todos.set(memKey(text), {
+                text,
+                from: isText ? '' : cleanMemText(item.from, 40),
+                due: isText ? '' : cleanMemText(item.due, 60),
+                done: isText ? false : !!item.done
+            });
+        });
+        const todoList = Array.from(todos.values());
+        const openTodos = todoList.filter(item => !item.done).slice(-MEM_LIMITS.todosOpen);
+        const doneTodos = todoList.filter(item => item.done).slice(-MEM_LIMITS.todosDone);
+        const keep = new Set([...openTodos, ...doneTodos]);
+        mem.todos = todoList.filter(item => keep.has(item));
+
+        mem.events = (Array.isArray(raw.events) ? raw.events : [])
+            .map(item => item && typeof item === 'object'
+                ? {
+                    title: cleanMemText(item.title, 40),
+                    summary: cleanMemText(item.summary, 400)
+                }
+                : null)
+            .filter(item => item && (item.title || item.summary))
+            .slice(-MEM_LIMITS.events);
+
+        return mem;
+    }
+
+    function getMemory() {
+        return sanitizeMemory(GM_getValue(getMemoryKey(), null));
+    }
+
+    function saveMemory(mem) {
+        GM_setValue(getMemoryKey(), sanitizeMemory(mem));
+    }
+
+    function clearMemory() {
+        if (typeof GM_deleteValue === 'function') {
+            try {
+                GM_deleteValue(getMemoryKey());
+                return;
+            } catch (_) {}
+        }
+        GM_setValue(getMemoryKey(), emptyMemory());
+    }
+
+    function pickMemoryEvents(events, sceneText) {
+        const list = Array.isArray(events) ? events : [];
+        if (list.length <= MEM_PROMPT_RECENT_EVENTS) return list.slice();
+
+        const recentStart = list.length - MEM_PROMPT_RECENT_EVENTS;
+        const keywords = extractSceneKeywords(sceneText);
+        const related = [];
+
+        if (keywords.length) {
+            for (let i = 0; i < recentStart; i++) {
+                const haystack = list[i].title + ' ' + list[i].summary;
+                const hits = keywords.filter(word => haystack.includes(word)).length;
+                if (hits) related.push({ index: i, hits });
+            }
+        }
+
+        const picked = related
+            .sort((a, b) => (b.hits - a.hits) || (b.index - a.index))
+            .slice(0, MEM_PROMPT_RELATED_EVENTS)
+            .map(item => item.index)
+            .sort((a, b) => a - b);
+
+        return [...picked.map(index => list[index]), ...list.slice(recentStart)];
+    }
+
+    /* 프롬프트에 넣을 장기기억 블록. 오래된 사건은 지금 장면과 관련된 것만 골라 넣는다. */
+    function memoryToPrompt(mem, sceneText) {
+        if (!mem) return '';
+
+        const lines = [];
+
+        if (mem.relationships.length) {
+            lines.push('(현재 관계)');
+            mem.relationships.forEach(item => {
+                lines.push(
+                    '- ' + item.name + ': ' + (item.relation || '관계 미정') +
+                    (item.change ? ' / 최근 변화: ' + item.change : '')
+                );
+            });
+        }
+
+        if (mem.userState.length) {
+            lines.push('(유저 캐릭터의 현재 상태 · 기본 페르소나보다 우선)');
+            mem.userState.forEach(item => lines.push('- ' + item));
+        }
+
+        const openTodos = mem.todos.filter(item => !item.done);
+        if (openTodos.length) {
+            lines.push('(유저 캐릭터가 아직 하지 않은 할 일)');
+            openTodos.forEach(item => {
+                lines.push(
+                    '- ' + item.text +
+                    (item.from ? ' (시킨 사람: ' + item.from + ')' : '') +
+                    (item.due ? ' (기한: ' + item.due + ')' : '')
+                );
+            });
+        }
+
+        const events = pickMemoryEvents(mem.events, sceneText);
+        if (events.length) {
+            lines.push('(있었던 일 · 위가 과거, 아래가 최근)');
+            events.forEach(item => {
+                lines.push('- ' + (item.title ? '[' + item.title + '] ' : '') + item.summary);
+            });
+        }
+
+        return lines.join('\n');
+    }
+
+    function buildMemoryPrompt(mem, chunkRecords, chunkIndex, chunkTotal) {
+        const name = String(GM_getValue(K_NAME, '') || '').trim();
+        const persona = getActivePersona();
+
+        const system = [
+            '너는 롤플레이 캐릭터 채팅의 장기기억 정리 담당이다.',
+            '[기존 기억]과 [새 대화 로그]를 읽고, 유저 캐릭터 입장에서 기억을 갱신한 JSON 하나만 출력한다.',
+            '',
+            '[누가 유저인가]',
+            '- [유저] 메시지는 유저 캐릭터' + (name ? '(이름: ' + name + ')' : '') + '의 말과 행동이다.',
+            '- [캐릭터] 메시지는 상대 캐릭터·NPC·내레이터의 출력이다.',
+            persona ? '- 유저 캐릭터 기본 설정:\n' + persona.slice(0, 1500) : '',
+            '',
+            '[relationships] 유저 캐릭터와 다른 인물의 현재 관계 전체 목록',
+            '- name: 인물 이름. 기존 인물은 이름을 글자 그대로 유지한다.',
+            '- relation: 지금 시점의 관계를 짧게 현재형으로. 예: "조금 의지하기 시작한 직장 상사"',
+            '- change: 가장 최근 관계 변화와 그 계기 한 줄. 이번 로그에 변화가 없으면 기존 값을 그대로 둔다.',
+            '- 로그에 근거한 변화만 반영한다. 새 인물은 유저와 의미 있는 상호작용이 있을 때만 추가한다.',
+            '',
+            '[userState] 유저 캐릭터의 현재 상태 중 기본 설정과 달라졌거나 새로 생긴 사실',
+            '- 부상, 소지품, 직책, 거처, 소속, 외모 변화, 알게 된 비밀, 남에게 숨기고 있는 것 등. 각 1문장.',
+            '- 해소되었거나 더 이상 사실이 아닌 상태는 목록에서 뺀다.',
+            '',
+            '[todos] 유저 캐릭터가 해야 할 일',
+            '- 다른 인물의 지시·부탁·명령, 유저가 한 약속, 유저가 스스로 정한 목표를 모두 포함한다.',
+            '- text: 할 일 한 문장. 기존 할 일은 text를 글자 그대로 유지한다.',
+            '- from: 시킨 사람(스스로 정했으면 ""), due: 언급된 기한(없으면 "").',
+            '- done: 로그에서 완료가 확인되거나 취소·무효가 되면 true. 기존 할 일을 목록에서 빼지 말고 done으로 표시한다.',
+            '',
+            '[newEvents] 새 대화 로그 안에서 일어난 중요한 사건만 시간순으로 새로 작성',
+            '- 기존 기억에 이미 있는 사건은 다시 쓰지 않는다.',
+            '- 장소, 시간대, 주요 인물 구성이 바뀌면 사건을 나눈다.',
+            '- title: 공백 포함 20자 이내. 관련 인물명과 핵심 소재. 유저 이름은 빼고 조사는 피한다.',
+            '- summary: 200자 이내 요약체(~함). 행동 → 상대 반응 → 변화의 인과를 쓰고, 대명사 대신 이름을 쓴다.',
+            '- 결정적 약속, 거짓말, 숨긴 것, 받은 물건, 중요한 대사는 짧게 보존한다.',
+            '- 사소한 잡담은 생략한다. 로그에 없는 사실이나 의도를 만들지 않는다.',
+            '',
+            '[출력 형식 — 설명 없이 JSON만]',
+            '{"relationships":[{"name":"","relation":"","change":""}],' +
+                '"userState":[""],' +
+                '"todos":[{"text":"","from":"","due":"","done":false}],' +
+                '"newEvents":[{"title":"","summary":""}]}',
+            '- 모든 값은 한국어로 쓴다.'
+        ].filter(line => line !== null).join('\n');
+
+        const oldMemory = {
+            relationships: mem.relationships,
+            userState: mem.userState,
+            todos: mem.todos,
+            recentEvents: mem.events.slice(-8)
+        };
+
+        const log = chunkRecords.map(item => {
+            const label = item.role === 'user'
+                ? '유저'
+                : item.role === 'assistant'
+                    ? '캐릭터'
+                    : '역할 미확인';
+            return '[' + label + ']\n' + item.text;
+        }).join('\n\n');
+
+        const user = [
+            chunkTotal > 1 ? '[진행] 전체 ' + chunkTotal + '구간 중 ' + chunkIndex + '번째 구간' : '',
+            '[기존 기억]',
+            JSON.stringify(oldMemory, null, 1),
+            '',
+            '[새 대화 로그 — 위가 과거, 아래가 최신]',
+            log,
+            '',
+            '새 대화 로그를 반영해 갱신된 기억을 지정한 JSON 형식으로만 출력해.'
+        ].filter(Boolean).join('\n');
+
+        return { system, user };
+    }
+
+    function parseJsonLoose(text) {
+        const source = String(text || '')
+            .replace(/^\s*```(?:json)?\s*/i, '')
+            .replace(/\s*```\s*$/, '')
+            .trim();
+
+        try {
+            return JSON.parse(source);
+        } catch (_) {}
+
+        const start = source.indexOf('{');
+        const end = source.lastIndexOf('}');
+        if (start >= 0 && end > start) {
+            try {
+                return JSON.parse(source.slice(start, end + 1));
+            } catch (_) {}
+        }
+
+        throw new Error('기억 정리 결과(JSON)를 읽지 못했어요.');
+    }
+
+    /* 모델이 목록 일부를 빠뜨려도 기존 기억이 사라지지 않도록 합친다. */
+    function applyMemoryUpdate(memInput, out) {
+        const mem = sanitizeMemory(memInput);
+        if (!out || typeof out !== 'object') return mem;
+
+        if (Array.isArray(out.relationships)) {
+            const merged = new Map(mem.relationships.map(item => [memKey(item.name), item]));
+            sanitizeMemory({ relationships: out.relationships }).relationships.forEach(item => {
+                const key = memKey(item.name);
+                const old = merged.get(key);
+                merged.delete(key);
+                merged.set(key, {
+                    name: item.name,
+                    relation: item.relation || (old && old.relation) || '',
+                    change: item.change || (old && old.change) || ''
+                });
+            });
+            mem.relationships = Array.from(merged.values());
+        }
+
+        if (Array.isArray(out.userState)) {
+            const states = sanitizeMemory({ userState: out.userState }).userState;
+            if (states.length || !mem.userState.length) mem.userState = states;
+        }
+
+        if (Array.isArray(out.todos)) {
+            const merged = new Map(mem.todos.map(item => [memKey(item.text), item]));
+            sanitizeMemory({ todos: out.todos }).todos.forEach(item => {
+                const key = memKey(item.text);
+                const old = merged.get(key);
+                merged.set(key, {
+                    text: item.text,
+                    from: item.from || (old && old.from) || '',
+                    due: item.due || (old && old.due) || '',
+                    done: !!item.done
+                });
+            });
+            mem.todos = Array.from(merged.values());
+        }
+
+        const newEvents = Array.isArray(out.newEvents)
+            ? out.newEvents
+            : Array.isArray(out.events) ? out.events : [];
+        const recentKeys = new Set(mem.events.slice(-20).map(item => memKey(item.title + item.summary)));
+
+        sanitizeMemory({ events: newEvents }).events.forEach(item => {
+            const key = memKey(item.title + item.summary);
+            if (recentKeys.has(key)) return;
+            recentKeys.add(key);
+            mem.events.push(item);
+        });
+
+        return sanitizeMemory(mem);
+    }
+
+    function splitRecordsByTurns(records, maxTurns) {
+        const hasUsers = records.some(item => item.role === 'user');
+        const chunks = [];
+        let current = [];
+        let turns = 0;
+
+        for (const item of records) {
+            const startsTurn = hasUsers ? item.role === 'user' : current.length >= maxTurns * 2;
+            if (startsTurn && (hasUsers ? turns >= maxTurns : true) && current.length) {
+                chunks.push(current);
+                current = [];
+                turns = 0;
+            }
+            current.push(item);
+            if (item.role === 'user') turns++;
+        }
+
+        if (current.length) chunks.push(current);
+        return chunks;
+    }
+
+    async function loadMessagesForMemory(capTurns, stopAtId) {
+        if (getCrackChatId() && getCrackToken()) {
+            try {
+                const ordered = await fetchCrackMessages({ turns: capTurns, stopAtId });
+                const records = crackMessagesToRecords(ordered);
+                if (records.length) return { source: 'api', records };
+            } catch (_) {}
+        }
+
+        const turns = Math.min(capTurns || CTX_MAX_TURNS, CTX_MAX_TURNS);
+        const scan = scanRecentRecords(turns, 1);
+        return { source: 'dom', records: scan.records.slice().reverse() };
+    }
+
+    function requestGeminiAsync(system, user, label, options) {
+        return new Promise((resolve, reject) => {
+            requestGemini(
+                system,
+                user,
+                label,
+                (text, cost) => resolve({ text, cost }),
+                error => reject(new Error(error)),
+                options
+            );
+        });
+    }
+
+    /* mode: 'auto' | 'manual' | 'rebuild' */
+    async function runMemoryUpdate(mode, options, onProgress) {
+        if (memoryBusy) throw new Error('이미 기억을 정리하는 중이에요.');
+        memoryBusy = true;
+
+        try {
+            const roomKey = getMemoryKey();
+            let mem = mode === 'rebuild' ? emptyMemory() : getMemory();
+            const every = clamp(parseInt(GM_getValue(K_MEM_EVERY, 5), 10) || 5, 1, 50);
+            let records;
+
+            if (mode === 'rebuild') {
+                const turns = Math.max(0, parseInt(options && options.turns, 10) || 0);
+                const loaded = await loadMessagesForMemory(turns, '');
+                records = turns ? sliceLatestTurns(loaded.records, turns) : loaded.records;
+            } else {
+                const cap = mode === 'auto' ? MEM_AUTO_MAX_TURNS : MEM_MANUAL_MAX_TURNS;
+                const loaded = await loadMessagesForMemory(cap, mem.lastMessageId);
+                const all = loaded.records;
+                const lastIndex = mem.lastMessageId
+                    ? all.findIndex(item => item.id === mem.lastMessageId)
+                    : -1;
+
+                if (lastIndex >= 0) {
+                    records = all.slice(lastIndex + 1);
+                } else {
+                    records = sliceLatestTurns(all, mem.lastMessageId ? cap : MEM_FIRST_TURNS);
+                }
+
+                const pending = countRecordTurns(records);
+                if (!records.length || (mode === 'auto' && pending < every)) {
+                    return { skipped: true, pendingTurns: records.length ? pending : 0, mem };
+                }
+            }
+
+            if (!records.length) return { skipped: true, pendingTurns: 0, mem };
+
+            const chunks = splitRecordsByTurns(records, MEM_CHUNK_TURNS);
+            let lastCost = null;
+
+            for (let i = 0; i < chunks.length; i++) {
+                if (typeof onProgress === 'function') onProgress(i + 1, chunks.length);
+
+                const prompt = buildMemoryPrompt(mem, chunks[i], i + 1, chunks.length);
+                const result = await requestGeminiAsync(
+                    prompt.system,
+                    prompt.user,
+                    mode === 'rebuild' ? '장기기억 다시 만들기' : '장기기억 정리',
+                    { json: true }
+                );
+
+                /* 정리 도중 다른 채팅방으로 옮겼으면 엉뚱한 방에 저장하지 않는다. */
+                if (getMemoryKey() !== roomKey) {
+                    throw new Error('채팅방이 바뀌어서 정리를 멈췄어요.');
+                }
+
+                mem = applyMemoryUpdate(mem, parseJsonLoose(result.text));
+                mem.lastMessageId = chunks[i][chunks[i].length - 1].id;
+                mem.processedTurns += countRecordTurns(chunks[i]);
+                mem.updatedAt = new Date().toLocaleString('ko-KR');
+                saveMemory(mem);
+                lastCost = result.cost || lastCost;
+            }
+
+            return { skipped: false, chunks: chunks.length, mem, cost: lastCost };
+        } finally {
+            memoryBusy = false;
+        }
+    }
+
+    /* 직접 편집용 텍스트 형식 */
+    function memoryToEditText(mem) {
+        const lines = ['# 관계 (이름 | 지금 관계 | 최근 변화)'];
+        mem.relationships.forEach(item => {
+            lines.push('- ' + [item.name, item.relation, item.change].join(' | '));
+        });
+
+        lines.push('', '# 내 상태 (기본 설정과 달라진 점)');
+        mem.userState.forEach(item => lines.push('- ' + item));
+
+        lines.push('', '# 할 일 ([ ] 안 함 · [x] 완료 · 할 일 | 시킨 사람 | 기한)');
+        mem.todos.forEach(item => {
+            lines.push(
+                '- [' + (item.done ? 'x' : ' ') + '] ' +
+                [item.text, item.from, item.due].join(' | ').replace(/(\s\|\s)+$/, '')
+            );
+        });
+
+        lines.push('', '# 있었던 일 ([제목] 내용 · 위가 과거)');
+        mem.events.forEach(item => {
+            lines.push('- ' + (item.title ? '[' + item.title + '] ' : '') + item.summary);
+        });
+
+        return lines.join('\n');
+    }
+
+    function editTextToMemory(text, base) {
+        const mem = sanitizeMemory(base);
+        const out = { relationships: [], userState: [], todos: [], events: [] };
+        let section = '';
+
+        String(text || '').split('\n').forEach(rawLine => {
+            const line = rawLine.trim();
+            if (!line) return;
+
+            if (line.startsWith('#')) {
+                if (/관계/.test(line)) section = 'rel';
+                else if (/상태/.test(line)) section = 'state';
+                else if (/할\s*일/.test(line)) section = 'todo';
+                else if (/있었던|사건/.test(line)) section = 'event';
+                else section = '';
+                return;
+            }
+
+            const item = line.replace(/^[-*•]\s*/, '').trim();
+            if (!item) return;
+
+            if (section === 'rel') {
+                const [name, relation, change] = item.split('|').map(part => part.trim());
+                out.relationships.push({ name, relation, change });
+            } else if (section === 'state') {
+                out.userState.push(item);
+            } else if (section === 'todo') {
+                const match = item.match(/^\[\s*([xXvV✓✔])?\s*\]\s*(.*)$/);
+                const body = match ? match[2] : item;
+                const [todoText, from, due] = body.split('|').map(part => part.trim());
+                out.todos.push({ text: todoText, from, due, done: !!(match && match[1]) });
+            } else if (section === 'event') {
+                const match = item.match(/^\[([^\]]*)\]\s*(.*)$/);
+                out.events.push(match
+                    ? { title: match[1], summary: match[2] }
+                    : { title: '', summary: item });
+            }
+        });
+
+        return sanitizeMemory({ ...mem, ...out });
     }
 
     /* =========================
@@ -1372,7 +2214,7 @@
         };
     }
 
-    function buildPrompt(dialogue, action, context, latestSnapshot) {
+    function buildPrompt(dialogue, action, context, latestSnapshot, memoryBlock) {
         const pov = GM_getValue(K_POV, 'first');
         const name = String(GM_getValue(K_NAME, '') || '').trim();
         const length = GM_getValue(K_LENGTH, 'medium');
@@ -1400,6 +2242,18 @@
             lines.push('[문체 규칙]');
             lines.push(style);
             lines.push('- 위 문체 규칙을 적극 반영한다.');
+        }
+
+        if (memoryBlock) {
+            lines.push('');
+            lines.push('[장기기억 — 이 채팅방에서 자동 정리된 관계·현재 상태·할 일·있었던 일]');
+            lines.push(memoryBlock);
+            lines.push('- 우선순위: 최근 대화 > 장기기억의 현재 상태·관계 > 페르소나 기본 설정.');
+            lines.push('- 장기기억의 현재 상태·관계가 페르소나와 다르면 장기기억을 따른다.');
+            lines.push('- 지금 관계 단계에 맞는 거리감·호칭·말투로 반응한다. 가까워졌으면 그만큼 편하게, 틀어졌으면 그만큼 경계하거나 서먹하게.');
+            lines.push('- 유저 캐릭터의 현재 상태(부상, 소지품, 처지, 숨기는 것 등)를 행동과 내면 묘사에 자연스럽게 반영한다.');
+            lines.push('- 아직 하지 않은 할 일은 지금 장면과 관련 있을 때만 자연스럽게 떠올리거나 언급한다. 억지로 꺼내지 않는다.');
+            lines.push('- 있었던 일은 회상이나 감정의 근거로만 쓰고, 기록에 없는 과거 사건을 지어내지 않는다.');
         }
 
         let latestAssistant = String(
@@ -1570,10 +2424,11 @@
         return texts.join('\n\n---\n\n');
     }
 
-    function buildPersonaPrompt(keywords, storyDetail, recentContext) {
+    function buildPersonaPrompt(keywords, storyDetail, recentContext, memoryBlock) {
         const system = [
             '너는 롤플레이 캐릭터 채팅용 유저 캐릭터 페르소나를 만드는 설정 보조다.',
             '제작자 설정, 상세 설명, 프롤로그와 최근 상황을 읽고 세계관에 자연스럽게 맞는 유저 캐릭터를 만든다.',
+            '장기기억에 관계 변화나 현재 상태가 있으면 지금 시점 기준으로 반영한다.',
             '상대 캐릭터나 NPC의 설정과 반응을 대신 확정하지 않는다.',
             '한국어로 작성한다.',
             '',
@@ -1601,6 +2456,9 @@
             recentContext.length
                 ? recentContext.map(item => '· ' + item).join('\n')
                 : '(없음)',
+            '',
+            '[장기기억 — 관계·상태 변화]',
+            memoryBlock || '(없음)',
             '',
             '위 자료를 바탕으로 페르소나 칸에 바로 넣을 완성형 페르소나만 출력해줘.'
         ].join('\n');
@@ -1666,7 +2524,7 @@
         });
     }
 
-    function requestGemini(system, user, label, onDone, onError) {
+    function requestGemini(system, user, label, onDone, onError, options) {
         const apiKey = String(GM_getValue(K_APIKEY, '') || '').trim();
         const model = String(
             GM_getValue(K_MODEL, DEFAULT_MODELS[0].id) ||
@@ -1698,9 +2556,9 @@
                     role: 'user',
                     parts: [{ text: user }]
                 }],
-                generationConfig: {
-                    maxOutputTokens: 8192
-                }
+                generationConfig: options && options.json
+                    ? { maxOutputTokens: 8192, responseMimeType: 'application/json' }
+                    : { maxOutputTokens: 8192 }
             }),
             timeout: 60000,
             onload(response) {
@@ -2077,6 +2935,7 @@
             border-radius: 15px;
             box-shadow: 0 12px 40px rgba(0,0,0,.45);
             font-size: 13px;
+            contain: layout style;
         }
 
         #se-head {
@@ -2116,6 +2975,12 @@
             padding: 10px;
             overflow-y: auto;
             -webkit-overflow-scrolling: touch;
+        }
+
+        /* 설정 칸이 많아도 서로 찌그러지지 않고 스크롤되게 한다. */
+        #se-body > *,
+        #se-settings > * {
+            flex-shrink: 0;
         }
 
         #se-settings {
@@ -2228,6 +3093,8 @@
         #se-fetch-status,
         #se-persona-status,
         #se-ctx-status,
+        #se-mem-meta,
+        #se-mem-status,
         #se-sync-status {
             min-height: 15px;
             color: #9da2b6;
@@ -2464,6 +3331,97 @@
             min-height: 70px !important;
         }
 
+        #se-mem-chip {
+            width: 100%;
+            min-height: 30px;
+            padding: 6px 9px;
+            border: 1px solid rgba(95,208,195,.35);
+            border-radius: 9px;
+            background: rgba(95,208,195,.08);
+            color: #dff7f3;
+            font-size: 11px;
+            font-weight: 700;
+            text-align: left;
+            cursor: pointer;
+        }
+
+        #se-mem-chip.busy {
+            border-color: rgba(200,166,255,.55);
+            background: rgba(200,166,255,.10);
+            color: #efe6ff;
+        }
+
+        #se-mem-chip.err {
+            border-color: rgba(255,146,146,.5);
+            background: rgba(255,146,146,.08);
+        }
+
+        #se-mem-view {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .se-mem-group {
+            padding: 7px 8px;
+            border: 1px solid #363b4d;
+            border-radius: 9px;
+            background: #181a21;
+            font-size: 11.5px;
+            line-height: 1.5;
+        }
+
+        .se-mem-group-title {
+            margin-bottom: 3px;
+            color: #fff;
+            font-weight: 800;
+        }
+
+        .se-mem-item {
+            padding: 2px 0;
+            color: #d6d9e6;
+            word-break: break-word;
+        }
+
+        .se-mem-sub {
+            color: #9da2b6;
+        }
+
+        .se-mem-empty {
+            color: #7d8296;
+            font-size: 11px;
+        }
+
+        .se-mem-todo {
+            display: flex;
+            align-items: flex-start;
+            gap: 6px;
+            padding: 3px 0;
+            color: #d6d9e6;
+            word-break: break-word;
+        }
+
+        .se-mem-todo.done span {
+            color: #7d8296;
+            text-decoration: line-through;
+        }
+
+        .se-mem-more {
+            margin-top: 4px;
+            border: 0;
+            padding: 2px 0;
+            background: transparent;
+            color: #8fb4ff;
+            font-size: 11px;
+            cursor: pointer;
+        }
+
+        #se-mem-text {
+            min-height: 220px !important;
+            max-height: 50vh !important;
+            font-size: 11.5px !important;
+        }
+
         #${FAB_ID} {
             position: fixed;
             z-index: 2147483647;
@@ -2593,13 +3551,14 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.12.45</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.14.0</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
 
             <div id="se-body">
                 <div id="se-cost-top">아직 계산된 사용량이 없어요.</div>
+                <button id="se-mem-chip" type="button">🧠 장기기억 불러오는 중…</button>
 
                 <div class="se-label">💬 대사</div>
                 <textarea id="se-dialogue" placeholder="예: 괜찮아, 내가 도와줄게"></textarea>
@@ -2674,19 +3633,19 @@
                     <div class="se-section-body">
                         <div class="se-inline">
                             <input id="se-ctx-on" type="checkbox" checked disabled>
-                            <span>직전 상대 채팅 + 최근</span>
+                            <span>최신부터 거꾸로</span>
                             <input
                                 id="se-ctx-n"
                                 class="se-inline-number"
                                 type="number"
                                 min="1"
-                                max="30"
+                                max="100"
                                 value="6"
                             >
-                            <span>개</span>
+                            <span>턴</span>
                         </div>
 
-                        <div class="se-label">직전 상대 캐릭터 채팅은 항상 읽고, 위 숫자만큼 이전 대화도 함께 참고해요.</div>
+                        <div class="se-label">유저 메시지 1개 = 1턴으로 세서, 최신 턴부터 거꾸로 딱 그 수만큼 불러와요. 첫 턴 바로 앞 캐릭터 메시지도 같이 넣어요. 크랙 서버에서 못 불러오면 화면에서 읽어요.</div>
 
                         <div class="se-btn-row">
                             <button id="se-ctx-preview" type="button">🔍 실제로 읽힌 맥락 보기</button>
@@ -2694,6 +3653,63 @@
                         </div>
 
                         <div id="se-ctx-status"></div>
+                    </div>
+                </details>
+
+                <details class="se-section" id="se-mem-section">
+                    <summary>🧠 장기기억 · 관계 · 할 일 (이 채팅방)</summary>
+                    <div class="se-section-body">
+                        <div class="se-inline">
+                            <input id="se-mem-auto" type="checkbox">
+                            <span>자동 정리 · 새 대화</span>
+                            <input
+                                id="se-mem-every"
+                                class="se-inline-number"
+                                type="number"
+                                min="1"
+                                max="50"
+                                value="5"
+                            >
+                            <span>턴마다</span>
+                        </div>
+
+                        <div class="se-label">✨늘리기를 쓴 뒤 새 대화가 위 턴 수만큼 쌓였으면 관계 변화·내 상태·할 일·있었던 일을 알아서 정리해요. 그때만 Gemini를 한 번 더 불러요.</div>
+
+                        <div id="se-mem-meta"></div>
+
+                        <div class="se-btn-row">
+                            <button id="se-mem-now" type="button">🧠 지금 정리</button>
+                            <button id="se-mem-edit-btn" type="button">✏️ 직접 편집</button>
+                        </div>
+
+                        <div id="se-mem-view"></div>
+
+                        <div id="se-mem-editor" style="display:none">
+                            <textarea id="se-mem-text"></textarea>
+                            <div class="se-btn-row" style="margin-top:6px">
+                                <button id="se-mem-edit-save" type="button">💾 편집 저장</button>
+                                <button id="se-mem-edit-cancel" type="button">취소</button>
+                            </div>
+                        </div>
+
+                        <div class="se-inline">
+                            <span>처음부터 다시 만들기</span>
+                            <input
+                                id="se-mem-rebuild-turns"
+                                class="se-inline-number"
+                                type="number"
+                                min="0"
+                                value="0"
+                            >
+                            <span>턴 (0 = 전체)</span>
+                        </div>
+
+                        <div class="se-btn-row">
+                            <button id="se-mem-rebuild" type="button">📚 다시 만들기</button>
+                            <button id="se-mem-clear" type="button">🗑️ 이 방 기억 지우기</button>
+                        </div>
+
+                        <div id="se-mem-status"></div>
                     </div>
                 </details>
 
@@ -2821,16 +3837,16 @@
                 : viewport.top + viewport.height - height - 100;
         }
 
-        left = clamp(
+        left = Math.round(clamp(
             left,
             viewport.left + EDGE,
             Math.max(
                 viewport.left + EDGE,
                 viewport.left + viewport.width - width - EDGE
             )
-        );
+        ));
 
-        top = clamp(
+        top = Math.round(clamp(
             top,
             viewport.top + EDGE,
             Math.max(
@@ -2839,14 +3855,28 @@
                     Math.min(height, isPanel ? 90 : height) -
                     EDGE
             )
-        );
+        ));
 
-        element.style.setProperty('position', 'fixed', 'important');
-        element.style.setProperty('left', left + 'px', 'important');
-        element.style.setProperty('top', top + 'px', 'important');
-        element.style.setProperty('right', 'auto', 'important');
-        element.style.setProperty('bottom', 'auto', 'important');
-        element.style.setProperty('transform', 'none', 'important');
+        const style = element.style;
+        const leftPx = left + 'px';
+        const topPx = top + 'px';
+
+        /* 위치가 그대로면 스타일을 다시 쓰지 않는다(불필요한 화면 재계산 방지). */
+        const alreadyPlaced =
+            style.getPropertyValue('position') === 'fixed' &&
+            style.getPropertyValue('left') === leftPx &&
+            style.getPropertyValue('top') === topPx &&
+            style.getPropertyPriority('left') === 'important' &&
+            style.getPropertyPriority('top') === 'important';
+
+        if (!alreadyPlaced) {
+            style.setProperty('position', 'fixed', 'important');
+            style.setProperty('left', leftPx, 'important');
+            style.setProperty('top', topPx, 'important');
+            style.setProperty('right', 'auto', 'important');
+            style.setProperty('bottom', 'auto', 'important');
+            style.setProperty('transform', 'none', 'important');
+        }
 
         if (saveKey) {
             GM_setValue(saveKey, { left, top });
@@ -3187,6 +4217,7 @@
 
             if (opening) {
                 settings.scrollTop = 0;
+                if (typeof refreshMemoryUI === 'function') refreshMemoryUI();
                 const resultDetails = $('#se-persona-result');
                 const personaResult = $('#se-persona-text-0');
 
@@ -3211,12 +4242,17 @@
             GM_setValue(K_CTX_ON, true);
             GM_setValue(
                 K_CTX_N,
-                clamp(parseInt(ctxN.value, 10) || 6, 1, 30)
+                clamp(parseInt(ctxN.value, 10) || 6, 1, CTX_MAX_TURNS)
             );
             GM_setValue(K_COST_ON, costOn.checked);
             GM_setValue(
                 K_COST_USDKRW,
                 Math.max(1, parseFloat(costRate.value) || 1400)
+            );
+            GM_setValue(K_MEM_AUTO, $('#se-mem-auto').checked);
+            GM_setValue(
+                K_MEM_EVERY,
+                clamp(parseInt($('#se-mem-every').value, 10) || 5, 1, 50)
             );
 
             if (modelSelect.value) {
@@ -3264,20 +4300,32 @@
         });
 
         /* 페르소나 자동추천 */
-        $('#se-persona-suggest').addEventListener('click', () => {
+        $('#se-persona-suggest').addEventListener('click', async () => {
             const button = $('#se-persona-suggest');
+            if (button.disabled) return;
             const keywords = personaHint.value.trim();
 
             GM_setValue(K_APIKEY, keyInput.value.trim());
             GM_setValue(K_MODEL, modelSelect.value);
             GM_setValue(K_PERSONA_HINT, keywords);
 
+            button.disabled = true;
+            setInfo(personaStatus, '설정과 최근 대화를 불러오는 중…', false);
+
             const storyDetail = collectStoryDetail();
-            const context = collectChatContext(
-                clamp(parseInt(ctxN.value, 10) || 10, 6, 20)
-            );
+            let context = [];
+            let memoryBlock = '';
+
+            try {
+                const loaded = await loadRecentChat(
+                    clamp(parseInt(ctxN.value, 10) || 10, 6, 20)
+                );
+                context = loaded.context;
+                memoryBlock = memoryToPrompt(getMemory(), loaded.snapshot && loaded.snapshot.text);
+            } catch (_) {}
 
             if (!keywords && !storyDetail && !context.length) {
+                button.disabled = false;
                 setInfo(
                     personaStatus,
                     '키워드나 읽을 설정/최근 맥락이 없어요.',
@@ -3289,10 +4337,10 @@
             const prompt = buildPersonaPrompt(
                 keywords,
                 storyDetail,
-                context
+                context,
+                memoryBlock
             );
 
-            button.disabled = true;
             setInfo(
                 personaStatus,
                 '설정과 최근 맥락을 읽고 페르소나 추천 중…',
@@ -3304,14 +4352,7 @@
                 prompt.user,
                 '페르소나 추천',
                 (text, costInfo) => {
-                    const slots = collectSlots(
-                        'persona',
-                        PERSONA_SLOTS,
-                        '페르소나'
-                    );
-
-                    /* 추천 결과는 항상 맨 위 1번 칸에 넣는다.
-                     * 기존에는 켜져 있는 2·3번 칸에 들어가 결과가 아래로 숨어버릴 수 있었다. */
+                    /* 추천 결과는 항상 맨 위 1번 칸에 넣는다. */
                     const index = 0;
                     const resultTextarea = $('#se-persona-text-0');
 
@@ -3323,12 +4364,12 @@
                     if (resultDetails) resultDetails.open = true;
                     resultTextarea.style.height = '';
 
-                    const nameInput = $('#se-persona-name-' + index);
+                    const slotNameInput = $('#se-persona-name-' + index);
                     if (
-                        !nameInput.value.trim() ||
-                        /^페르소나\s*\d+$/.test(nameInput.value.trim())
+                        !slotNameInput.value.trim() ||
+                        /^페르소나\s*\d+$/.test(slotNameInput.value.trim())
                     ) {
-                        nameInput.value = '자동추천 페르소나';
+                        slotNameInput.value = '자동추천 페르소나';
                     }
 
                     saveSlots();
@@ -3343,9 +4384,9 @@
                     );
 
                     requestAnimationFrame(() => {
-                        const resultDetails = $('#se-persona-result');
-                        if (resultDetails && resultDetails.scrollIntoView) {
-                            resultDetails.scrollIntoView({
+                        const details = $('#se-persona-result');
+                        if (details && details.scrollIntoView) {
+                            details.scrollIntoView({
                                 behavior: 'smooth',
                                 block: 'nearest'
                             });
@@ -3367,17 +4408,35 @@
             GM_setValue(K_CTX_ON, true);
         });
 
-        $('#se-ctx-preview').addEventListener('click', () => {
-            const n = clamp(parseInt(ctxN.value, 10) || 6, 1, 30);
+        let previewBusy = false;
+
+        $('#se-ctx-preview').addEventListener('click', async () => {
+            if (previewBusy) return;
+            const n = clamp(parseInt(ctxN.value, 10) || 6, 1, CTX_MAX_TURNS);
+            ctxN.value = n;
             GM_setValue(K_CTX_N, n);
 
-            const records = getRecentContextRecords(n);
-            const latestSnapshot = collectLatestSceneSnapshot();
+            previewBusy = true;
+            setInfo(ctxStatus, '최신 턴부터 거꾸로 불러오는 중… 📥', false);
+
+            let loaded;
+            try {
+                loaded = await loadRecentChat(n);
+            } catch (error) {
+                setInfo(ctxStatus, '불러오기 실패: ' + (error && error.message || error), true);
+                return;
+            } finally {
+                previewBusy = false;
+            }
+
+            const records = loaded.records;
+            const latestSnapshot = loaded.snapshot || {};
 
             if (!records.length && !latestSnapshot.text) {
                 setInfo(
                     ctxStatus,
-                    '대화를 못 잡았어요. 채팅이 보이는 상태에서 다시 눌러보세요.',
+                    '대화를 못 잡았어요. 채팅방 안에서 다시 눌러보세요.' +
+                        (loaded.apiError ? '\n(서버: ' + loaded.apiError + ')' : ''),
                     true
                 );
                 return;
@@ -3385,44 +4444,45 @@
 
             /* 미리보기만 최신 → 과거 순서로 보여준다.
              * records 원본은 건드리지 않으므로 Gemini 전달 순서는 계속 과거 → 최신이다. */
-            const previewRecords = records.slice().reverse();
+            const labels = turnAgoLabels(records);
+            const previewText = records
+                .map((item, index) => ({ item, label: labels[index] }))
+                .reverse()
+                .map((entry, index) => {
+                    const item = entry.item;
+                    const roleLabel = item.role === 'user'
+                        ? '유저'
+                        : item.role === 'assistant'
+                            ? '상대 캐릭터'
+                            : '역할 미확인';
+                    const preview = String(item.text || '')
+                        .replace(/\s+/g, ' ')
+                        .trim();
 
-            const loaded = previewRecords.map((item, index) => {
-                const roleLabel = item.role === 'user'
-                    ? '유저'
-                    : item.role === 'assistant'
-                        ? '상대 캐릭터'
-                        : '역할 미확인';
-                const turnLabel = Number.isFinite(item.turnNumber)
-                    ? '턴 ' + item.turnNumber + ' · '
-                    : '';
-                const preview = String(item.text || '')
-                    .replace(/\s+/g, ' ')
-                    .trim();
+                    return (
+                        (index + 1) + '. [' + (entry.label ? entry.label + ' · ' : '') + roleLabel + ']\n' +
+                        (preview.length > 220 ? preview.slice(0, 220) + '…' : preview)
+                    );
+                })
+                .join('\n\n');
 
-                return (
-                    (index + 1) + '. [' + turnLabel + roleLabel + ']\n' +
-                    (preview.length > 220 ? preview.slice(0, 220) + '…' : preview)
-                );
-            }).join('\n\n');
-
-            const liveGroups = getLiveMessageGroupsNewestFirst();
-            const liveTurns = liveGroups
-                .map(group => extractTurnNumber(getRawNodeText(group)))
-                .filter(Number.isFinite);
+            const sourceLine = loaded.source === 'api'
+                ? '불러온 곳: 크랙 서버 (최신부터 역순, 정확한 턴 수)'
+                : '불러온 곳: 화면 읽기' +
+                    (loaded.apiError ? ' (서버 실패: ' + loaded.apiError + ')' : '') +
+                    (loaded.scan ? '\n화면의 전체 메시지: ' + loaded.scan.groups.length + '개' : '');
 
             setInfo(
                 ctxStatus,
-                '직전 턴: ' +
-                    (Number.isFinite(latestSnapshot.turnNumber)
-                        ? '턴 ' + latestSnapshot.turnNumber
-                        : (latestSnapshot.source || '판별 실패')) +
-                    '\n감지한 메시지: ' + liveGroups.length +
-                    '개 · 감지한 턴: ' +
-                    (liveTurns.length ? liveTurns.join(' → ') : '(없음)') +
+                sourceLine +
+                    '\n요청 ' + n + '턴 → 실제 ' + loaded.actualTurns + '턴 · 메시지 ' + records.length + '개' +
+                    (loaded.source === 'api' && loaded.actualTurns < n
+                        ? ' (대화가 아직 ' + loaded.actualTurns + '턴뿐이에요)'
+                        : '') +
+                    '\n직전 장면: ' + (latestSnapshot.source || '판별 실패') +
                     '\n미리보기 순서: 최신 → 과거\n' +
                     'Gemini 전달 순서: 과거 → 최신\n\n' +
-                    loaded,
+                    previewText,
                 false
             );
         });
@@ -3474,8 +4534,12 @@
             K_COST_TOTAL_IN,
             K_COST_TOTAL_OUT,
             K_COST_REQ_COUNT,
-            K_COST_LOG
+            K_COST_LOG,
+            K_MEM_AUTO,
+            K_MEM_EVERY
         ];
+
+        const isMemoryKey = key => String(key).startsWith(K_MEM_BASE + '::');
 
         $('#se-export').addEventListener('click', () => {
             saveSlots();
@@ -3488,6 +4552,16 @@
                     data[key] = value;
                 }
             });
+
+            /* 채팅방별 장기기억도 함께 옮긴다(다른 기기에서도 이어서 쓰도록). */
+            if (typeof GM_listValues === 'function') {
+                try {
+                    (GM_listValues() || []).filter(isMemoryKey).forEach(key => {
+                        const value = GM_getValue(key, null);
+                        if (value) data[key] = value;
+                    });
+                } catch (_) {}
+            }
 
             const code =
                 'CSE1:' +
@@ -3558,6 +4632,11 @@
                     }
                 });
 
+                Object.keys(parsed.data).filter(isMemoryKey).forEach(key => {
+                    GM_setValue(key, sanitizeMemory(parsed.data[key]));
+                    count++;
+                });
+
                 setInfo(
                     syncStatus,
                     count +
@@ -3575,6 +4654,301 @@
             }
         });
 
+        /* =========================
+         * 장기기억 UI
+         * ========================= */
+        const memChip = $('#se-mem-chip');
+        const memSection = $('#se-mem-section');
+        const memAuto = $('#se-mem-auto');
+        const memEvery = $('#se-mem-every');
+        const memMeta = $('#se-mem-meta');
+        const memView = $('#se-mem-view');
+        const memEditor = $('#se-mem-editor');
+        const memText = $('#se-mem-text');
+        const memStatus = $('#se-mem-status');
+        const memRebuildTurns = $('#se-mem-rebuild-turns');
+        let memShowAllEvents = false;
+        let chipTimer = null;
+
+        memAuto.checked = GM_getValue(K_MEM_AUTO, true) !== false;
+        memEvery.value = clamp(parseInt(GM_getValue(K_MEM_EVERY, 5), 10) || 5, 1, 50);
+
+        memAuto.addEventListener('change', () => {
+            GM_setValue(K_MEM_AUTO, memAuto.checked);
+        });
+
+        memEvery.addEventListener('change', () => {
+            const value = clamp(parseInt(memEvery.value, 10) || 5, 1, 50);
+            memEvery.value = value;
+            GM_setValue(K_MEM_EVERY, value);
+        });
+
+        function memoryChipText(mem) {
+            const open = mem.todos.filter(item => !item.done).length;
+            if (
+                !mem.relationships.length && !mem.userState.length &&
+                !mem.todos.length && !mem.events.length
+            ) {
+                return '🧠 장기기억 비어 있음 · 눌러서 보기';
+            }
+            return '🧠 할 일 ' + open +
+                ' · 관계 ' + mem.relationships.length +
+                ' · 있었던 일 ' + mem.events.length;
+        }
+
+        function setChip(text, state) {
+            if (chipTimer) {
+                clearTimeout(chipTimer);
+                chipTimer = null;
+            }
+            memChip.textContent = text;
+            memChip.classList.toggle('busy', state === 'busy');
+            memChip.classList.toggle('err', state === 'err');
+        }
+
+        function makeEl(tag, className, text) {
+            const node = document.createElement(tag);
+            if (className) node.className = className;
+            if (text != null) node.textContent = text;
+            return node;
+        }
+
+        function memGroup(title, nodes, emptyText) {
+            const box = makeEl('div', 'se-mem-group');
+            box.appendChild(makeEl('div', 'se-mem-group-title', title));
+            if (!nodes.length) box.appendChild(makeEl('div', 'se-mem-empty', emptyText));
+            nodes.forEach(node => box.appendChild(node));
+            return box;
+        }
+
+        function renderMemory() {
+            const mem = getMemory();
+
+            memMeta.textContent = mem.updatedAt
+                ? '마지막 정리: ' + mem.updatedAt + ' · 지금까지 반영한 턴 ' + mem.processedTurns + '개'
+                : '아직 정리된 기억이 없어요. ✨늘리기를 쓰거나 🧠 지금 정리를 눌러보세요.';
+
+            memView.textContent = '';
+
+            memView.appendChild(memGroup('👥 관계', mem.relationships.map(item => {
+                const row = makeEl('div', 'se-mem-item');
+                row.appendChild(makeEl('b', '', item.name));
+                row.appendChild(document.createTextNode(' — ' + (item.relation || '관계 미정')));
+                if (item.change) row.appendChild(makeEl('div', 'se-mem-sub', '↳ ' + item.change));
+                return row;
+            }), '아직 없어요'));
+
+            memView.appendChild(memGroup(
+                '🙋 내 캐릭터의 지금 상태',
+                mem.userState.map(text => makeEl('div', 'se-mem-item', '• ' + text)),
+                '기본 설정 그대로예요'
+            ));
+
+            memView.appendChild(memGroup('📌 해야 할 일', mem.todos.map(item => {
+                const row = makeEl('label', 'se-mem-todo' + (item.done ? ' done' : ''));
+                const box = document.createElement('input');
+                box.type = 'checkbox';
+                box.checked = item.done;
+                box.addEventListener('change', () => {
+                    const current = getMemory();
+                    const target = current.todos.find(todo => memKey(todo.text) === memKey(item.text));
+                    if (target) {
+                        target.done = box.checked;
+                        saveMemory(current);
+                    }
+                    renderMemory();
+                });
+                row.appendChild(box);
+                row.appendChild(makeEl(
+                    'span',
+                    '',
+                    item.text +
+                        (item.from ? ' · ' + item.from : '') +
+                        (item.due ? ' · 기한 ' + item.due : '')
+                ));
+                return row;
+            }), '지금은 없어요'));
+
+            const events = mem.events.slice().reverse();
+            const shown = memShowAllEvents ? events : events.slice(0, 6);
+            const eventBox = memGroup('📖 있었던 일 · 최근 순', shown.map(item => {
+                const row = makeEl('div', 'se-mem-item');
+                if (item.title) row.appendChild(makeEl('b', '', '[' + item.title + '] '));
+                row.appendChild(document.createTextNode(item.summary));
+                return row;
+            }), '아직 없어요');
+
+            if (events.length > 6) {
+                const more = makeEl(
+                    'button',
+                    'se-mem-more',
+                    memShowAllEvents ? '접기' : '더보기 (' + (events.length - 6) + '개 더)'
+                );
+                more.type = 'button';
+                more.addEventListener('click', () => {
+                    memShowAllEvents = !memShowAllEvents;
+                    renderMemory();
+                });
+                eventBox.appendChild(more);
+            }
+
+            memView.appendChild(eventBox);
+
+            if (!memoryBusy) setChip(memoryChipText(mem));
+        }
+
+        refreshMemoryUI = renderMemory;
+
+        function closeMemoryEditor() {
+            memEditor.style.display = 'none';
+            memView.style.display = '';
+        }
+
+        function startMemoryJob(mode, options, labels) {
+            if (memoryBusy) {
+                setInfo(memStatus, '이미 기억을 정리하는 중이에요.', true);
+                return Promise.resolve(null);
+            }
+
+            GM_setValue(K_APIKEY, keyInput.value.trim());
+            if (modelSelect.value) GM_setValue(K_MODEL, modelSelect.value);
+            closeMemoryEditor();
+
+            if (labels.start) {
+                setChip(labels.start, 'busy');
+                setInfo(memStatus, labels.start, false);
+            }
+
+            return runMemoryUpdate(mode, options, (index, total) => {
+                const text = labels.progress + ' (' + index + '/' + total + ')';
+                setChip(text, 'busy');
+                setInfo(memStatus, text, false);
+            }).then(result => {
+                renderMemory();
+                if (result && result.cost) refreshCost(result.cost);
+                return result;
+            }).catch(error => {
+                const message = '🧠 기억 정리 실패: ' + (error && error.message || error);
+                setChip(message, 'err');
+                setInfo(memStatus, message, true);
+                chipTimer = setTimeout(() => setChip(memoryChipText(getMemory())), 6000);
+                return null;
+            });
+        }
+
+        function maybeAutoMemory() {
+            if (!memAuto.checked || memoryBusy) return;
+
+            startMemoryJob('auto', null, {
+                progress: '🧠 새 대화로 기억 정리 중…'
+            }).then(result => {
+                if (!result || result.skipped) return;
+                setChip('✅ 기억 업데이트 · ' + memoryChipText(result.mem).replace('🧠 ', ''));
+                setInfo(
+                    memStatus,
+                    '자동 정리 완료 ✅' + (result.cost ? '\n' + result.cost.message : ''),
+                    false
+                );
+                chipTimer = setTimeout(() => setChip(memoryChipText(getMemory())), 5000);
+            });
+        }
+
+        memChip.addEventListener('click', () => {
+            settings.classList.add('show');
+            body.classList.add('hide');
+            memSection.open = true;
+            renderMemory();
+
+            requestAnimationFrame(() => {
+                if (memSection.scrollIntoView) memSection.scrollIntoView({ block: 'start' });
+                if (!isSoftKeyboardOpen()) clampElementToViewport(panel, null, true);
+            });
+        });
+
+        $('#se-mem-now').addEventListener('click', () => {
+            startMemoryJob('manual', null, {
+                start: '🧠 새 대화를 불러오는 중…',
+                progress: '🧠 기억 정리 중…'
+            }).then(result => {
+                if (!result) return;
+                if (result.skipped) {
+                    setInfo(memStatus, '새로 정리할 대화가 없어요 🙂', false);
+                } else {
+                    setInfo(
+                        memStatus,
+                        '정리 완료 ✅ (Gemini ' + result.chunks + '번 호출)' +
+                            (result.cost ? '\n' + result.cost.message : ''),
+                        false
+                    );
+                }
+            });
+        });
+
+        $('#se-mem-rebuild').addEventListener('click', () => {
+            const turns = Math.max(0, parseInt(memRebuildTurns.value, 10) || 0);
+            const ok = window.confirm(
+                (turns ? '최근 ' + turns + '턴' : '이 채팅방 전체 대화') +
+                '으로 장기기억을 처음부터 다시 만들까요?\n\n' +
+                '· ' + MEM_CHUNK_TURNS + '턴마다 Gemini를 한 번씩 불러요 (100턴이면 약 7번).\n' +
+                '· 지금 기억(직접 편집한 내용 포함)은 새로 만든 기억으로 바뀌어요.'
+            );
+            if (!ok) return;
+
+            startMemoryJob('rebuild', { turns }, {
+                start: '📚 대화를 불러오는 중…',
+                progress: '📚 다시 만드는 중…'
+            }).then(result => {
+                if (!result) return;
+                if (result.skipped) {
+                    setInfo(memStatus, '불러올 대화가 없어요.', true);
+                } else {
+                    setInfo(
+                        memStatus,
+                        '다시 만들기 완료 ✅ (Gemini ' + result.chunks + '번 호출)' +
+                            (result.cost ? '\n' + result.cost.message : ''),
+                        false
+                    );
+                }
+            });
+        });
+
+        $('#se-mem-edit-btn').addEventListener('click', () => {
+            if (memEditor.style.display === 'none') {
+                memText.value = memoryToEditText(getMemory());
+                memEditor.style.display = 'block';
+                memView.style.display = 'none';
+            } else {
+                closeMemoryEditor();
+            }
+        });
+
+        $('#se-mem-edit-save').addEventListener('click', () => {
+            if (memoryBusy) {
+                setInfo(memStatus, '기억 정리가 끝난 뒤에 저장해 주세요.', true);
+                return;
+            }
+            saveMemory(editTextToMemory(memText.value, getMemory()));
+            closeMemoryEditor();
+            renderMemory();
+            setInfo(memStatus, '편집한 기억을 저장했어요 💾', false);
+        });
+
+        $('#se-mem-edit-cancel').addEventListener('click', closeMemoryEditor);
+
+        $('#se-mem-clear').addEventListener('click', () => {
+            if (memoryBusy) {
+                setInfo(memStatus, '기억 정리가 끝난 뒤에 지워 주세요.', true);
+                return;
+            }
+            if (!window.confirm('이 채팅방의 장기기억(관계·상태·할 일·있었던 일)을 모두 지울까요?')) return;
+            clearMemory();
+            closeMemoryEditor();
+            renderMemory();
+            setInfo(memStatus, '이 채팅방 기억을 지웠어요 🗑️', false);
+        });
+
+        renderMemory();
+
         /* 문장 생성 */
         function renderResult(text) {
             lastResult = text;
@@ -3588,9 +4962,14 @@
                     clampElementToViewport(panel, null, true);
                 }
             });
+
+            /* 결과를 보여준 뒤, 새 대화가 충분히 쌓였으면 장기기억을 정리한다. */
+            setTimeout(maybeAutoMemory, 300);
         }
 
-        function run() {
+        let runBusy = false;
+
+        async function run() {
             const d = dialogue.value;
             const a = action.value;
 
@@ -3598,22 +4977,46 @@
                 flash('대사나 행동 중 하나는 입력해 주세요.', true);
                 return;
             }
+            if (runBusy) return;
+            runBusy = true;
 
             GM_setValue(K_APIKEY, keyInput.value.trim());
             GM_setValue(K_MODEL, modelSelect.value);
             saveSlots();
 
-            const context = collectChatContext(
-                clamp(parseInt(ctxN.value, 10) || 6, 1, 30)
-            );
-            const latestSnapshot = collectLatestSceneSnapshot();
-            const sceneFocus = extractSceneFocus(latestSnapshot.text);
-            const prompt = buildPrompt(d, a, context, latestSnapshot);
-
             goButton.disabled = true;
             output.classList.remove('show');
             insertButton.classList.remove('show');
             resultButtons.classList.remove('show');
+            flash('최신 대화 불러오는 중… 📥');
+
+            /* 대화는 여기서 딱 한 번만 불러오고, 맥락과 직전 장면이 같은 결과를 공유한다. */
+            const n = clamp(parseInt(ctxN.value, 10) || 6, 1, CTX_MAX_TURNS);
+            let loaded;
+
+            try {
+                loaded = await loadRecentChat(n);
+            } catch (error) {
+                runBusy = false;
+                goButton.disabled = false;
+                flash('대화를 불러오지 못했어요: ' + (error && error.message || error), true);
+                return;
+            }
+
+            const context = loaded.context;
+            const latestSnapshot = loaded.snapshot || {
+                text: '', nearby: '', source: '판별 실패', role: 'unknown', id: '', turnNumber: null
+            };
+            const memoryBlock = memoryToPrompt(getMemory(), latestSnapshot.text);
+            const sceneFocus = extractSceneFocus(latestSnapshot.text);
+            const prompt = buildPrompt(d, a, context, latestSnapshot, memoryBlock);
+
+            /* 아래 요청 콜백에서 버튼을 다시 켤 때 진행 중 표시도 함께 푼다. */
+            const releaseButton = () => {
+                runBusy = false;
+                goButton.disabled = false;
+            };
+
             flash('늘리는 중… ✍️');
 
             requestGemini(
@@ -3648,7 +5051,7 @@
                                 const formattedRepair = normalizeRoleplayItalics(repaired);
                                 renderResult(formattedRepair);
                                 refreshCost(repairCost || costInfo);
-                                goButton.disabled = false;
+                                releaseButton();
                                 flash(
                                     repairCost
                                         ? '문맥에 맞게 자동 재교정했어요.\n' + repairCost.message
@@ -3658,7 +5061,7 @@
                             error => {
                                 renderResult(formattedText);
                                 refreshCost(costInfo);
-                                goButton.disabled = false;
+                                releaseButton();
                                 flash('자동 재교정은 실패했지만 첫 결과를 표시했어요: ' + error, true);
                             }
                         );
@@ -3667,11 +5070,11 @@
 
                     renderResult(formattedText);
                     refreshCost(costInfo);
-                    goButton.disabled = false;
+                    releaseButton();
                     flash(costInfo ? costInfo.message : '');
                 },
                 error => {
-                    goButton.disabled = false;
+                    releaseButton();
                     flash(error, true);
                 }
             );
@@ -3739,17 +5142,20 @@
         );
 
         /* 모바일 화면 변화 복구
-         * 소프트 키보드가 열린 동안에는 visualViewport의 크기와 오프셋이
-         * 계속 바뀔 수 있으므로 패널과 FAB의 저장 좌표를 아예 건드리지 않는다.
-         */
+         * 스크롤 중 주소창이 접히면 resize/scroll 이벤트가 연달아 오므로
+         * 한 프레임에 한 번만 처리한다. 키보드가 열린 동안에는 건드리지 않는다. */
+        let repairQueued = false;
         const repair = () => {
-            if (isSoftKeyboardOpen()) return;
+            if (repairQueued) return;
+            repairQueued = true;
 
-            clampElementToViewport(fab, null, false);
+            requestAnimationFrame(() => {
+                repairQueued = false;
+                if (isSoftKeyboardOpen()) return;
 
-            if (getComputedStyle(panel).display !== 'none') {
+                clampElementToViewport(fab, null, false);
                 clampElementToViewport(panel, null, true);
-            }
+            });
         };
 
         window.addEventListener('resize', repair, { passive: true });
@@ -3766,21 +5172,8 @@
         }, { passive: true });
 
         if (window.visualViewport) {
-            window.visualViewport.addEventListener(
-                'resize',
-                () => {
-                    if (!isSoftKeyboardOpen()) repair();
-                },
-                { passive: true }
-            );
-
-            window.visualViewport.addEventListener(
-                'scroll',
-                () => {
-                    if (!isSoftKeyboardOpen()) repair();
-                },
-                { passive: true }
-            );
+            window.visualViewport.addEventListener('resize', repair, { passive: true });
+            window.visualViewport.addEventListener('scroll', repair, { passive: true });
         }
 
         [0, 100, 400, 1000, 2500].forEach(delay => {
@@ -3794,9 +5187,10 @@
     function init() {
         if (document.getElementById(PANEL_ID)) return;
 
+        cleanupLegacyStorage();
         injectStyle();
         buildUI();
-        attachContextObserver();
+        watchStoryBootstrap();
 
         [100, 500, 1200, 2500, 5000].forEach(delay => {
             setTimeout(collectStoryBootstrap, delay);
@@ -3805,8 +5199,11 @@
         routeTimer = setInterval(() => {
             if (location.href !== lastUrl) {
                 lastUrl = location.href;
-                setTimeout(attachContextObserver, 300);
-                setTimeout(collectStoryBootstrap, 350);
+                lastCtxSaveSig = '';
+                setTimeout(watchStoryBootstrap, 300);
+                setTimeout(() => {
+                    if (typeof refreshMemoryUI === 'function') refreshMemoryUI();
+                }, 400);
                 setTimeout(collectStoryBootstrap, 1200);
                 setTimeout(() => {
                     const panel = document.getElementById(PANEL_ID);
@@ -3815,13 +5212,7 @@
                     if (isSoftKeyboardOpen()) return;
 
                     clampElementToViewport(fab, null, false);
-
-                    if (
-                        panel &&
-                        getComputedStyle(panel).display !== 'none'
-                    ) {
-                        clampElementToViewport(panel, null, true);
-                    }
+                    clampElementToViewport(panel, null, true);
                 }, 500);
             }
         }, 1600);
