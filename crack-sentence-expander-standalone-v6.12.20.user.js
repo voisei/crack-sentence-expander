@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 문장 부풀리기 (Gemini) · 풀기능 모바일 수정판
 // @namespace    https://crack.wrtn.ai
-// @version      6.15.0
+// @version      6.16.0
 // @author       me
 // @description  크랙 서버에서 최신 턴부터 거꾸로 정확히 불러오고, 채팅방별 장기기억(관계 변화·내 상태·할 일·있었던 일)을 자동 정리해 문장 부풀리기에 반영하는 경량판. Gemini 무료 키를 먼저 쓰고 한도를 다 쓰면 유료 키로 전환.
 // @match        https://crack.wrtn.ai/*
@@ -22,6 +22,17 @@
     'use strict';
 
     /*
+     * v6.16.0
+     * - 🧠 장기기억 적용 체크: 끄면 늘리기·페르소나 추천에 장기기억을 넣지 않고 자동 정리도 쉰다.
+     * - 🚫 구글이 막은 요청(PROHIBITED_CONTENT 등)을 기록해, 같은 대화·기억·설정으로 다시 누르면
+     *   보내기 전에 물어본다. 자동 장기기억 정리는 막혔던 구간을 다시 보내지 않는다.
+     *   막힌 요청에 쓰인 토큰도 비용 기록에 남기고, 키·크레딧 문제가 아니라고 알려 준다.
+     *
+     * v6.15.1
+     * - ✍️ 문체 칸을 크게: 기본 높이를 넉넉하게 잡고(모바일 105px 상한 해제),
+     *   글이 길어지면 칸이 내용에 맞춰 자동으로 늘어난다(화면 높이의 60%까지).
+     *   손으로 늘린 크기는 줄이지 않는다.
+     *
      * v6.15.0
      * - 🆓 무료 키를 먼저 쓰고, 그 모델의 하루 무료 한도를 다 쓰면 💳 유료 키로 자동 전환한다.
      *   분당 한도는 잠깐 기다렸다 무료로 다시 시도한다. 무료 요청은 비용 ₩0으로 기록한다.
@@ -99,6 +110,13 @@
     const CRACK_API_BASE = 'https://crack-api.wrtn.ai/crack-gen/v3/chats';
     const K_MEM_BASE = 'se_mem_v1';
     const K_MEM_AUTO = 'se_mem_auto';
+    const K_MEM_USE = 'se_mem_use';              /* 장기기억을 프롬프트에 넣을지 */
+    const K_BLOCK_GUARD = 'se_block_guard_v1';   /* 구글에 막힌 요청 기록 */
+    const BLOCK_GUARD_TTL = 12 * 60 * 60 * 1000;
+    const BLOCK_GUARD_LIMIT = 40;
+    const BLOCK_REASONS = new Set([
+        'PROHIBITED_CONTENT', 'SAFETY', 'BLOCKLIST', 'SPII', 'IMAGE_SAFETY'
+    ]);
     const K_MEM_EVERY = 'se_mem_every';
     const MEM_CHUNK_TURNS = 15;
     const MEM_FIRST_TURNS = 20;
@@ -2043,7 +2061,7 @@
                 user,
                 label,
                 (text, cost) => resolve({ text, cost }),
-                error => reject(new Error(error)),
+                (error, info) => reject(Object.assign(new Error(error), { info: info || null })),
                 options
             );
         });
@@ -2097,7 +2115,8 @@
                     prompt.system,
                     prompt.user,
                     mode === 'rebuild' ? '장기기억 다시 만들기' : '장기기억 정리',
-                    { json: true }
+                    /* 자동 정리는 예전에 막힌 구간을 다시 보내지 않고 조용히 건너뛴다. */
+                    { json: true, repeatGuard: mode === 'auto' ? 'skip' : 'confirm' }
                 );
 
                 /* 정리 도중 다른 채팅방으로 옮겼으면 엉뚱한 방에 저장하지 않는다. */
@@ -2716,7 +2735,53 @@
         });
     }
 
-    /* options.json: JSON으로 받기, options.onNotice(문구): 키 전환·대기 안내 */
+    /* =========================
+     * 막힌 요청 기록 (같은 내용을 또 보내 크레딧만 나가는 것 방지)
+     * ========================= */
+    function memoryApplyOn() {
+        return GM_getValue(K_MEM_USE, true) !== false;
+    }
+
+    function getBlockGuard() {
+        const now = Date.now();
+        const list = GM_getValue(K_BLOCK_GUARD, []);
+        return (Array.isArray(list) ? list : []).filter(item =>
+            item && typeof item.fp === 'string' && now - Number(item.at || 0) < BLOCK_GUARD_TTL
+        );
+    }
+
+    function findBlocked(fp) {
+        return getBlockGuard().find(item => item.fp === fp) || null;
+    }
+
+    function rememberBlocked(fp, reason, label) {
+        const list = getBlockGuard().filter(item => item.fp !== fp);
+        list.unshift({ fp, reason: String(reason || ''), label: String(label || ''), at: Date.now() });
+        GM_setValue(K_BLOCK_GUARD, list.slice(0, BLOCK_GUARD_LIMIT));
+    }
+
+    function forgetBlocked(fp) {
+        const list = getBlockGuard();
+        const next = list.filter(item => item.fp !== fp);
+        if (next.length !== list.length) GM_setValue(K_BLOCK_GUARD, next);
+    }
+
+    function textFingerprint(text) {
+        const value = String(text || '');
+        return hashContextId(value) + ':' + value.length;
+    }
+
+    function minutesAgoText(at) {
+        const minutes = Math.max(0, Math.round((Date.now() - Number(at || 0)) / 60000));
+        if (minutes < 1) return '방금';
+        if (minutes < 60) return minutes + '분 전';
+        return Math.round(minutes / 60) + '시간 전';
+    }
+
+    /* options.json: JSON으로 받기, options.onNotice(문구): 키 전환·대기 안내
+     * options.guardKey: 막힘 판정에 쓸 내용 지문(없으면 요청 전체로 계산)
+     * options.repeatGuard: 예전에 막힌 내용과 같을 때 'confirm'(물어보기, 기본) · 'skip'(안 보냄) · 'off'
+     * onError(문구, info): info = { blocked, reason, cost, guardSkipped, guardCancelled } */
     function requestGemini(system, user, label, onDone, onError, options) {
         const freeKey = getFreeKey();
         const paidKey = getPaidKey();
@@ -2745,6 +2810,36 @@
 
         let switchedFromFree = false;
 
+        const guardFp = model + '|' + (
+            options && options.guardKey
+                ? String(options.guardKey)
+                : textFingerprint(body)
+        );
+        const guardMode = (options && options.repeatGuard) || 'confirm';
+        const priorBlock = guardMode === 'off' ? null : findBlocked(guardFp);
+
+        if (priorBlock) {
+            if (guardMode === 'skip') {
+                onError(
+                    '🚫 ' + minutesAgoText(priorBlock.at) + ' 구글에 막힌 내용과 똑같아서 다시 보내지 않았어요. (크레딧 아끼기)',
+                    { guardSkipped: true, reason: priorBlock.reason }
+                );
+                return;
+            }
+
+            const ok = window.confirm(
+                '🚫 ' + minutesAgoText(priorBlock.at) + ' 똑같은 대화·기억·설정으로 보낸 요청이 구글에 막혔어요.\n' +
+                '(사유: ' + (priorBlock.reason || '알 수 없음') + ')\n\n' +
+                '입력한 글만 바꿔서 보내도 같은 이유로 또 막힐 가능성이 커요.\n' +
+                '막힌 요청에도 크레딧이 나갈 수 있어요.\n\n' +
+                '그래도 보낼까요?'
+            );
+            if (!ok) {
+                onError('보내지 않았어요. 크레딧은 안 나갔어요 🙂', { guardCancelled: true });
+                return;
+            }
+        }
+
         const freeLimitMessage = () =>
             '🆓 오늘 이 모델(' + model + ')의 무료 한도를 다 썼어요.\n' +
             nextFreeResetText() + '에 다시 채워져요. 💳 유료 키를 넣으면 그동안 이어서 쓸 수 있어요.';
@@ -2762,13 +2857,42 @@
 
             if (!output) {
                 const reason =
-                    (candidate && candidate.finishReason) ||
                     (data.promptFeedback && data.promptFeedback.blockReason) ||
+                    (candidate && candidate.finishReason) ||
                     '알 수 없음';
+                const blocked = BLOCK_REASONS.has(String(reason));
+                const free = keyType === 'free';
 
-                onError('응답이 비어 있어요 (사유: ' + reason + ').');
+                /* 막히거나 비어 있어도 구글이 쓴 토큰이 있으면 비용 기록에 남긴다. */
+                const cost = recordCostUsage(
+                    model,
+                    data.usageMetadata,
+                    (label || '요청') + (blocked ? ' 🚫막힘' : ' (빈 응답)'),
+                    free
+                );
+
+                if (!blocked) {
+                    onError(
+                        '응답이 비어 있어요 (사유: ' + reason + ').' +
+                            (cost ? '\n' + cost.message : ''),
+                        { blocked: false, reason, cost }
+                    );
+                    return;
+                }
+
+                rememberBlocked(guardFp, reason, label);
+
+                onError(
+                    '🚫 구글이 이번 요청을 막았어요 (사유: ' + reason + ')\n' +
+                        '키·크레딧 문제는 아니에요. 입력한 글뿐 아니라 같이 보낸 최근 대화·장기기억·페르소나까지 통째로 보고 막은 거예요.\n' +
+                        '같은 내용으로 또 누르면 다시 막히고 크레딧이 나갈 수 있어서, 다음엔 보내기 전에 한 번 물어볼게요.' +
+                        (cost ? '\n' + cost.message.replace('💸 이번', '💸 막힌 요청') : ''),
+                    { blocked: true, reason, cost }
+                );
                 return;
             }
+
+            forgetBlocked(guardFp);
 
             const free = keyType === 'free';
             const freeCount = free ? noteFreeSuccess(model) : 0;
@@ -3476,6 +3600,15 @@
             min-height: 64px !important;
         }
 
+        /* 문체 칸: 기본으로 넉넉하게. 글이 길어지면 스크립트가 높이를 늘린다. */
+        #${PANEL_ID} textarea.se-style-box {
+            min-height: 170px !important;
+            max-height: 60vh !important;
+            overflow-y: auto !important;
+            resize: vertical;
+            line-height: 1.55;
+        }
+
         #se-persona-suggest {
             flex: none;
             width: 100%;
@@ -3604,6 +3737,33 @@
             background: rgba(255,146,146,.08);
         }
 
+        #se-mem-chip.off {
+            opacity: .55;
+            border-style: dashed;
+        }
+
+        .se-check-row {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 2px 7px;
+            margin: -2px 2px 0;
+            color: #dfe2ee;
+            font-size: 11.5px;
+            font-weight: 750;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .se-check-sub {
+            flex-basis: 100%;
+            padding-left: 25px;
+            color: #8d92a6;
+            font-size: 10.5px;
+            font-weight: 500;
+            line-height: 1.4;
+        }
+
         #se-mem-view {
             display: flex;
             flex-direction: column;
@@ -3722,6 +3882,12 @@
                 overflow-y: auto !important;
             }
 
+            /* 모바일 공통 textarea 상한(105px)을 문체 칸에서는 풀어 준다. */
+            #${PANEL_ID} textarea.se-style-box {
+                min-height: 160px !important;
+                max-height: 60vh !important;
+            }
+
             #se-settings {
                 overscroll-behavior: contain;
                 touch-action: pan-y;
@@ -3758,6 +3924,7 @@
                         >
                     </div>
                     <textarea
+                        class="${type === 'style' ? 'se-style-box' : ''}"
                         id="se-${type}-text-${i}"
                         placeholder="${label} 내용을 입력하세요"
                     ></textarea>
@@ -3799,7 +3966,7 @@
         panel.id = PANEL_ID;
         panel.innerHTML = `
             <div id="se-head">
-                <span id="se-title">✨ 문장 부풀리기 · v6.15.0</span>
+                <span id="se-title">✨ 문장 부풀리기 · v6.16.0</span>
                 <button id="se-gear" type="button" title="설정">⚙️</button>
                 <button id="se-close" type="button" title="닫기">✕</button>
             </div>
@@ -3807,6 +3974,11 @@
             <div id="se-body">
                 <div id="se-cost-top">아직 계산된 사용량이 없어요.</div>
                 <button id="se-mem-chip" type="button">🧠 장기기억 불러오는 중…</button>
+                <label class="se-check-row" for="se-mem-use">
+                    <input type="checkbox" id="se-mem-use">
+                    <span>🧠 장기기억 적용</span>
+                    <span class="se-check-sub">끄면 늘리기·페르소나 추천에 장기기억을 안 넣고, 자동 정리도 쉬어요</span>
+                </label>
 
                 <div class="se-label">💬 대사</div>
                 <textarea id="se-dialogue" placeholder="예: 괜찮아, 내가 도와줄게"></textarea>
@@ -3907,6 +4079,12 @@
                 <details class="se-section" id="se-mem-section">
                     <summary>🧠 장기기억 · 관계 · 할 일 (이 채팅방)</summary>
                     <div class="se-section-body">
+                        <label class="se-check-row" for="se-mem-use-2">
+                            <input type="checkbox" id="se-mem-use-2">
+                            <span>장기기억 적용 (늘리기·추천에 넣기)</span>
+                            <span class="se-check-sub">끄면 자동 정리도 쉬어요. 🧠 지금 정리 / 📚 다시 만들기는 눌렀을 때만 돌아가요.</span>
+                        </label>
+
                         <div class="se-inline">
                             <input id="se-mem-auto" type="checkbox">
                             <span>자동 정리 · 새 대화</span>
@@ -3968,7 +4146,7 @@
                     </div>
                 </details>
 
-                <details class="se-section">
+                <details class="se-section" id="se-style-section">
                     <summary>✍️ 문체 규칙</summary>
                     <div class="se-section-body">
                         ${slotHTML('style', STYLE_SLOTS, '문체')}
@@ -4400,6 +4578,47 @@
         loadSlots('persona', getPersonaSlots(), PERSONA_SLOTS);
         loadSlots('style', getStyleSlots(), STYLE_SLOTS);
 
+        /* 문체 칸 자동 높이:
+         * - 칸이 보일 때(문체 섹션 열기, 설정 열기, 칸 누르기) 내용 길이에 맞춘다.
+         * - 쓰는 중에 글이 넘치면 그만큼 늘린다. 손으로 늘린 크기는 줄이지 않는다.
+         * - 최대 높이는 화면의 60%. 그보다 길면 칸 안에서 스크롤된다. */
+        const styleBoxes = Array.from(panel.querySelectorAll('textarea.se-style-box'));
+        const styleSection = $('#se-style-section');
+
+        function styleBoxMax() {
+            return Math.round(getViewport().height * 0.6);
+        }
+
+        function fitStyleBox(box) {
+            if (!box || !box.offsetParent) return;
+            const minHeight = parseFloat(getComputedStyle(box).minHeight) || 160;
+            box.style.height = 'auto';
+            const next = clamp(box.scrollHeight + 2, minHeight, styleBoxMax());
+            box.style.height = next + 'px';
+        }
+
+        function growStyleBox(box) {
+            if (!box || !box.offsetParent) return;
+            if (box.scrollHeight <= box.clientHeight + 1) return;
+            const next = Math.min(box.scrollHeight + 2, styleBoxMax());
+            if (next > box.offsetHeight) box.style.height = next + 'px';
+        }
+
+        function fitAllStyleBoxes() {
+            requestAnimationFrame(() => styleBoxes.forEach(fitStyleBox));
+        }
+
+        styleBoxes.forEach(box => {
+            box.addEventListener('input', () => growStyleBox(box));
+            box.addEventListener('focus', () => growStyleBox(box));
+        });
+        if (styleSection) {
+            styleSection.addEventListener('toggle', () => {
+                if (styleSection.open) fitAllStyleBoxes();
+            });
+        }
+        $('#se-gear').addEventListener('click', fitAllStyleBoxes);
+
         const storedModels = GM_getValue(K_MODELLIST, DEFAULT_MODELS);
         populateModels(
             Array.isArray(storedModels) && storedModels.length
@@ -4601,7 +4820,9 @@
                     clamp(parseInt(ctxN.value, 10) || 10, 6, 20)
                 );
                 context = loaded.context;
-                memoryBlock = memoryToPrompt(getMemory(), loaded.snapshot && loaded.snapshot.text);
+                if (memoryApplyOn()) {
+                    memoryBlock = memoryToPrompt(getMemory(), loaded.snapshot && loaded.snapshot.text);
+                }
             } catch (_) {}
 
             if (!keywords && !storyDetail && !context.length) {
@@ -4674,9 +4895,10 @@
                         resultTextarea.scrollTop = 0;
                     });
                 },
-                error => {
+                (error, info) => {
                     button.disabled = false;
-                    setInfo(personaStatus, error, true);
+                    if (info && info.cost) refreshCost(info.cost);
+                    setInfo(personaStatus, error, !(info && info.guardCancelled));
                 }
             );
         });
@@ -4964,12 +5186,31 @@
             GM_setValue(K_MEM_EVERY, value);
         });
 
+        /* 장기기억 적용 체크 (메인 화면 · 설정 두 곳이 같은 값을 공유) */
+        const memUseBoxes = ['#se-mem-use', '#se-mem-use-2'].map($).filter(Boolean);
+        memUseBoxes.forEach(box => {
+            box.checked = memoryApplyOn();
+            box.addEventListener('change', () => {
+                const on = box.checked;
+                GM_setValue(K_MEM_USE, on);
+                memUseBoxes.forEach(other => { other.checked = on; });
+                if (!memoryBusy) setChip(memoryChipText(getMemory()));
+                flash(on ? '🧠 장기기억을 다시 적용해요.' : '⏸️ 장기기억을 빼고 보낼게요. 자동 정리도 쉬어요.');
+            });
+        });
+
         function memoryChipText(mem) {
             const open = mem.todos.filter(item => !item.done).length;
-            if (
+            const empty =
                 !mem.relationships.length && !mem.userState.length &&
-                !mem.todos.length && !mem.events.length
-            ) {
+                !mem.todos.length && !mem.events.length;
+
+            if (!memoryApplyOn()) {
+                return '⏸️ 장기기억 적용 꺼짐' +
+                    (empty ? '' : ' · 할 일 ' + open + ' · 관계 ' + mem.relationships.length +
+                        ' · 있었던 일 ' + mem.events.length);
+            }
+            if (empty) {
                 return '🧠 장기기억 비어 있음 · 눌러서 보기';
             }
             return '🧠 할 일 ' + open +
@@ -4985,6 +5226,7 @@
             memChip.textContent = text;
             memChip.classList.toggle('busy', state === 'busy');
             memChip.classList.toggle('err', state === 'err');
+            memChip.classList.toggle('off', !state && !memoryApplyOn());
         }
 
         function makeEl(tag, className, text) {
@@ -5109,7 +5351,13 @@
                 if (result && result.cost) refreshCost(result.cost);
                 return result;
             }).catch(error => {
-                const message = '🧠 기억 정리 실패: ' + (error && error.message || error);
+                const info = error && error.info;
+                if (info && info.cost) refreshCost(info.cost);
+                const message = info && info.guardSkipped
+                    ? '🧠 자동 정리 건너뜀 · 예전에 구글에 막힌 대화 구간이라 다시 안 보냈어요 (크레딧 아끼기)'
+                    : info && info.guardCancelled
+                        ? '🧠 기억 정리를 보내지 않았어요. 크레딧은 안 나갔어요.'
+                        : '🧠 기억 정리 실패: ' + (error && error.message || error);
                 setChip(message, 'err');
                 setInfo(memStatus, message, true);
                 chipTimer = setTimeout(() => setChip(memoryChipText(getMemory())), 6000);
@@ -5119,6 +5367,8 @@
 
         function maybeAutoMemory() {
             if (!memAuto.checked || memoryBusy) return;
+            /* 장기기억을 안 쓰는 중이면 정리할 필요도 없으니 크레딧을 아낀다. */
+            if (!memoryApplyOn()) return;
             /* 무료 한도를 다 썼고 유료 키도 없으면 조용히 건너뛴다. */
             if (!canRequestGemini()) return;
 
@@ -5290,9 +5540,16 @@
             const latestSnapshot = loaded.snapshot || {
                 text: '', nearby: '', source: '판별 실패', role: 'unknown', id: '', turnNumber: null
             };
-            const memoryBlock = memoryToPrompt(getMemory(), latestSnapshot.text);
+            const memoryBlock = memoryApplyOn()
+                ? memoryToPrompt(getMemory(), latestSnapshot.text)
+                : '';
             const sceneFocus = extractSceneFocus(latestSnapshot.text);
             const prompt = buildPrompt(d, a, context, latestSnapshot, memoryBlock);
+
+            /* 막힘 판정용 지문: 입력한 대사·행동을 뺀 나머지(대화·기억·설정)만으로 만든다.
+             * 같은 대화·기억으로 막힌 뒤 입력만 바꿔 다시 눌러도 한 번 물어보게 하기 위해서다. */
+            const probe = buildPrompt('', '', context, latestSnapshot, memoryBlock);
+            const guardKey = textFingerprint(probe.system + '\u0000' + probe.user);
 
             /* 아래 요청 콜백에서 버튼을 다시 켤 때 진행 중 표시도 함께 푼다. */
             const releaseButton = () => {
@@ -5357,11 +5614,12 @@
                     releaseButton();
                     flash(costInfo ? costInfo.message : '');
                 },
-                error => {
+                (error, info) => {
                     releaseButton();
-                    flash(error, true);
+                    if (info && info.cost) refreshCost(info.cost);
+                    flash(error, !(info && info.guardCancelled));
                 },
-                { onNotice: message => flash(message) }
+                { onNotice: message => flash(message), guardKey, repeatGuard: 'confirm' }
             );
         }
 
